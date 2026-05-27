@@ -1,197 +1,149 @@
-# Sunshine Foundation Edition
+### ░▒▓ Kernfunktionen
 
-## 🌐 Mehrsprachige Unterstützung / Multi-language Support
+- **HDR Vollkette** — Dual-Format-Codierung (PQ + HLG)・Frame-basierte GPU-Helligkeitsanalyse・HDR10+ / HDR Vivid dynamische Metadaten・Vollständige statische Metadaten-Durchleitung
+- **Virtueller Monitor** — Tiefe Integration von [ZakoVDD](https://github.com/qiin2333/zako-vdd)・5 Bildschirmmodi・Named Pipe Kommunikation・Multi-Client GUID-Sitzungen
+- **Audio-Verbesserungen** — 7.1.4 Surround Sound (12ch)・Opus DRED Paketverlustwiederherstellung・Kontinuierlicher Audiostream・Remote-Mikrofon・Virtuelle Lautsprecher-Bittiefenanpassung
+- **Codierungsoptimierungen** — NVENC SDK 13.0・AMF QVBR/HQVBR・Encoder-Ergebnis-Cache (260x)・Adaptives Downsampling・Vulkan Encoder
+- **Steuerungszentrale** — Tauri 2 + Vue 3 + Vite・Dark Mode・QR-Pairing・Echtzeit-Überwachung
+- **Intelligentes Pairing** — Client-unabhängige Konfiguration・Automatische Anpassung an Gerätefähigkeiten・Virtueller Maus-Treiber (vmouse)
 
-<div align="center">
+### ░▒▓ Technische Details
 
-[![English](https://img.shields.io/badge/English-README.en.md-blue?style=for-the-badge)](README.en.md)
-[![中文简体](https://img.shields.io/badge/中文简体-README.zh--CN.md-red?style=for-the-badge)](README.md)
-[![Français](https://img.shields.io/badge/Français-README.fr.md-green?style=for-the-badge)](README.fr.md)
-[![Deutsch](https://img.shields.io/badge/Deutsch-README.de.md-yellow?style=for-the-badge)](README.de.md)
-[![日本語](https://img.shields.io/badge/日本語-README.ja.md-purple?style=for-the-badge)](README.ja.md)
+<details>
+<summary><b>HDR Vollkette Technisches Konzept</b></summary>
 
-</div>
+#### Dual-Format HDR-Codierung: Parallele Unterstützung für HDR10 (PQ) + HLG
 
----
+Traditionelle Streaming-Lösungen unterstützen nur HDR10 (PQ) absolute Helligkeitszuordnung. Wenn die Fähigkeiten des Endgeräts unzureichend sind oder die Helligkeitsparameter nicht übereinstimmen, treten Probleme wie Detailverlust in Schattenbereichen und abgeschnittene Lichter auf.
 
-Ein Fork basierend auf LizardByte/Sunshine, bietet vollständige Dokumentationsunterstützung [Read the Docs](https://docs.qq.com/aio/DSGdQc3htbFJjSFdO?p=YTpMj5JNNdB5hEKJhhqlSB).
+Daher wurde auf der Codierungsebene Unterstützung für HLG (Hybrid Log-Gamma, ITU-R BT.2100) hinzugefügt, das eine relative Helligkeitszuordnung verwendet:
+- **Szenenbezogene Helligkeitsanpassung**: HLG basiert auf einer relativen Helligkeitskurve. Das Anzeigegerät führt automatisch eine Tonwertzuordnung basierend auf seiner eigenen Spitzenhelligkeit durch. Auf Geräten mit geringer Helligkeit ist die Detailerhaltung in Schattenbereichen deutlich besser als bei PQ.
+- **Sanftes Ausrollen in hellen Bereichen**: Die logarithmisch-gamma-gemischte Übertragungsfunktion von HLG bietet ein progressives Ausrollen in hellen Bereichen und vermeidet die harten Farbabrisse in hellen Bereichen, die durch das harte Abschneiden von PQ verursacht werden.
+- **Natürliche SDR-Rückwärtskompatibilität**: HLG-Signale können direkt von SDR-Displays als Standard-BT.709-Bild decodiert werden, ohne dass eine zusätzliche Tonwertzuordnung erforderlich ist.
 
-**Sunshine-Foundation** ist ein selbst gehosteter Game-Stream-Host für Moonlight. Diese Fork-Version hat erhebliche Verbesserungen gegenüber dem ursprünglichen Sunshine vorgenommen und konzentriert sich darauf, das Spiel-Streaming-Erlebnis für verschiedene Streaming-Endgeräte und Windows-Hosts zu verbessern:
+**Frame-basierte Helligkeitsanalyse und adaptive Metadatengenerierung**
 
-### 🌟 Kernfunktionen
-- **Vollständige HDR-Pipeline-Unterstützung** - Dualformat HDR10 (PQ) + HLG Kodierung mit adaptiven Metadaten für eine breitere Geräteabdeckung
-- **Virtuelle Anzeige** - Integriertes virtuelles Display-Management, ermöglicht das Erstellen und Verwalten virtueller Displays ohne zusätzliche Software
-- **Entferntes Mikrofon** - Unterstützt das Empfangen von Client-Mikrofonen und bietet hochwertige Sprachdurchleitung
-- **Erweiterte Systemsteuerung** - Intuitive Web-Oberfläche zur Konfiguration mit Echtzeit-Überwachung und Verwaltung
-- **Niedrige Latenzübertragung** - Optimierte Encoder-Verarbeitung unter Nutzung der neuesten Hardware-Fähigkeiten
-- **Intelligente Paarung** - Intelligentes Management von Profilen für gepaarte Geräte
-
-### 🎬 Vollständige HDR-Pipeline-Architektur
-
-**Dual-Format HDR-Kodierung: HDR10 (PQ) + HLG Parallelunterstützung**
-
-Herkömmliche Streaming-Lösungen unterstützen nur HDR10 (PQ) mit absoluter Luminanzzuordnung, was erfordert, dass das Client-Display die EOTF-Parameter und Spitzenhelligkeit der Quelle genau reproduziert. Wenn die Fähigkeiten des Empfangsgeräts unzureichend sind oder die Helligkeitsparameter nicht übereinstimmen, treten Tone-Mapping-Artefakte wie abgeschnittene Schatten und überbelichtete Lichter auf.
-
-Foundation Sunshine führt HLG-Unterstützung (Hybrid Log-Gamma, ITU-R BT.2100) auf der Kodierungsebene ein. Dieser Standard verwendet eine relative Luminanzzuordnung mit folgenden technischen Vorteilen:
-- **Szenenreferenzierte Luminanzanpassung**: HLG verwendet eine relative Luminanzkurve, die es dem Display ermöglicht, automatisch Tone Mapping basierend auf seiner eigenen Spitzenhelligkeit durchzuführen — die Erhaltung von Schattendetails auf Geräten mit niedriger Helligkeit ist PQ deutlich überlegen
-- **Sanfter Highlight-Roll-Off**: Die hybride Log-Gamma-Transferfunktion von HLG bietet einen graduellen Roll-Off in Highlight-Bereichen und vermeidet die Banding-Artefakte, die durch hartes Clipping bei PQ verursacht werden
-- **Native SDR-Abwärtskompatibilität**: HLG-Signale können von SDR-Displays direkt als Standard-BT.709-Inhalt dekodiert werden, ohne zusätzliches Tone Mapping
-
-**Einzelbild-Luminanzanalyse und adaptive Metadatengenerierung**
-
-Die Kodierungspipeline integriert ein Echtzeit-Luminanzanalysemodul auf der GPU-Seite, das über Compute Shader für jedes Einzelbild folgende Operationen ausführt:
-- **MaxFALL / MaxCLL Einzelbild-Berechnung**: Echtzeit-Berechnung des maximalen Inhaltslichtpegels (MaxCLL) und des maximalen durchschnittlichen Bildlichtpegels (MaxFALL) auf Einzelbildebene, dynamisch in HEVC/AV1 SEI/OBU-Metadaten injiziert
-- **Robuste Ausreißerfilterung**: Perzentilbasierte Abschneidestrategie zur Eliminierung extremer Luminanzpixel (z.B. Spiegelreflexionen), um zu verhindern, dass isolierte Leuchtpunkte die globale Luminanzreferenz anheben und zu einer allgemeinen Bildverdunkelung führen
-- **Interframe-Exponentialglättung**: EMA-Filterung (Exponentieller gleitender Durchschnitt) auf Luminanzstatistiken über aufeinanderfolgende Frames, zur Beseitigung von Helligkeitsflimmern durch abrupte Metadatenänderungen bei Szenenwechseln
+Auf der GPU-Seite ist ein Echtzeit-Helligkeitsanalysemodul integriert, das über Compute Shader für jedes Bild Folgendes ausführt:
+- **MaxFALL / MaxCLL Frame-basierte Berechnung**: Echtzeit-Statistik der maximalen Inhaltshelligkeit (MaxCLL) und der durchschnittlichen Frame-Helligkeit (MaxFALL) pro Frame, dynamische Injektion in HEVC/AV1 SEI/OBU Metadaten
+- **Robuste Ausreißerfilterung**: Verwendung einer Perzentil-Abschneidestrategie, um extreme Helligkeitspixel (z. B. Spiegelungen in hellen Bereichen) zu entfernen und zu verhindern, dass isolierte helle Pixel die globale Helligkeitsreferenz anheben und das Gesamtbild abdunkeln.
+- **Exponentielle Glättung zwischen Frames**: Anwendung eines EMA-Filters (Exponential Moving Average) auf die Helligkeitsstatistiken aufeinanderfolgender Frames, um Helligkeitsflimmern zu vermeiden, das durch plötzliche Metadatenänderungen bei Szenenwechseln verursacht wird.
 
 **Vollständige HDR-Metadaten-Durchleitung**
 
-Unterstützt die vollständige Durchleitung von statischen HDR10-Metadaten (Mastering Display Info + Content Light Level), dynamischen HDR Vivid-Metadaten und HLG-Transfercharakteristik-Kennungen. Dies stellt sicher, dass die von NVENC / AMF / QSV-Encodern ausgegebenen Bitstreams vollständige Farbvolumen- und Luminanzinformationen gemäß der CTA-861-Spezifikation enthalten, sodass Client-Decoder die HDR-Absicht der Quelle präzise reproduzieren können.
+HDR10 statische Metadaten (Mastering Display Info + Content Light Level) werden vollständig durchgeleitet. Die von NVENC / AMF / QSV codierten Bitströme tragen vollständige Farbvolumen- und Helligkeitsinformationen gemäß der CTA-861-Spezifikation.
 
-### 🖥️ Integriertes virtuelles Display (Erfordert Win10 22H2 oder neuer)
-- Dynamische Erstellung und Entfernung virtueller Displays
-- Unterstützung für benutzerdefinierte Auflösungen und Bildwiederholraten
-- Verwaltung von Mehrfachanzeigekonfigurationen
+**HDR10+ / HDR Vivid Dynamische Metadaten-Injektion**
+
+In der NVENC-Codierungspipeline werden basierend auf den Ergebnissen der Frame-basierten Helligkeitsanalyse automatisch die folgenden dynamischen Metadaten-SEIs generiert und injiziert:
+- **HDR10+ (ST 2094-40)**: Trägt szenenbezogene MaxSCL / Verteilungsperzentile / Knee-Point usw. als Tonwertzuordnungsreferenz und unterstützt präzise Tonwertzuordnung auf HDR10+-zertifizierten Fernsehern von Samsung/Panasonic usw.
+- **HDR Vivid (CUVA T/UWA 005.3)**: ITU-T T.35 registrierter Standard der China Ultra HD Video Alliance (CUVA). Bietet absolute Helligkeitstonwertzuordnung im PQ-Modus und szenenbezogene relative Helligkeitstonwertzuordnung im HLG-Modus und deckt das inländische Terminal-Ökosystem ab.
+
+</details>
+
+<details>
+<summary><b>Integration des virtuellen Monitors</b> (erfordert Windows 10 22H2+)</summary>
+
+Tiefe Integration des [ZakoVDD](https://github.com/qiin2333/zako-vdd) virtuellen Monitortreibers:
+- Unterstützung für benutzerdefinierte Auflösungen und Bildwiederholraten, 10-Bit HDR-Farbtiefe
+- **5 Bildschirmkombinationsmodi**: Nur virtuell, Nur physisch, Hybrid, Spiegelung, Erweitert
+- Named Pipe Echtzeitkommunikation, automatische Erstellung/Zerstörung des virtuellen Monitors bei Start/Ende des Streamings
+- Jeder Client ist unabhängig an eine VDD-Sitzung (GUID) gebunden, unterstützt schnelles Umschalten zwischen mehreren Clients
 - Echtzeit-Konfigurationsänderungen ohne Neustart
 
+</details>
 
-## Empfohlene Moonlight-Clients
+<details>
+<summary><b>Audio-Verbesserungen</b></summary>
 
-Für das beste Streaming-Erlebnis wird die Verwendung der folgenden optimierten Moonlight-Clients empfohlen (aktiviert Set-Boni):
+- **7.1.4 Surround Sound (12 Kanäle)**: Vollständige Kanalzuordnung für immersive Audio-Layouts wie Dolby Atmos
+- **Opus DRED Tiefenredundanz**: Neuronale Netzwerk-basierte Paketverlustwiederherstellung, 100ms Redundanzfenster gleicht Netzwerkschwankungen aus
+- **Kontinuierlicher Audiostream**: Unterbrechungsfreier Audiostream, füllt Stille bei Stille automatisch auf, um wiederholte Initialisierung von Audiogeräten zu vermeiden
+- **Automatische Anpassung des virtuellen Lautsprechers**: Automatische Erkennung und Anpassung virtueller Audiogeräte an Bittiefenformate wie 16bit/24bit
 
-### 🖥️ Windows(X86_64, Arm64), MacOS, Linux Clients
-[![Moonlight-PC](https://img.shields.io/badge/Moonlight-PC-red?style=for-the-badge&logo=windows)](https://github.com/qiin2333/moonlight-qt)
+</details>
 
-### 📱 Android Client
-[![Enhanced Edition Moonlight-Android](https://img.shields.io/badge/Enhanced_Edition-Moonlight--Android-green?style=for-the-badge&logo=android)](https://github.com/qiin2333/moonlight-android/releases/tag/shortcut)
-[![Crown Edition Moonlight-Android](https://img.shields.io/badge/Crown_Edition-Moonlight--Android-blue?style=for-the-badge&logo=android)](https://github.com/WACrown/moonlight-android)
+<details>
+<summary><b>Erfassungs- und Codierungsoptimierungen</b></summary>
 
-### 📱 iOS Client
-[![Voidlink Moonlight-iOS](https://img.shields.io/badge/Voidlink-Moonlight--iOS-lightgrey?style=for-the-badge&logo=apple)](https://github.com/The-Fried-Fish/VoidLink)
+**Erfassungspipeline**
+- **Gamma-bewusste Shader**: Automatische Auswahl der sRGB / linearen Gamma-Farbkonvertierung basierend auf dem DXGI ColorSpace
+- **Hochwertiges Downsampling**: Bikubische Interpolation, unterstützt drei Stufen: fast / balanced / high_quality
+- **Dynamische Auflösungserkennung**: Echtzeiterkennung von Monitorauflösung und -rotation, adaptive Anpassung des Encoders
+- **GPU-Helligkeitsanalyse**: Compute Shader zweistufige Reduktion, P95/P99-Abschneidung, EMA-Zeitglättung zwischen Frames
 
+**NVENC**
+- **SDK 13.0**: Feinkörnige Bitratensteuerung und Look-ahead
+- **HDR-Metadaten API**: Native Mastering Display / Content Light Level Schreibunterstützung ab NVENC SDK 12.2+
+- **HDR10+ / HDR Vivid SEI**: Automatische Frame-basierte Generierung von ST 2094-40 und CUVA T.35 dynamischen Metadaten
+- **SPS-Bitstrom-Spezifikation**: Vollständige Schreibunterstützung für H.264/HEVC SPS Bitstream Restrictions
 
-### 🛠️ Weitere Ressourcen
-[awesome-sunshine](https://github.com/LizardByte/awesome-sunshine)
+**AMF (AMD)**
+- **QVBR / HQVBR / HQCBR**: Erweiterte Bitratensteuerung, unterstützt UI-Anpassung der Qualitätsstufe
+- **AV1 Geringe Latenz**: Optimierte Optionen für den AV1-Encoder ohne Latenzeinfluss
 
-## Systemanforderungen
+**Allgemein**
+- **Encoder-Ergebnis-Cache**: Dauerhafte Speicherung der Erkennungsergebnisse, nachfolgende Verbindungen 26s → <100ms (260x Beschleunigung)
+- **Adaptives Downsampling**: Unterstützt drei Stufen der Auflösungsskalierung (bilinear / bikubisch / hochwertig), geeignet für Szenarien wie 4K-Quelle → 1080p-Streaming
+- **Vulkan Encoder**: Experimentelle Unterstützung für Vulkan Video-Codierung
+- **Sperrfreie Zertifikatskette**: `shared_mutex` ersetzt mutex, eliminiert TLS-Warteschlangen-Overhead
 
+</details>
 
-> [!WARNING]
-> Diese Tabellen werden kontinuierlich aktualisiert. Bitte kaufen Sie Hardware nicht nur basierend auf diesen Informationen.
-
-
-<table>
-    <caption id="minimum_requirements">Mindestanforderungen</caption>
-    <tr>
-        <th>Komponente</th>
-        <th>Anforderung</th>
-    </tr>
-    <tr>
-        <td rowspan="3">GPU</td>
-        <td>AMD: VCE 1.0 oder höher, siehe: <a href="https://github.com/obsproject/obs-amd-encoder/wiki/Hardware-Support">obs-amd Hardware-Unterstützung</a></td>
-    </tr>
-    <tr>
-        <td>Intel: VAAPI-kompatibel, siehe: <a href="https://www.intel.com/content/www/us/en/developer/articles/technical/linuxmedia-vaapi.html">VAAPI Hardware-Unterstützung</a></td>
-    </tr>
-    <tr>
-        <td>Nvidia: Grafikkarte mit NVENC-Unterstützung, siehe: <a href="https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new">NVENC-Unterstützungsmatrix</a></td>
-    </tr>
-    <tr>
-        <td rowspan="2">CPU</td>
-        <td>AMD: Ryzen 3 oder höher</td>
-    </tr>
-    <tr>
-        <td>Intel: Core i3 oder höher</td>
-    </tr>
-    <tr>
-        <td>RAM</td>
-        <td>4GB oder mehr</td>
-    </tr>
-    <tr>
-        <td rowspan="5">Betriebssystem</td>
-        <td>Windows: 10 22H2+ (Windows Server unterstützt keine virtuellen Gamepads)</td>
-    </tr>
-    <tr>
-        <td>macOS: 12+</td>
-    </tr>
-    <tr>
-        <td>Linux/Debian: 12+ (bookworm)</td>
-    </tr>
-    <tr>
-        <td>Linux/Fedora: 39+</td>
-    </tr>
-    <tr>
-        <td>Linux/Ubuntu: 22.04+ (jammy)</td>
-    </tr>
-    <tr>
-        <td rowspan="2">Netzwerk</td>
-        <td>Host: 5GHz, 802.11ac</td>
-    </tr>
-    <tr>
-        <td>Client: 5GHz, 802.11ac</td>
-    </tr>
-</table>
-
-<table>
-    <caption id="4k_suggestions">Empfohlene Konfiguration für 4K</caption>
-    <tr>
-        <th>Komponente</th>
-        <th>Anforderung</th>
-    </tr>
-    <tr>
-        <td rowspan="3">GPU</td>
-        <td>AMD: Video Coding Engine 3.1 oder höher</td>
-    </tr>
-    <tr>
-        <td>Intel: HD Graphics 510 oder höher</td>
-    </tr>
-    <tr>
-        <td>Nvidia: GeForce GTX 1080 oder höhere Modelle mit mehreren Encodern</td>
-    </tr>
-    <tr>
-        <td rowspan="2">CPU</td>
-        <td>AMD: Ryzen 5 oder höher</td>
-    </tr>
-    <tr>
-        <td>Intel: Core i5 oder höher</td>
-    </tr>
-    <tr>
-        <td rowspan="2">Netzwerk</td>
-        <td>Host: CAT5e Ethernet oder besser</td>
-    </tr>
-    <tr>
-        <td>Client: CAT5e Ethernet oder besser</td>
-    </tr>
-</table>
-
-## Technischer Support
-
-Lösungsweg bei Problemen:
-1. Konsultieren Sie die [Nutzungsdokumentation](https://docs.qq.com/aio/DSGdQc3htbFJjSFdO?p=YTpMj5JNNdB5hEKJhhqlSB) [LizardByte-Dokumentation](https://docs.lizardbyte.dev/projects/sunshine/latest/)
-2. Aktivieren Sie den detaillierten Log-Level in den Einstellungen, um relevante Informationen zu finden
-3. [Treten Sie der QQ-Gruppe bei, um Hilfe zu erhalten](https://qm.qq.com/cgi-bin/qm/qr?k=5qnkzSaLIrIaU4FvumftZH_6Hg7fUuLD&jump_from=webapi)
-4. [Benutze zwei Buchstaben!](https://uuyc.163.com/)
-
-**Problemrückmeldung-Labels:**
-- `hdr-support` - Probleme im Zusammenhang mit HDR
-- `virtual-display` - Probleme mit virtuellen Displays
-- `config-help` - Probleme im Zusammenhang mit der Konfiguration
-
-## 📚 Entwicklerdokumentation
-
-- **[Build-Anleitung](docs/building.md)** - Anleitung zum Kompilieren und Erstellen des Projekts
-- **[Konfigurationshandbuch](docs/configuration.md)** - Erläuterung der Laufzeit-Konfigurationsoptionen
-- **[WebUI-Entwicklung](docs/WEBUI_DEVELOPMENT.md)** - Vollständige Anleitung zur Entwicklung der Vue 3 + Vite Web-Oberfläche
-
-## Community beitreten
-
-Wir begrüßen die Teilnahme an Diskussionen und Code-Beiträgen!
-[![QQ-Gruppe beitreten](https://pub.idqqimg.com/wpa/images/group.png 'QQ-Gruppe beitreten')](https://qm.qq.com/cgi-bin/qm/qr?k=WC2PSZ3Q6Hk6j8U_DG9S7522GPtItk0m&jump_from=webapi&authKey=zVDLFrS83s/0Xg3hMbkMeAqI7xoHXaM3sxZIF/u9JW7qO/D8xd0npytVBC2lOS+z)
-
-## Star-Verlauf
-
-[![Star-Verlauf Diagramm](https://api.star-history.com/svg?repos=qiin2333/Sunshine-Foundation&type=Date)](https://www.star-history.com/#qiin2333/Sunshine-Foundation&Date)
+<br>
 
 ---
 
-**Sunshine Foundation Edition - Macht Game-Streaming eleganter**
+### ░▒▓ Empfohlene Clients
+
+Kombinieren Sie die folgenden optimierten Moonlight-Clients für das beste Erlebnis (Aktivierung des Set-Bonus)
+
+- **PC** — [Moonlight-PC](https://github.com/qiin2333/moonlight-qt) (Windows · macOS · Linux)
+- **Android** — [Power Enhanced Edition](https://github.com/qiin2333/moonlight-vplus) · [Crown Edition](https://github.com/WACrown/moonlight-android)
+- **iOS** — [VoidLink](https://github.com/The-Fried-Fish/VoidLink-previously-moonlight-zwm)
+- **HarmonyOS** — [Moonlight V+](https://appgallery.huawei.com/app/detail?id=com.alkaidlab.sdream)
+
+Weitere Ressourcen: [awesome-sunshine](https://github.com/LizardByte/awesome-sunshine)
+
+<br>
+
+<details>
+<summary><b>░▒▓ Systemanforderungen</b></summary>
+
+| Komponente | Minimum | 4K Empfohlen |
+|------------|---------|--------------|
+| **GPU** | AMD VCE 1.0+ / Intel VAAPI / NVIDIA NVENC | AMD VCE 3.1+ / Intel HD 510+ / GTX 1080+ |
+| **CPU** | Ryzen 3 / Core i3 | Ryzen 5 / Core i5 |
+| **RAM** | 4 GB | 8 GB |
+| **System** | Windows 10 22H2+ | Windows 10 22H2+ |
+| **Netzwerk** | 5GHz 802.11ac | CAT5e Ethernet |
+
+GPU-Kompatibilität: [NVENC](https://developer.nvidia.com/video-encode-and-decode-gpu-support-matrix-new) · [AMD VCE](https://github.com/obsproject/obs-amd-encoder/wiki/Hardware-Support) · [Intel VAAPI](https://www.intel.com/content/www/us/en/developer/articles/technical/linuxmedia-vaapi.html)
+
+</details>
+
+---
+
+### ░▒▓ Dokumentation & Support
+
+[![Docs](https://img.shields.io/badge/Benutzerdokumentation-ff69b4?style=flat-square)](https://docs.qq.com/aio/DSGdQc3htbFJjSFdO?p=YTpMj5JNNdB5hEKJhhqlSB) [![LizardByte](https://img.shields.io/badge/LizardByte_Dokumentation-a78bfa?style=flat-square)](https://docs.lizardbyte.dev/projects/sunshine/latest/) [![QQ-Gruppe](https://img.shields.io/badge/QQ_Community-38bdf8?style=flat-square)](https://qm.qq.com/cgi-bin/qm/qr?k=5qnkzSaLIrIaU4FvumftZH_6Hg7fUuLD&jump_from=webapi)
+
+Möchten Sie beim Code mithelfen? → [![Build](https://img.shields.io/badge/Build-Anleitung-34d399?style=flat-square)](docs/building.md) [![Config](https://img.shields.io/badge/Konfigurationsleitfaden-fbbf24?style=flat-square)](docs/configuration.md) [![WebUI](https://img.shields.io/badge/WebUI_Entwicklung-fb923c?style=flat-square)](docs/WEBUI_DEVELOPMENT.md)
+
+<br>
+
+<div align="center">
+
+「 ░▒▓ 」
+
+<a href="https://github.com/qiin2333/foundation-sunshine/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=qiin2333/foundation-sunshine&max=100" />
+</a>
+
+<br>
+
+[![QQ-Gruppe beitreten](https://pub.idqqimg.com/wpa/images/group.png 'QQ-Gruppe beitreten')](https://qm.qq.com/cgi-bin/qm/qr?k=WC2PSZ3Q6Hk6j8U_DG9S7522GPtItk0m&jump_from=webapi&authKey=zVDLFrS83s/0Xg3hMbkMeAqI7xoHXaM3sxZIF/u9JW7qO/D8xd0npytVBC2lOS+z)
+
+[![Star History Chart](https://api.star-history.com/svg?repos=qiin2333/Sunshine-Foundation&type=Date)](https://www.star-history.com/#qiin2333/Sunshine-Foundation&Date)
+
+</div>
+```
