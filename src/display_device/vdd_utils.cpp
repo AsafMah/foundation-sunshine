@@ -5,10 +5,12 @@
 #include "vdd_ioctl.h"
 
 #include <algorithm>
+#include <boost/algorithm/string.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/process/v1.hpp>
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
+#include <boost/property_tree/xml_parser.hpp>
 #include <boost/uuid/name_generator_sha1.hpp>
 #include <boost/uuid/uuid.hpp>
 #include <boost/uuid/uuid_io.hpp>
@@ -268,6 +270,70 @@ namespace display_device {
         BOOST_LOG(info) << "Reload VDD driver requested (PIPE)";
       }
       return ok;
+    }
+
+    bool
+    set_hardware_cursor_enabled(bool enabled) {
+      const wchar_t *command = enabled ? L"HARDWARECURSOR true" : L"HARDWARECURSOR false";
+
+      switch (vdd_ioctl::send_command(command)) {
+        case vdd_ioctl::result::success:
+          BOOST_LOG(info) << "VDD hardware cursor " << (enabled ? "enabled" : "disabled") << " (IOCTL)";
+          return true;
+        case vdd_ioctl::result::failed:
+          BOOST_LOG(error) << "VDD hardware cursor command was rejected by driver; not falling back to pipe";
+          return false;
+        case vdd_ioctl::result::interface_missing:
+          break;
+      }
+
+      std::string response;
+      const bool ok = execute_pipe_command(kVddPipeName, command, &response);
+      if (ok) {
+        BOOST_LOG(info) << "VDD hardware cursor " << (enabled ? "enabled" : "disabled") << " (PIPE)";
+      }
+      return ok;
+    }
+
+    bool
+    ensure_hardware_cursor_disabled_for_capture(bool *changed) {
+      if (changed) {
+        *changed = false;
+      }
+
+      const auto settings_path = std::filesystem::path(platf::appdata()) / "vdd_settings.xml";
+      bool needs_disable = true;
+
+      try {
+        if (std::filesystem::exists(settings_path)) {
+          pt::ptree tree;
+          pt::read_xml(settings_path.string(), tree);
+
+          if (const auto value = tree.get_optional<std::string>("vdd_settings.cursor.HardwareCursor")) {
+            auto hardware_cursor = *value;
+            boost::algorithm::trim(hardware_cursor);
+            needs_disable = !(boost::algorithm::iequals(hardware_cursor, "false") || hardware_cursor == "0");
+          }
+        }
+      }
+      catch (const std::exception &e) {
+        BOOST_LOG(warning) << "Unable to inspect VDD HardwareCursor setting; will request software cursor for direct capture: " << e.what();
+      }
+
+      if (!needs_disable) {
+        BOOST_LOG(debug) << "VDD HardwareCursor is already disabled for direct capture";
+        return true;
+      }
+
+      BOOST_LOG(info) << "Disabling VDD HardwareCursor because direct VDD capture only receives the shared framebuffer texture";
+      if (!set_hardware_cursor_enabled(false)) {
+        return false;
+      }
+
+      if (changed) {
+        *changed = true;
+      }
+      return true;
     }
 
     set_vdd_result

@@ -69,7 +69,7 @@
 		-->
 	</colour>
 	<cursor>
-		<HardwareCursor>true</HardwareCursor>
+		<HardwareCursor>false</HardwareCursor>
 		<!--Whether to display a hardware cursor in the buffer (If disabled streaming apps will use client cursor)-->
 		<CursorMaxY>128</CursorMaxY>
 		<!--The maximum height support for all cursor types. Older intel cpus may be limited to 64x64 -->

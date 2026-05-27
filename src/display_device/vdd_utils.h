@@ -74,6 +74,16 @@ namespace display_device::vdd_utils {
   reload_driver();
 
   /**
+   * @brief Ensure ZakoVDD renders the cursor into the framebuffer instead of exposing a hardware cursor plane.
+   * @details Sunshine's direct VDD capture backend consumes only the shared frame texture exported by ZakoVDD.
+   *          Hardware cursor planes are not part of that texture, so they would be invisible to remote clients.
+   * @param changed Optional output set to true when this call had to update the driver setting.
+   * @return True when the setting is already safe or was updated successfully.
+   */
+  bool
+  ensure_hardware_cursor_disabled_for_capture(bool *changed = nullptr);
+
+  /**
    * @brief Outcome of attempting a live SETMODES update.
    * @details Lets callers distinguish "driver accepted" / "driver rejected" /
    *          "feature not present" / "config is unusable" so the persistent
