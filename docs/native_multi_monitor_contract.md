@@ -1,10 +1,11 @@
 # Native multi-monitor contracts (P0)
 
-**Unimplemented product design.** P0 supplies executable, standalone contracts
-and fixtures only. None of these sources is in the production host source list,
-and no existing production call site uses them. This does **not** enable native
-multi-monitor streaming, new configuration, a driver interface, or a protocol.
-Implementation stops at **G0, awaiting user review before P1**.
+**Unimplemented product design.** P0 supplied executable, standalone contracts
+and fixtures without changing production call sites. The user reviewed G0 and
+authorized P1. P1 is in progress; its serialized command-queue foundation is
+not yet connected to production display operations. This does **not** enable
+native multi-monitor streaming, new configuration, a driver interface, or a
+protocol.
 
 The reviewed architecture's P0 scope (section 9.1) is the boundary of this
 document. Its later phases are not implementation authorization.
@@ -26,10 +27,13 @@ are **trusted coordinator inputs, not authentication or client-supplied proof**.
 P1 must derive them from current pairing/policy authority.
 
 P0 contains no CCD, DXGI, SetupAPI, VDD IOCTL, GPU, capture, encoder, filesystem
-journal, network, or input-injection operations. It adds no executor, threads,
-driver/capture/allocator fakes, feature bits, wire messages, or key derivation.
-There are no changes to production session/video/stream/RTSP/HTTP/tray/config/UI
-paths. Cross-GPU transfer is excluded, not an automatic fallback.
+journal, network, or input-injection operations. P1 currently adds a serialized
+command queue with generation invalidation, per-command cancellation handles,
+and deadlines, plus standalone fake-clock tests. Per-command handles let launch
+expiry cancel only its associated monitor operation. The queue is not yet wired
+into production and does not authorize platform operations. There are no changes
+to production session/video/stream/RTSP/HTTP/tray/config/UI paths. Cross-GPU
+transfer is excluded, not an automatic fallback.
 
 ## Code and existing-type adoption
 
@@ -306,7 +310,7 @@ and keep baseline evidence separate from restoration authority.
 
 | Gate | Required before proceeding |
 |---|---|
-| **G0 / P1** | User reviews these P0 contracts, mutation/regression evidence, adoption boundaries and legacy/replay adapter obligations |
+| **G0 / P1** | User reviewed these P0 contracts and authorized P1; G1 remains pending |
 | **GD / driver D** | User/maintainer decides upstream/fork, signing, distribution and minimum driver capability/version policy |
 | **G1 / P2** | P1 ownership/journal/bypass-closure and unchanged N=1 evidence |
 | **G2 / P3** | Distinct source/capture and P2 aggregate admission/replacement evidence |
@@ -318,3 +322,28 @@ and keep baseline evidence separate from restoration authority.
 P0 does not choose history retirement, implement the legacy adapter, establish
 Windows full-head correlation, decide driver distribution, or qualify hardware
 limits. Those remain explicit later-gate obligations, not silent fallbacks.
+
+## P1 implementation status
+
+The standalone `display_topology_coordinator_unit_tests` target exercises single-
+worker FIFO execution, generation invalidation, cancellation during an in-flight
+command, per-command launch cancellation without affecting an unrelated command
+in the same generation, queued deadline expiry, stale submissions and exception
+reporting. The queue has not yet been integrated with `session_t`, launch-ticket
+lifecycle, Windows topology mutation paths, durable journal recovery, or the
+administrator profile/status surface. No production display behavior has
+changed, and this status is not evidence for G1.
+
+User-confirmed P1 decisions:
+
+- Every monitor-changing action is serialized through the one queue, not only
+  stream starts. Rotation, scale, resolution, VDD create/destroy and restore
+  wait their turn.
+- The legacy "unknown configured output falls back to primary" behavior is
+  preserved only for legacy scalar settings through an explicit compatibility
+  adapter. Native multi-monitor profiles keep strict resolution.
+- After a crash or interrupted change, recovery of the unfinished journaled
+  change completes before any new stream start or display change is admitted.
+- When a stream-start ticket expires or is cancelled, the monitor command tied
+  to that ticket is cancelled by its own handle; unrelated queued work in the
+  same generation continues.
