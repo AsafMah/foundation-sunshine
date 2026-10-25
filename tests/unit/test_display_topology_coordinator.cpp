@@ -153,17 +153,32 @@ namespace {
     topology_command_queue_t queue { [&clock]() { return clock.now(); } };
     const auto stale_generation = queue.generation();
     const auto current_generation = queue.begin_generation();
+    std::promise<void> busy_started;
+    std::promise<void> release_busy;
+    auto release_busy_future = release_busy.get_future().share();
     std::atomic_bool ran {};
 
+    // Keeps the worker busy, so only the submit-time checks can complete the next two.
+    auto busy = queue.submit(current_generation, 100ms, [&](const command_context_t &) {
+      busy_started.set_value();
+      release_busy_future.wait();
+    });
+    busy_started.get_future().wait();
     auto stale = queue.submit(stale_generation, 100ms, [&](const command_context_t &) {
       ran.store(true);
     });
     auto expired = queue.submit(current_generation, 0ms, [&](const command_context_t &) {
       ran.store(true);
     });
+    const bool stale_ready = stale.completion.wait_for(0ms) == std::future_status::ready;
+    const bool expired_ready = expired.completion.wait_for(0ms) == std::future_status::ready;
+    release_busy.set_value();
 
+    EXPECT_TRUE(stale_ready) << "a stale-generation submission waited for the worker";
+    EXPECT_TRUE(expired_ready) << "an already-expired submission waited for the worker";
     EXPECT_EQ(stale.completion.get().status, command_status_e::stale_generation);
     EXPECT_EQ(expired.completion.get().status, command_status_e::expired_before_start);
+    EXPECT_EQ(busy.completion.get().status, command_status_e::completed);
     EXPECT_FALSE(ran.load());
   }
 
