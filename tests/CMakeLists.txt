@@ -202,6 +202,19 @@ if (WIN32)
 endif ()
 add_test(NAME display_topology_unit_tests COMMAND display_topology_unit_tests)
 
+add_executable(display_topology_coordinator_unit_tests
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_command_queue.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology_coordinator.cpp)
+target_include_directories(display_topology_coordinator_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(display_topology_coordinator_unit_tests PRIVATE gtest_main
+        sunshine_project_options sunshine_coverage)
+target_compile_options(display_topology_coordinator_unit_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>)
+set_target_properties(display_topology_coordinator_unit_tests PROPERTIES CXX_STANDARD 23)
+if (WIN32)
+    set_target_properties(display_topology_coordinator_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
+endif ()
+add_test(NAME display_topology_coordinator_unit_tests COMMAND display_topology_coordinator_unit_tests)
+
 add_executable(pyrowave_unit_tests
         ${CMAKE_SOURCE_DIR}/src/pyrowave/types.cpp
         ${CMAKE_SOURCE_DIR}/src/pyrowave/config.cpp
@@ -545,6 +558,7 @@ list(REMOVE_ITEM TEST_SOURCES
         ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology_lifecycle.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology_journal.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology_coordinator.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_frame_contract.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_http_util.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_input_activity.cpp
