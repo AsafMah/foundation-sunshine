@@ -703,7 +703,7 @@ namespace display_device::topology {
                                     " cannot end a managed lease" };
     }
     std::lock_guard lock { mutex_ };
-    if (!lease_ || lease_->flavor != launch_flavor_e::managed || lease_->stage == lease_stage_e::preparing ||
+    if (!lease_ || lease_->flavor != launch_flavor_e::managed || lease_->stage != lease_stage_e::active ||
         (launch_session_id && lease_->launch_session_id != *launch_session_id)) {
       return false;
     }

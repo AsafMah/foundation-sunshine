@@ -268,7 +268,10 @@ namespace display_device::topology {
     launch_activated(std::uint32_t launch_session_id);
 
     /**
-     * @brief End a bound or active managed lease and post the native restore as `kind`.
+     * @brief End the active managed lease and post the native restore as `kind`.
+     * @details Only an active lease (its stream connected) ends here. A bound lease belongs
+     *          to a launch whose stream has not connected yet, possibly a newer launch than
+     *          the stream that ended; it ends through ticket abandonment or the idle grace.
      * @param launch_session_id When set, only the lease of that launch is ended, so a late
      *        end event for an earlier launch cannot end a newer one.
      * @return true when this call ended the lease.

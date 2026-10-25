@@ -1505,6 +1505,32 @@ namespace {
     EXPECT_TRUE(legacy.status().lease);
   }
 
+  TEST(DisplayTopologyCoordinator, AStreamEndLeavesABoundManagedLeaseAlone) {
+    fake_clock_t clock;
+    std::atomic_int restores {};
+    auto options = make_options(clock, true);
+    options.native_restore = counting(restores);
+    coordinator_t coordinator { std::move(options) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+
+    // The previous stream ended after this launch bound its ticket but before it connected.
+    const auto launch = coordinator.admit_launch({ 211, "cert:a" });
+    ASSERT_TRUE(launch);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *launch.token));
+    EXPECT_FALSE(coordinator.end_managed_lease(command_kind_e::stream_restore)) << "a stream end released a bound lease";
+    EXPECT_FALSE(coordinator.end_managed_lease(command_kind_e::stream_restore, 211)) << "a stream end released a bound lease";
+    auto status = coordinator.status();
+    ASSERT_TRUE(status.lease);
+    EXPECT_EQ(status.lease->launch_session_id, 211u);
+    EXPECT_EQ(status.lease->stage, lease_stage_e::bound);
+    EXPECT_EQ(status.native_restores_posted, 0u);
+
+    coordinator.launch_activated(211);
+    EXPECT_TRUE(coordinator.end_managed_lease(command_kind_e::stream_restore));
+    ASSERT_TRUE(flush(coordinator).completed());
+    EXPECT_EQ(restores.load(), 1);
+  }
+
   TEST(DisplayTopologyCoordinator, ALateStreamEndCannotEndTheNextLaunchsLease) {
     fake_clock_t clock;
     std::atomic_int restores {};
