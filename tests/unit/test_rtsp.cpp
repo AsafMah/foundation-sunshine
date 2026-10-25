@@ -253,6 +253,35 @@ TEST(LaunchSessionManager, AuthenticatesEncryptedClaimByGcmTagAcrossRouteChanges
   EXPECT_EQ(std::string_view(reinterpret_cast<const char *>(claim.plaintext.data()), claim.plaintext.size()), plaintext);
 }
 
+TEST(LaunchSessionManager, ContainsReportsPendingAndClaimedTicketsUntilTheyExpireOrAreRemoved) {
+  rtsp_stream::launch_session_manager_t manager;
+  const auto now = rtsp_stream::launch_session_manager_t::clock_t::now();
+
+  ASSERT_EQ(manager.register_session(make_session(40, "cert-40", "192.0.2.40"), 1s, now),
+            rtsp_stream::launch_ticket_register_e::accepted);
+  ASSERT_EQ(manager.register_session(make_session(41, "cert-41", "192.0.2.41"), 1s, now),
+            rtsp_stream::launch_ticket_register_e::accepted);
+  EXPECT_TRUE(manager.contains(40, now));
+  EXPECT_FALSE(manager.contains(42, now));
+
+  // A claimed ticket outlives the pending expiry; a pending one does not.
+  ASSERT_TRUE(manager.claim_plaintext("192.0.2.40", now));
+  EXPECT_TRUE(manager.contains(40, now + 2s));
+  EXPECT_FALSE(manager.contains(41, now + 2s));
+
+  // Released by its last RTSP connection, it is pending again until the new expiry.
+  EXPECT_TRUE(manager.release(40, 1s, now + 2s));
+  EXPECT_TRUE(manager.contains(40, now + 2s));
+  EXPECT_FALSE(manager.contains(40, now + 4s));
+
+  // The control stream erases the ticket when the stream activates.
+  ASSERT_EQ(manager.register_session(make_session(43, "cert-43", "192.0.2.43"), 10s, now + 4s),
+            rtsp_stream::launch_ticket_register_e::accepted);
+  EXPECT_TRUE(manager.contains(43, now + 4s));
+  EXPECT_TRUE(manager.erase(43));
+  EXPECT_FALSE(manager.contains(43, now + 4s));
+}
+
 TEST(LaunchSessionManager, ExpiredTicketReleasesCompatibilityLease) {
   rtsp_stream::launch_session_manager_t manager;
   const auto now = rtsp_stream::launch_session_manager_t::clock_t::now();

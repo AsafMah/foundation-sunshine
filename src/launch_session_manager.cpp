@@ -264,4 +264,13 @@ namespace rtsp_stream {
     return _impl->tickets.size();
   }
 
+  bool
+  launch_session_manager_t::contains(std::uint32_t launch_session_id, clock_t::time_point now) {
+    std::lock_guard lock { _impl->mutex };
+    _impl->prune_locked(now);
+    return std::any_of(_impl->tickets.begin(), _impl->tickets.end(), [launch_session_id](const auto &ticket) {
+      return ticket.session && ticket.session->id == launch_session_id;
+    });
+  }
+
 }  // namespace rtsp_stream

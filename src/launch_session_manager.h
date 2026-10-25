@@ -93,6 +93,13 @@ namespace rtsp_stream {
     std::size_t
     size(clock_t::time_point now = clock_t::now());
 
+    /**
+     * @brief Whether the ticket of this launch is still pending or claimed.
+     * @details Expired pending tickets are pruned first, so an expired ticket is never reported.
+     */
+    bool
+    contains(std::uint32_t launch_session_id, clock_t::time_point now = clock_t::now());
+
   private:
     struct impl_t;
     std::unique_ptr<impl_t> _impl;
