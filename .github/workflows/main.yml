@@ -411,10 +411,16 @@ jobs:
         if: steps.inno-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          # Download and install Inno Setup 6 (silent install)
-          $url = "https://jrsoftware.org/download.php/is.exe"
+          # Download and install Inno Setup 6 (silent install). The unversioned
+          # jrsoftware.org/download.php/is.exe link now serves an HTML page, so
+          # pin the signed release asset and verify its publisher before running it.
+          $url = "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe"
           $installer = "$env:TEMP\innosetup.exe"
           Invoke-WebRequest -Uri $url -OutFile $installer
+          $signature = Get-AuthenticodeSignature -FilePath $installer
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch '(^|, )CN=Pyrsys B\.V\.(,|$)') {
+            throw "Unexpected Inno Setup installer signature: $($signature.Status) $($signature.SignerCertificate.Subject)"
+          }
           Start-Process -FilePath $installer -ArgumentList '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-' -Wait
 
       - name: Add Inno Setup to PATH
