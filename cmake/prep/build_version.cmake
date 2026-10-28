@@ -1,7 +1,8 @@
 # Check if env vars are defined before attempting to access them, variables will be defined even if blank
 if((DEFINED ENV{BRANCH}) AND (DEFINED ENV{BUILD_VERSION}) AND (DEFINED ENV{COMMIT}))  # cmake-lint: disable=W0106
-    if(($ENV{BRANCH} STREQUAL "master") AND (NOT $ENV{BUILD_VERSION} STREQUAL ""))
-        # If BRANCH is "master" and BUILD_VERSION is not empty, then we are building a master branch
+    if((($ENV{BRANCH} STREQUAL "master") OR ("$ENV{FORK_RELEASE}" STREQUAL "true")) AND (NOT $ENV{BUILD_VERSION} STREQUAL ""))
+        # If BRANCH is "master" and BUILD_VERSION is not empty, then we are building a master branch.
+        # Fork release builds (FORK_RELEASE=true) also carry their own release version.
         MESSAGE("Got from CI master branch and version $ENV{BUILD_VERSION}")
         set(PROJECT_VERSION $ENV{BUILD_VERSION})
         set(CMAKE_PROJECT_VERSION ${PROJECT_VERSION})  # cpack will use this to set the binary versions

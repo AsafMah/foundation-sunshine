@@ -28,6 +28,10 @@ on:
           - 'AUTO'
           - 'ON'
           - 'OFF'
+      fork_release:
+        description: 'Forks only: publish a GitHub Release that the fork-built control panel updates from'
+        type: boolean
+        default: true
 
 concurrency:
   group: '${{ github.workflow }}-${{ github.ref }}'
@@ -42,18 +46,22 @@ jobs:
   setup_release:
     name: Setup Release
     outputs:
-      publish_release: ${{ steps.setup_release_auto.outputs.publish_release || steps.setup_release_manual.outputs.publish_release }}
-      release_body: ${{ steps.filter_release_contributors.outputs.release_body || steps.setup_release_auto.outputs.release_body || steps.setup_release_manual.outputs.release_body }}
-      release_commit: ${{ steps.setup_release_auto.outputs.release_commit || steps.setup_release_manual.outputs.release_commit }}
-      release_generate_release_notes: ${{ steps.setup_release_auto.outputs.release_generate_release_notes || steps.setup_release_manual.outputs.release_generate_release_notes }}
-      release_tag: ${{ steps.setup_release_auto.outputs.release_tag || steps.setup_release_manual.outputs.release_tag }}
-      release_version: ${{ steps.setup_release_auto.outputs.release_version || steps.setup_release_manual.outputs.release_version }}
+      fork_release: ${{ steps.setup_release_fork.outputs.fork_release || 'false' }}
+      publish_release: ${{ steps.setup_release_fork.outputs.publish_release || steps.setup_release_auto.outputs.publish_release || steps.setup_release_manual.outputs.publish_release }}
+      release_body: ${{ steps.setup_release_fork.outputs.release_body || steps.filter_release_contributors.outputs.release_body || steps.setup_release_auto.outputs.release_body || steps.setup_release_manual.outputs.release_body }}
+      release_commit: ${{ steps.setup_release_fork.outputs.release_commit || steps.setup_release_auto.outputs.release_commit || steps.setup_release_manual.outputs.release_commit }}
+      release_generate_release_notes: ${{ steps.setup_release_fork.outputs.release_generate_release_notes || steps.setup_release_auto.outputs.release_generate_release_notes || steps.setup_release_manual.outputs.release_generate_release_notes }}
+      release_tag: ${{ steps.setup_release_fork.outputs.release_tag || steps.setup_release_auto.outputs.release_tag || steps.setup_release_manual.outputs.release_tag }}
+      release_version: ${{ steps.setup_release_fork.outputs.release_version || steps.setup_release_auto.outputs.release_version || steps.setup_release_manual.outputs.release_version }}
     permissions:
       contents: write  # read does not work to check squash and merge details
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # Fork releases locate their upstream base release by ancestry.
+          fetch-depth: ${{ github.repository == 'AlkaidLab/foundation-sunshine' && 1 || 0 }}
 
       - name: Setup Release (Auto)
         id: setup_release_auto
@@ -73,6 +81,43 @@ jobs:
           echo "release_generate_release_notes=false" >> $GITHUB_OUTPUT
           echo "release_tag=manual-$(date +%Y%m%d-%H%M%S)${SUFFIX}" >> $GITHUB_OUTPUT
           echo "release_version=manual-$(date +%Y%m%d-%H%M%S)${SUFFIX}" >> $GITHUB_OUTPUT
+
+      - name: Setup Release (Fork)
+        id: setup_release_fork
+        # A fork release is versioned as the newest upstream release contained
+        # in this commit plus the run number: v<base>.<run>. The updater's
+        # numeric comparison then orders it after its upstream base and fork
+        # releases on that base, and before the next upstream release.
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          github.repository != 'AlkaidLab/foundation-sunshine' &&
+          inputs.fork_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base=""
+          while read -r tag sha; do
+            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
+            if git merge-base --is-ancestor "$sha" HEAD 2>/dev/null; then
+              base="$tag"
+              break
+            fi
+          done < <(gh api "repos/AlkaidLab/foundation-sunshine/releases?per_page=100" \
+            --jq '.[] | select(.draft | not) | select(.tag_name | test("^v[0-9]+[.][0-9]+[.][0-9]+")) | "\(.tag_name) \(.target_commitish)"')
+          if [[ ! "$base" =~ ^v([0-9]+[.][0-9]+[.][0-9]+) ]]; then
+            echo "No upstream release is an ancestor of ${GITHUB_SHA}"
+            exit 1
+          fi
+          tag="v${BASH_REMATCH[1]}.${GITHUB_RUN_NUMBER}"
+          echo "Fork release ${tag} on upstream ${base}"
+          echo "fork_release=true" >> $GITHUB_OUTPUT
+          echo "publish_release=false" >> $GITHUB_OUTPUT
+          echo "release_body=Fork build of ${GITHUB_REF_NAME} (${GITHUB_SHA}) on upstream ${base}" >> $GITHUB_OUTPUT
+          echo "release_commit=${GITHUB_SHA}" >> $GITHUB_OUTPUT
+          echo "release_generate_release_notes=false" >> $GITHUB_OUTPUT
+          echo "release_tag=${tag}" >> $GITHUB_OUTPUT
+          echo "release_version=${tag}" >> $GITHUB_OUTPUT
 
       - name: Filter bot contributors
         id: filter_release_contributors
@@ -223,6 +268,30 @@ jobs:
           echo "  Ninja: $(ninja --version)"
           echo "  GCC: $(gcc --version | head -1)"
 
+      - name: Setup Node.js for the fork control panel
+        if: github.repository != 'AlkaidLab/foundation-sunshine'
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24.21.0
+
+      - name: Build fork control panel from source
+        # Forks ship the submodule's control panel instead of the latest
+        # official release, so its updater trusts this repository's releases.
+        if: github.repository != 'AlkaidLab/foundation-sunshine'
+        shell: pwsh
+        working-directory: src_assets/common/sunshine-control-panel
+        env:
+          FOUNDATION_RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          npm ci
+          if ($LASTEXITCODE) { throw 'Control panel npm ci failed' }
+          npm run build:renderer
+          if ($LASTEXITCODE) { throw 'Control panel renderer build failed' }
+          ./scripts/build-native-plugins.ps1 -Configuration Release -Target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE) { throw 'Control panel native plugin build failed' }
+          cargo build --manifest-path src-tauri/Cargo.toml --release --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE) { throw 'Control panel build failed' }
+
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
@@ -239,7 +308,7 @@ jobs:
         shell: pwsh
         env:
           RELEASE_TAG: ${{ needs.setup_release.outputs.release_tag }}.杂鱼
-        run: .\scripts\build-ds5-sidecar.ps1 -ReleaseTag $env:RELEASE_TAG
+        run: .\scripts\build-ds5-sidecar.ps1 -ReleaseTag $env:RELEASE_TAG -Repository '${{ github.repository }}'
 
       - name: Build Web UI
         shell: pwsh
@@ -268,7 +337,7 @@ jobs:
             ccache-windows-
 
       - name: Fetch paired GUI artifact
-        if: github.event_name == 'workflow_dispatch' && inputs.gui_run_id != ''
+        if: github.repository == 'AlkaidLab/foundation-sunshine' && github.event_name == 'workflow_dispatch' && inputs.gui_run_id != ''
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -293,6 +362,8 @@ jobs:
           BRANCH: ${{ github.head_ref || github.ref_name }}
           BUILD_VERSION: ${{ needs.setup_release.outputs.release_tag }}.杂鱼
           COMMIT: ${{ needs.setup_release.outputs.release_commit }}
+          FORK_RELEASE: ${{ needs.setup_release.outputs.fork_release }}
+          FORK_BUILD: ${{ github.repository != 'AlkaidLab/foundation-sunshine' }}
           # ccache.exe is a native binary, so it reads the Windows-style path
           # straight out of the environment even under the msys2 shell.
           CCACHE_DIR: ${{ github.workspace }}\.ccache
@@ -309,7 +380,12 @@ jobs:
           mkdir -p build
           ccache --zero-stats
           gui_options=()
-          if [[ -n "${GUI_BUNDLE_DIR:-}" ]]; then
+          if [[ "$FORK_BUILD" == "true" ]]; then
+            # Never package an official GUI on a fork (fetched release or
+            # paired artifact): its updater would replace the fork. The tray
+            # build fails if the source-built control panel is missing.
+            gui_options=(-DFETCH_GUI=OFF)
+          elif [[ -n "${GUI_BUNDLE_DIR:-}" ]]; then
             gui_options=(-DFETCH_GUI=OFF "-DGUI_DIR=$GUI_BUNDLE_DIR")
           fi
           cmake \
@@ -354,7 +430,7 @@ jobs:
         # produced valid objects). PR runs restore master's entry, so they
         # don't need to save, and skipping their saves keeps the shared
         # cache quota flat.
-        if: always() && github.ref == 'refs/heads/master'
+        if: always() && (github.ref == 'refs/heads/master' || (github.repository != 'AlkaidLab/foundation-sunshine' && github.ref == 'refs/heads/integration'))
         id: ccache_save
         continue-on-error: true
         uses: actions/cache/save@v6
@@ -376,7 +452,7 @@ jobs:
         # Skipped unless the save step actually succeeded (outcome keeps the
         # real result under continue-on-error; the save subaction sets no
         # outputs, so conclusion can't tell success from failure).
-        if: always() && github.ref == 'refs/heads/master' && steps.ccache_save.outcome == 'success'
+        if: always() && (github.ref == 'refs/heads/master' || (github.repository != 'AlkaidLab/foundation-sunshine' && github.ref == 'refs/heads/integration')) && steps.ccache_save.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
@@ -549,6 +625,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: sunshine-windows-r${{ github.run_number }}
+          # Full reruns keep the run number; the fork publish job needs this name.
+          overwrite: true
           path: |
             artifacts/Sunshine.*.WindowsInstaller.exe
             artifacts/Sunshine.*.Portable-x64.zip
@@ -569,3 +647,34 @@ jobs:
           prerelease: true
           tag: ${{ needs.setup_release.outputs.release_tag }}.杂鱼
           token: ${{ secrets.GH_BOT_TOKEN }}
+
+  publish_fork_release:
+    name: Publish fork release
+    needs: [setup_release, build_win]
+    if: needs.setup_release.outputs.fork_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Publish GitHub Release
+        # Same tag as the version stamped into Sunshine and the DualSense
+        # sidecar manifest. Published as the latest stable release so the
+        # fork control panel's default stable channel finds it; the updater
+        # verifies each asset against GitHub's SHA-256 digest.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.setup_release.outputs.release_tag }}.杂鱼
+          NOTES: ${{ needs.setup_release.outputs.release_body }}
+          COMMIT: ${{ needs.setup_release.outputs.release_commit }}
+        run: |
+          set -euo pipefail
+          gh run download "${{ github.run_id }}" --repo "$GITHUB_REPOSITORY" \
+            --name "sunshine-windows-r${{ github.run_number }}" --dir artifacts
+          ls -l artifacts
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" artifacts/* --repo "$GITHUB_REPOSITORY" \
+              --target "$COMMIT" --title "$TAG" --notes "$NOTES" --latest
+          fi
