@@ -276,6 +276,8 @@ TEST_F(ConfigHttpRoutes, EveryRegisteredRouteDispatchesItsMethodPathAndCapturesO
   for (auto &[pattern, methods] : server->resource) {
     auto path = pattern.str.substr(1, pattern.str.size() - 2);
     replace(path, "([0-9]+)", "42");
+    // File-transfer offer IDs are 64 lowercase hex digits.
+    replace(path, "([a-f0-9]{64})", std::string(64, 'a'));
     // The remaining captures are component and clipboard/file-mapping IDs.
     path = std::regex_replace(path, std::regex(R"(\([^)]*\))"), "id_1");
     replace(path, "\\/", "/");

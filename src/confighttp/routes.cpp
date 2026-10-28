@@ -17,6 +17,8 @@
 #include "src/confighttp/proxies.h"
 #include "src/confighttp/runtime.h"
 #include "src/file_mapping/config_http.h"
+#include "src/file_transfer_http.h"
+#include "src/logging.h"
 #include "src/network.h"
 #include "src/text_context/http.h"
 #include "src/tray/tray_http.h"
@@ -44,6 +46,29 @@ namespace confighttp {
     clipboard_http::register_routes(server,
       [](clipboard_http::resp_https_t resp, clipboard_http::req_https_t req) {
         return authenticate(std::move(resp), std::move(req));
+      });
+    // Host-to-client file transfer offers. Offer creation is local-GUI-facing
+    // through confighttp; the paired client download endpoint is also mirrored
+    // onto nvhttp so clients can fetch bytes over their certificate-authenticated
+    // GameStream HTTPS channel.
+    file_transfer_http::register_routes(server,
+      [](file_transfer_http::resp_https_t resp, file_transfer_http::req_https_t req) {
+        if (!authenticate(resp, req)) {
+          return false;
+        }
+
+        const auto client_address = req->remote_endpoint().address();
+        const auto address = net::addr_to_normalized_string(client_address);
+        if (net::from_address(address) != net::PC) {
+          web::CaseInsensitiveMultimap headers;
+          headers.emplace("Content-Type", "application/json");
+          headers.emplace("Cache-Control", "no-store");
+          resp->write(web::StatusCode::forbidden, R"({"error":"local_only"})", headers);
+          BOOST_LOG(warning) << "FileTransfer: local-only endpoint denied for " << client_address.to_string();
+          return false;
+        }
+
+        return true;
       });
     text_context::http::register_routes(server,
       [](text_context::http::resp_https_t resp, text_context::http::req_https_t req) {

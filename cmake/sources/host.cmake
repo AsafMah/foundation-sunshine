@@ -56,6 +56,8 @@ set(SUNSHINE_HOST_SOURCES
     src/cursor_channel.cpp src/cursor_channel.h
     src/clipboard_blob_store.cpp src/clipboard_blob_store.h
     src/clipboard_http.cpp src/clipboard_http.h
+    src/file_transfer_store.cpp src/file_transfer_store.h
+    src/file_transfer_http.cpp src/file_transfer_http.h
     src/video.cpp src/video.h
     src/video_hdr_metadata.cpp src/video_hdr_metadata.h
     src/video_hdr_bitstream.cpp src/video_hdr_bitstream.h
@@ -142,6 +144,7 @@ set(SUNSHINE_HOST_SOURCES
     src/nvhttp/ai_api.cpp src/nvhttp/ai_api.h
     src/nvhttp/apps.cpp src/nvhttp/apps.h
     src/nvhttp/clipboard_api.cpp src/nvhttp/clipboard_api.h
+    src/nvhttp/file_transfer_api.cpp src/nvhttp/file_transfer_api.h
     src/nvhttp/display_control.cpp src/nvhttp/display_control.h
     src/nvhttp/display_scale.cpp src/nvhttp/display_scale.h
     src/nvhttp/dynamic_params.cpp src/nvhttp/dynamic_params.h
