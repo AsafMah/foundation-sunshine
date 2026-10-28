@@ -59,6 +59,8 @@ const DEFAULT_TABS = [
       virtual_mouse: 'enabled',
       capture_cursor: true,
       amf_draw_mouse_cursor: false,
+      clipboard_sync: true,
+      file_transfer: true,
       enable_dsu_server: 'disabled',
       dsu_server_port: 26760,
       keybindings: '[0x10,0xA0,0x11,0xA2,0x12,0xA4]',

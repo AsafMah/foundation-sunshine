@@ -413,6 +413,30 @@ onBeforeUnmount(() => {
       <div class="form-text">{{ $t('config.amf_draw_mouse_cursor_desc') }}</div>
     </div>
 
+    <!-- Clipboard sync -->
+    <div class="mb-3">
+      <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" id="clipboard_sync"
+               v-model="config.clipboard_sync">
+        <label class="form-check-label" for="clipboard_sync">
+          {{ $t('config.clipboard_sync') }}
+        </label>
+      </div>
+      <div class="form-text">{{ $t('config.clipboard_sync_desc') }}</div>
+    </div>
+
+    <!-- Host-to-client file transfer -->
+    <div class="mb-3">
+      <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" id="file_transfer"
+               v-model="config.file_transfer">
+        <label class="form-check-label" for="file_transfer">
+          {{ $t('config.file_transfer') }}
+        </label>
+      </div>
+      <div class="form-text">{{ $t('config.file_transfer_desc') }}</div>
+    </div>
+
     <div
       class="mb-3 accordion"
       v-if="platform === 'windows' && ((config.controller === 'enabled' && vigem.available) || config.mouse === 'enabled')"
