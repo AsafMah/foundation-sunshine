@@ -33,7 +33,9 @@ namespace file_transfer_http {
   };
 
   response_t make_offer_response(const std::string &body);
-  download_response_t make_download_response(const std::string &id);
+  /// requester_uuid is the downloading client's certificate UUID; offers bound
+  /// to another client are reported as not found.
+  download_response_t make_download_response(const std::string &id, const std::string &requester_uuid = {});
 
   template <typename Request>
   inline response_t process_offer(const Request &req) {
@@ -45,7 +47,7 @@ namespace file_transfer_http {
   template <typename Request>
   inline download_response_t process_download(const Request &req) {
     const std::string id = req->path_match.size() >= 2 ? req->path_match[1].str() : std::string {};
-    return make_download_response(id);
+    return make_download_response(id, req->client_uuid);
   }
 
   template <typename Response>

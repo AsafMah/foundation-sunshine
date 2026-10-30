@@ -100,3 +100,24 @@ TEST(FileTransferHttp, RejectsWhenDisabled) {
 
   config::input.file_transfer = old;
 }
+
+TEST(FileTransferHttp, OfferBoundToClientIsHiddenFromOthers) {
+  auto path = make_temp_file("bound");
+  nlohmann::json req;
+  req["path"] = path_to_utf8(path);
+  req["client_uuid"] = "client-a";
+
+  auto out = file_transfer_http::make_offer_response(req.dump());
+  ASSERT_EQ(out.status, web::StatusCode::ok);
+  const auto id = nlohmann::json::parse(out.body)["id"].get<std::string>();
+
+  EXPECT_EQ(file_transfer_http::make_download_response(id, "client-a").status, web::StatusCode::ok);
+  EXPECT_EQ(file_transfer_http::make_download_response(id, "client-b").status, web::StatusCode::not_found);
+  EXPECT_EQ(file_transfer_http::make_download_response(id, "").status, web::StatusCode::not_found);
+
+  req["client_uuid"] = 5;
+  EXPECT_EQ(file_transfer_http::make_offer_response(req.dump()).status, web::StatusCode::bad_request);
+
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+}

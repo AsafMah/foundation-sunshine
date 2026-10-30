@@ -80,7 +80,7 @@ namespace file_transfer_store {
   }  // namespace
 
   create_result_t
-  create_single_file_offer(const std::filesystem::path &path) {
+  create_single_file_offer(const std::filesystem::path &path, const std::string &client_uuid) {
     std::error_code ec;
     const auto canonical = std::filesystem::canonical(path, ec);
     if (ec) {
@@ -106,6 +106,7 @@ namespace file_transfer_store {
       offer.display_name = "download";
     }
     offer.size = static_cast<std::uint64_t>(size);
+    offer.client_uuid = client_uuid;
     offer.expires_at = clock_t::now() + std::chrono::seconds(kOfferTtlSeconds);
 
     std::lock_guard<std::mutex> lk(g_mu);

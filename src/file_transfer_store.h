@@ -24,6 +24,8 @@ namespace file_transfer_store {
     std::filesystem::path path;
     std::string display_name;
     std::uint64_t size;
+    /// When set, only this paired client may download the offer.
+    std::string client_uuid;
     std::chrono::steady_clock::time_point expires_at;
   };
 
@@ -35,7 +37,7 @@ namespace file_transfer_store {
 
   /// Create a single-file offer from an existing host path. Directories and
   /// non-regular files are rejected in the initial MVP.
-  create_result_t create_single_file_offer(const std::filesystem::path &path);
+  create_result_t create_single_file_offer(const std::filesystem::path &path, const std::string &client_uuid = {});
 
   struct get_result_t {
     bool found;
