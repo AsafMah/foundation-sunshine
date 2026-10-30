@@ -61,6 +61,9 @@ set(SUNSHINE_HOST_SOURCES
     src/clipboard_http.cpp src/clipboard_http.h
     src/file_transfer_store.cpp src/file_transfer_store.h
     src/file_transfer_http.cpp src/file_transfer_http.h
+    src/file_upload_store.cpp src/file_upload_store.h
+    src/file_upload_api.cpp src/file_upload_api.h
+    src/file_upload_routes.cpp src/file_upload_routes.h
     src/video.cpp src/video.h
     src/video_hdr_metadata.cpp src/video_hdr_metadata.h
     src/video_hdr_bitstream.cpp src/video_hdr_bitstream.h

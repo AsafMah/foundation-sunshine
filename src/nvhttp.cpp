@@ -62,6 +62,7 @@
 #include "nvhttp/apps.h"
 #include "nvhttp/clipboard_api.h"
 #include "nvhttp/file_transfer_api.h"
+#include "file_upload_routes.h"
 #include "nvhttp/display_control.h"
 #include "nvhttp/display_scale.h"
 #include "nvhttp/dynamic_params.h"
@@ -1152,6 +1153,11 @@ namespace nvhttp {
     // File transfer bytes are fetched by paired clients over nvhttp. Offer
     // creation remains local-only on confighttp.
     https_server.resource["^/api/v1/file-transfer/([a-f0-9]{64})$"]["GET"] = file_transfer_api::get;
+
+    // Client-to-host uploads (drop onto the stream, file copy/paste), bound to
+    // the certificate client UUID. Gated by the file_upload setting.
+    file_upload_routes::init();
+    file_upload_routes::register_client_routes(https_server);
 
     https_server.resource["^/api/v1/file-mapping/capability$"]["GET"] =
       [&](resp_https_t resp, req_https_t req) {

@@ -99,6 +99,17 @@ target_link_libraries(current_capture_target_unit_tests PRIVATE gtest_main sunsh
 set_target_properties(current_capture_target_unit_tests PROPERTIES CXX_STANDARD 23)
 add_test(NAME current_capture_target_unit_tests COMMAND current_capture_target_unit_tests)
 
+add_executable(file_upload_store_unit_tests
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_file_upload_store.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_file_upload_api.cpp
+        ${CMAKE_SOURCE_DIR}/src/file_upload_store.cpp
+        ${CMAKE_SOURCE_DIR}/src/file_upload_api.cpp)
+target_include_directories(file_upload_store_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(file_upload_store_unit_tests PRIVATE gtest_main OpenSSL::Crypto nlohmann_json::nlohmann_json
+        sunshine_project_options sunshine_coverage)
+set_target_properties(file_upload_store_unit_tests PROPERTIES CXX_STANDARD 23)
+add_test(NAME file_upload_store_unit_tests COMMAND file_upload_store_unit_tests)
+
 add_executable(pen_barrel_roll_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_pen_barrel_roll.cpp)
 target_include_directories(pen_barrel_roll_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}/third-party")
 target_link_libraries(pen_barrel_roll_unit_tests PRIVATE gtest_main
@@ -596,6 +607,8 @@ list(REMOVE_ITEM TEST_SOURCES
         ${CMAKE_SOURCE_DIR}/tests/unit/test_config_overrides.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_current_capture_target.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_display_scale_steps.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_file_upload_store.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_file_upload_api.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_frame_contract.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_http_util.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_input_activity.cpp

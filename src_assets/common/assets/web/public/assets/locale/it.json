@@ -395,6 +395,8 @@
     "clipboard_sync_desc": "Sincronizza testo e immagini tra gli appunti del client e dell'host. Richiede che il pannello di controllo di Sunshine sia in esecuzione nella sessione utente dell'host e un client che supporti la sincronizzazione degli appunti.",
     "file_transfer": "Trasferimento file dall'host al client",
     "file_transfer_desc": "Consente di inviare file dall'host a un client connesso tramite la voce \"Invia al client\" del menu contestuale di Esplora file (installata dal pannello di controllo di Sunshine). I client associati scaricano i file tramite HTTPS.",
+    "file_upload": "Caricamento di file dal client all'host",
+    "file_upload_desc": "Consente ai client associati di inviare file a questo host trascinandoli sullo stream o copiandoli. I file ricevuti vengono salvati in Downloads\\Moonlight Received dell'utente connesso (dal pannello di controllo di Sunshine) e non vengono mai aperti automaticamente. I client possono usare fino a 16 GB di spazio temporaneo su disco.",
     "apply_note": "Fare clic su 'Applica' per applicare le modifiche e riavviare Sunshine. Questo terminerà qualsiasi sessione in esecuzione.",
     "audio_sink": "Dispositivo di acquisizione audio",
     "audio_sink_desc_linux": "Il nome dell'uscita audio è utilizzato per il Loopback audio. Se non si specifica questa variabile, pulseaudio selezionerà il dispositivo predefinito. È possibile trovare il nome del'uscita audio utilizzando entrambi i comandi:",

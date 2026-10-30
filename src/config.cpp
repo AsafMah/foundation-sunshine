@@ -609,6 +609,7 @@ namespace config {
     true,  // clipboard_sync (default on; effective only when the user-session GUI agent is alive and forwards data)
     true,  // client_gamepad_override (client-declared type wins; no official client sends it today)
     true,  // file_transfer (default on; offers are created only by the local GUI agent)
+    false,  // file_upload (default off; lets paired clients stage files on the host)
   };
 
   sunshine_t sunshine {
@@ -1588,6 +1589,7 @@ namespace config {
     bool_f(vars, "amf_draw_mouse_cursor", input.amf_draw_mouse_cursor);
     bool_f(vars, "clipboard_sync", input.clipboard_sync);
     bool_f(vars, "file_transfer", input.file_transfer);
+    bool_f(vars, "file_upload", input.file_upload);
 
     bool_f(vars, "notify_pre_releases", sunshine.notify_pre_releases);
 

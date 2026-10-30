@@ -397,6 +397,8 @@
     "clipboard_sync_desc": "在用戶端與主機剪貼簿之間同步文字和圖片。需要主機使用者工作階段中正在執行 Sunshine 控制面板，且用戶端支援剪貼簿同步。",
     "file_transfer": "主機到用戶端檔案傳輸",
     "file_transfer_desc": "允許透過檔案總管右鍵選單中的「傳送到用戶端」（由 Sunshine 控制面板安裝）將主機上的檔案傳送到已連線的用戶端。已配對的用戶端透過 HTTPS 下載檔案。",
+    "file_upload": "用戶端上傳檔案至主機",
+    "file_upload_desc": "允許已配對的用戶端透過拖放到串流畫面或複製的方式將檔案傳送到本主機。收到的檔案由 Sunshine 控制面板儲存到目前登入使用者的 Downloads\\Moonlight Received，不會自動開啟。用戶端最多可佔用 16 GB 暫存磁碟空間。",
     "apply_note": "點選「套用」以重新啟動 Sunshine 並應用變更。這將終止所有正在進行的工作階段。",
     "audio_sink": "音訊擷取裝置",
     "audio_sink_desc_linux": "用於 Audio Loopback 的音訊輸出的名稱。如果您沒有指定這個變數，pulseaudio 將會選擇預設的監視裝置。您可以使用以下任一指令找出音訊輸出裝置的名稱：",

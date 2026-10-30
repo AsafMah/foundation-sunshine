@@ -395,6 +395,8 @@
     "clipboard_sync_desc": "İstemci ile ana bilgisayar panoları arasında metin ve görüntüleri eşitler. Sunshine denetim masasının ana bilgisayarın kullanıcı oturumunda çalışmasını ve pano eşitlemeyi destekleyen bir istemci gerektirir.",
     "file_transfer": "Ana bilgisayardan istemciye dosya aktarımı",
     "file_transfer_desc": "Gezgin sağ tık menüsündeki \"İstemciye gönder\" girişiyle (Sunshine denetim masası tarafından yüklenir) ana bilgisayardaki dosyaların bağlı bir istemciye gönderilmesine izin verir. Eşleştirilmiş istemciler dosyaları HTTPS üzerinden indirir.",
+    "file_upload": "İstemciden ana bilgisayara dosya yükleme",
+    "file_upload_desc": "Eşleştirilmiş istemcilerin dosyaları akışa bırakarak veya kopyalayarak bu ana bilgisayara göndermesine izin verir. Alınan dosyalar (Sunshine denetim masası tarafından) oturum açmış kullanıcının Downloads\\Moonlight Received klasörüne kaydedilir ve hiçbir zaman otomatik olarak açılmaz. İstemciler en fazla 16 GB geçici disk alanı kullanabilir.",
     "apply_note": "Sunshine'ı yeniden başlatmak ve değişiklikleri uygulamak için 'Uygula'ya tıklayın. Bu, çalışan tüm oturumları sonlandıracaktır.",
     "audio_sink": "Ses Yakalama Cihazı",
     "audio_sink_desc_linux": "Ses Döngü Yönlendirmesi için kullanılan ses çıkışının adı. Bu değişkeni belirtmezseniz, pulseaudio varsayılan monitor aygıtını seçecektir. Ses çıkışının adını şu komutlardan biriyle bulabilirsiniz:",

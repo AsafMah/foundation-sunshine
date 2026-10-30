@@ -395,6 +395,8 @@
     "clipboard_sync_desc": "Synchronizuje text a obrázky mezi schránkami klienta a hostitele. Vyžaduje, aby v uživatelské relaci hostitele běžel ovládací panel Sunshine, a klienta, který synchronizaci schránky podporuje.",
     "file_transfer": "Přenos souborů z hostitele do klienta",
     "file_transfer_desc": "Umožňuje odesílat soubory z hostitele do připojeného klienta pomocí položky „Odeslat do klienta“ v místní nabídce Průzkumníka (instaluje ji ovládací panel Sunshine). Spárovaní klienti soubory stahují přes HTTPS.",
+    "file_upload": "Nahrávání souborů z klienta na hostitele",
+    "file_upload_desc": "Umožňuje spárovaným klientům posílat soubory na tohoto hostitele přetažením do streamu nebo zkopírováním. Přijaté soubory se ukládají do Downloads\\Moonlight Received přihlášeného uživatele (ovládacím panelem Sunshine) a nikdy se automaticky neotevírají. Klienti mohou využít až 16 GB dočasného místa na disku.",
     "apply_note": "Kliknutím na tlačítko \"Použít\" restartujte Sunshine a aplikujte změny. Tím se ukončí všechny spuštěné relace.",
     "audio_sink": "Zařízení pro zachycení zvuku",
     "audio_sink_desc_linux": "Název skluzu zvuku, který se používá pro zvukovou smyčku. Pokud tuto proměnnou nevyberete, pulseaudio zvolí výchozí zařízení pro monitor. Název sklízení zvuku můžete najít pomocí některého příkazu:",

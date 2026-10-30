@@ -235,6 +235,7 @@ namespace config {
     bool clipboard_sync;  ///< Bidirectional clipboard sync (text + single image). On by default; effective only when the user-session GUI agent is alive. Set to false to force-disable.
     bool client_gamepad_override;  ///< Honor the client-declared controller type carried on the /launch query (Sunshine extension). On by default; set false to keep host-side selection authoritative.
     bool file_transfer;  ///< Host-to-client file transfer offers. Uses clipboard sync only as the control channel; file bytes stream over HTTPS.
+    bool file_upload;  ///< Client-to-host file uploads (drop onto the stream, file copy/paste). Off by default: paired clients may then use host disk up to the staging quota.
   };
 
   namespace flag {

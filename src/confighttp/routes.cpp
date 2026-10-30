@@ -18,6 +18,7 @@
 #include "src/confighttp/runtime.h"
 #include "src/file_mapping/config_http.h"
 #include "src/file_transfer_http.h"
+#include "src/file_upload_routes.h"
 #include "src/logging.h"
 #include "src/network.h"
 #include "src/text_context/http.h"
@@ -68,6 +69,20 @@ namespace confighttp {
           return false;
         }
 
+        return true;
+      });
+    // Client-to-host uploads: the local GUI agent reads committed manifests.
+    // Same local-only policy as file transfer offers.
+    file_upload_routes::register_agent_routes(server,
+      [](auto resp, auto req) {
+        if (!authenticate(resp, req)) {
+          return false;
+        }
+        const auto address = net::addr_to_normalized_string(req->remote_endpoint().address());
+        if (net::from_address(address) != net::PC) {
+          resp->write(web::StatusCode::forbidden);
+          return false;
+        }
         return true;
       });
     text_context::http::register_routes(server,

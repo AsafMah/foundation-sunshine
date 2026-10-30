@@ -395,6 +395,8 @@
     "clipboard_sync_desc": "Synchronisiert Text und Bilder zwischen den Zwischenablagen von Client und Host. Erfordert, dass das Sunshine-Kontrollfeld in der Benutzersitzung des Hosts läuft und der Client die Synchronisierung der Zwischenablage unterstützt.",
     "file_transfer": "Dateiübertragung vom Host zum Client",
     "file_transfer_desc": "Erlaubt das Senden von Dateien vom Host an einen verbundenen Client über den Eintrag „An Client senden“ im Explorer-Kontextmenü (vom Sunshine-Kontrollfeld installiert). Gekoppelte Clients laden die Dateien über HTTPS herunter.",
+    "file_upload": "Datei-Uploads vom Client zum Host",
+    "file_upload_desc": "Erlaubt gepaarten Clients, Dateien an diesen Host zu senden, indem sie auf den Stream gezogen oder kopiert werden. Empfangene Dateien werden (vom Sunshine-Kontrollzentrum) unter Downloads\\Moonlight Received des angemeldeten Benutzers gespeichert und nie automatisch geöffnet. Clients können bis zu 16 GB temporären Speicherplatz belegen.",
     "apply_note": "Klicken Sie auf 'Anwenden', um Sunshine neu zu starten und Änderungen anzuwenden. Dies wird alle laufenden Sitzungen beenden.",
     "audio_sink": "Audioaufnahmegerät",
     "audio_sink_desc_linux": "Der Name des Audio-Spüls, der für Audio Loopback verwendet wird. Wenn Sie diese Variable nicht angeben, wählt pulseaudio das Standard-Monitorgerät. Sie können den Namen des Audiospülers mit einem Befehl finden:",
