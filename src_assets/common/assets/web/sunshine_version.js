@@ -27,7 +27,8 @@ class SunshineVersion {
     if (v.indexOf('v') === 0) {
       v = v.substring(1)
     }
-    return v.split('.').map(Number)
+    // Leading digits of each part; a non-numeric part (e.g. the 杂鱼 suffix) is 0.
+    return v.split('.').map((part) => Number.parseInt(part, 10) || 0)
   }
 
   isGreater(otherVersion) {
@@ -43,9 +44,11 @@ class SunshineVersion {
     if (!this.versionParts || !otherVersionParts) {
       return false
     }
-    for (let i = 0; i < Math.min(3, this.versionParts.length, otherVersionParts.length); i++) {
-      const v1 = this.versionParts[i]
-      const v2 = otherVersionParts[i]
+    // Compare every part, so fork releases (v<upstream base>.<run>) order after
+    // their base and each other; missing trailing parts count as 0.
+    for (let i = 0; i < Math.max(this.versionParts.length, otherVersionParts.length); i++) {
+      const v1 = this.versionParts[i] ?? 0
+      const v2 = otherVersionParts[i] ?? 0
       if (v1 > v2) {
         return true
       }

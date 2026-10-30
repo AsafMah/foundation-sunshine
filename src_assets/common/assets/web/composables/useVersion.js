@@ -2,8 +2,9 @@ import { ref, computed } from 'vue'
 import { marked } from 'marked'
 import SunshineVersion from '../sunshine_version.js'
 import { trackEvents } from '../config/firebase.js'
+import { RELEASE_REPOSITORY } from '../config/releaseSource.js'
 
-const GITHUB_API_BASE = 'https://api.github.com/repos/qiin2333/Sunshine/releases'
+const GITHUB_API_BASE = `https://api.github.com/repos/${RELEASE_REPOSITORY}/releases`
 
 export const VERSION_CHECK_STATUS = Object.freeze({
   IDLE: 'idle',

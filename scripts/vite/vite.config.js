@@ -38,6 +38,10 @@ export default defineConfig({
     },
   },
   plugins: [vue(), ViteEjsPlugin({ header })],
+  define: {
+    // Fork builds: the Web UI update notice checks this repository's releases.
+    __FOUNDATION_RELEASE_REPOSITORY__: JSON.stringify(process.env.FOUNDATION_RELEASE_REPOSITORY || ''),
+  },
   root: resolve(assetsSrcPath),
   preview: {
     port: 3000,

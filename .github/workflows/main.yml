@@ -312,6 +312,9 @@ jobs:
 
       - name: Build Web UI
         shell: pwsh
+        env:
+          # Forks: the Web UI update notice checks this repository's releases.
+          FOUNDATION_RELEASE_REPOSITORY: ${{ github.repository != 'AlkaidLab/foundation-sunshine' && github.repository || '' }}
         run: |
           npm ci
           npm run lint:webui
