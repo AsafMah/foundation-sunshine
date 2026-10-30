@@ -395,6 +395,8 @@
     "clipboard_sync_desc": "Synkroniserar text och bilder mellan klientens och värdens urklipp. Kräver att Sunshines kontrollpanel körs i värdens användarsession och en klient som stöder synkronisering av urklipp.",
     "file_transfer": "Filöverföring från värd till klient",
     "file_transfer_desc": "Gör det möjligt att skicka filer från värden till en ansluten klient med posten ”Skicka till klient” i Utforskarens snabbmeny (installeras av Sunshines kontrollpanel). Parkopplade klienter laddar ned filerna via HTTPS.",
+    "file_upload": "Filuppladdning från klient till värd",
+    "file_upload_desc": "Låter parkopplade klienter skicka filer till den här värden genom att släppa dem på strömmen eller kopiera dem. Mottagna filer sparas (av Sunshines kontrollpanel) i Downloads\\Moonlight Received för den inloggade användaren och öppnas aldrig automatiskt. Klienter kan använda upp till 16 GB tillfälligt diskutrymme.",
     "apply_note": "Klicka på \"Tillämpa\" för att starta om Sunshine och tillämpa ändringar. Detta avslutar alla pågående sessioner.",
     "audio_sink": "Ljudfångstenhet",
     "audio_sink_desc_linux": "Namnet på ljuddiskbänken som används för Audio Loopback. Om du inte anger denna variabel, kommer pulseaudio att välja standardövervakningsenheten. Du kan hitta namnet på audiosänkan med hjälp av antingen kommandot:",

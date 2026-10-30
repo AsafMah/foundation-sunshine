@@ -395,6 +395,8 @@
     "clipboard_sync_desc": "Synchronizuje tekst i obrazy między schowkami klienta i hosta. Wymaga, aby panel sterowania Sunshine działał w sesji użytkownika hosta, oraz klienta obsługującego synchronizację schowka.",
     "file_transfer": "Przesyłanie plików z hosta do klienta",
     "file_transfer_desc": "Umożliwia wysyłanie plików z hosta do połączonego klienta za pomocą pozycji „Wyślij do klienta” w menu kontekstowym Eksploratora (instalowanej przez panel sterowania Sunshine). Sparowani klienci pobierają pliki przez HTTPS.",
+    "file_upload": "Przesyłanie plików z klienta do hosta",
+    "file_upload_desc": "Pozwala sparowanym klientom wysyłać pliki do tego hosta przez upuszczenie ich na strumień lub skopiowanie. Odebrane pliki są zapisywane (przez panel sterowania Sunshine) w Downloads\\Moonlight Received zalogowanego użytkownika i nigdy nie są otwierane automatycznie. Klienci mogą zająć do 16 GB tymczasowego miejsca na dysku.",
     "apply_note": "Kliknij \"Zastosuj\", aby ponownie uruchomić Sunshine i zastosować zmiany. Spowoduje to zakończenie wszystkich uruchomionych sesji.",
     "audio_sink": "Urządzenie przechwytywania dźwięku",
     "audio_sink_desc_linux": "Nazwa odbiornika audio używanego dla Audio Loopback. Jeśli nie określisz tej zmiennej, pulseaudio wybierze domyślne urządzenie monitorujące. Nazwę urządzenia audio można znaleźć za pomocą polecenia:",

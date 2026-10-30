@@ -437,6 +437,18 @@ onBeforeUnmount(() => {
       <div class="form-text">{{ $t('config.file_transfer_desc') }}</div>
     </div>
 
+    <!-- Client-to-host file uploads -->
+    <div class="mb-3">
+      <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" id="file_upload"
+               v-model="config.file_upload">
+        <label class="form-check-label" for="file_upload">
+          {{ $t('config.file_upload') }}
+        </label>
+      </div>
+      <div class="form-text">{{ $t('config.file_upload_desc') }}</div>
+    </div>
+
     <div
       class="mb-3 accordion"
       v-if="platform === 'windows' && ((config.controller === 'enabled' && vigem.available) || config.mouse === 'enabled')"

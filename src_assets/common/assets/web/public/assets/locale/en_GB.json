@@ -395,6 +395,8 @@
     "clipboard_sync_desc": "Sync text and images between the client and host clipboards. Requires the Sunshine control panel to be running in the host user session and a client that supports clipboard sync.",
     "file_transfer": "Host-to-client file transfer",
     "file_transfer_desc": "Allow sending files from the host to a connected client with the \"Send to client\" entry in the Explorer right-click menu (installed by the Sunshine control panel). Paired clients download the files over HTTPS.",
+    "file_upload": "Client-to-host file uploads",
+    "file_upload_desc": "Allow paired clients to send files to this host by dropping them onto the stream or copying them. Received files are saved to Downloads\\Moonlight Received for the signed-in user (by the Sunshine control panel) and are never opened automatically. Clients may use up to 16 GB of temporary disk space.",
     "apply_note": "Click 'Apply' to restart Sunshine and apply changes. This will terminate any running sessions.",
     "audio_sink": "Audio Capture Device",
     "audio_sink_desc_linux": "The name of the audio sink used for Audio Loopback. If you do not specify this variable, pulseaudio will select the default monitor device. You can find the name of the audio sink using either command:",

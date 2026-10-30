@@ -145,7 +145,16 @@ namespace file_transfer_http {
         json_error("missing_path"));
     }
 
-    const auto created = file_transfer_store::create_single_file_offer(path_from_utf8(path_value->get<std::string>()));
+    std::string client_uuid;
+    if (const auto bound = in.find("client_uuid"); bound != in.end()) {
+      if (!bound->is_string()) {
+        return json_response(web::StatusCode::bad_request,
+          json_error("bad_client_uuid"));
+      }
+      client_uuid = bound->get<std::string>();
+    }
+
+    const auto created = file_transfer_store::create_single_file_offer(path_from_utf8(path_value->get<std::string>()), client_uuid);
     if (!created.ok) {
       const auto status = created.err == "too_large" ?
                             web::StatusCode::payload_too_large :
@@ -166,7 +175,7 @@ namespace file_transfer_http {
   }
 
   download_response_t
-  make_download_response(const std::string &id) {
+  make_download_response(const std::string &id, const std::string &requester_uuid) {
     if (!config::input.file_transfer) {
       auto out = json_response(web::StatusCode::forbidden,
         json_error("file_transfer_disabled"));
@@ -180,7 +189,7 @@ namespace file_transfer_http {
     }
 
     const auto got = file_transfer_store::get(id);
-    if (!got.found) {
+    if (!got.found || (!got.offer.client_uuid.empty() && got.offer.client_uuid != requester_uuid)) {
       auto out = json_response(web::StatusCode::not_found,
         json_error("not_found"));
       return { out.status, std::move(out.body), std::move(out.headers), {}, false };

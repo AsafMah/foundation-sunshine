@@ -397,6 +397,8 @@
     "clipboard_sync_desc": "在客户端与主机剪贴板之间同步文本和图片。需要主机用户会话中正在运行 Sunshine 控制面板，并且客户端支持剪贴板同步。",
     "file_transfer": "主机到客户端文件传输",
     "file_transfer_desc": "允许通过资源管理器右键菜单中的“发送到客户端”（由 Sunshine 控制面板安装）将主机上的文件发送到已连接的客户端。已配对的客户端通过 HTTPS 下载文件。",
+    "file_upload": "客户端向主机上传文件",
+    "file_upload_desc": "允许已配对的客户端通过拖放到串流画面或复制的方式向本主机发送文件。收到的文件由 Sunshine 控制面板保存到当前登录用户的 Downloads\\Moonlight Received，不会自动打开。客户端最多可占用 16 GB 临时磁盘空间。",
     "apply_note": "点击“应用”重启 Sunshine 并应用更改。这将终止任何正在运行的会话。",
     "audio_sink": "音频采集设备",
     "audio_sink_desc_linux": "手动指定需要抓取的音频输出设备。如果您没有指定此变量，PulseAudio 将选择默认监测设备。 您可以使用以下任何命令找到音频输出设备的名称：",
