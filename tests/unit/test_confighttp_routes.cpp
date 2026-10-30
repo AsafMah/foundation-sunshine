@@ -278,6 +278,9 @@ TEST_F(ConfigHttpRoutes, EveryRegisteredRouteDispatchesItsMethodPathAndCapturesO
     replace(path, "([0-9]+)", "42");
     // File-transfer offer IDs are 64 lowercase hex digits.
     replace(path, "([a-f0-9]{64})", std::string(64, 'a'));
+    replace(path, "[a-f0-9]{64}", std::string(64, 'a'));
+    // Upload manifests address an optional item index.
+    replace(path, "(/items/[0-9]{1,4})?", "/items/7");
     // The remaining captures are component and clipboard/file-mapping IDs.
     path = std::regex_replace(path, std::regex(R"(\([^)]*\))"), "id_1");
     replace(path, "\\/", "/");

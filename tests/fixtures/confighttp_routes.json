@@ -353,6 +353,14 @@
     "method": "GET"
   },
   {
+    "pattern": "^/api/v1/file-transfer/manifests/[a-f0-9]{64}(/items/[0-9]{1,4})?$",
+    "method": "GET"
+  },
+  {
+    "pattern": "^/api/v1/file-transfer/manifests/[a-f0-9]{64}(/items/[0-9]{1,4})?$",
+    "method": "DELETE"
+  },
+  {
     "pattern": "^/api/v1/text-context/capability$",
     "method": "POST"
   },
