@@ -96,7 +96,7 @@ const HOST_DEFAULTS = Object.freeze({
   client_fingerprint_remote_rules: true, client_fingerprint_rules_url: null, client_fingerprint_rules_refresh_hours: 24, client_fingerprint_rules_certificate: null,
   network_external_check: true, network_external_endpoint: null, network_bypass_proxy: true, stun_servers: null,
   // Fork keys (src/config.cpp video/input defaults).
-  allow_client_resolution_change: false, file_transfer: true, file_upload: false,
+  allow_client_resolution_change: true, file_transfer: true, file_upload: false,
 })
 
 const normalize = (value) => {

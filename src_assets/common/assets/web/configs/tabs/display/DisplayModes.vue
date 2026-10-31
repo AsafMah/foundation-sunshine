@@ -31,7 +31,7 @@ const setRates = (value) => { props.fps.splice(0, props.fps.length, ...value) }
       </MItem>
       <CfgField v-if="refreshRule === 'manual'" :config="config" k="manual_refresh_rate" label="config.refresh_rate_change_manual" help="none" placeholder="59.95" />
       <CfgSwitch :config="config" k="dynamic_resolution_follow_display" def="enabled" />
-      <CfgSwitch :config="config" k="allow_client_resolution_change" :on="true" :off="false" :def="false" />
+      <CfgSwitch :config="config" k="allow_client_resolution_change" :on="true" :off="false" :def="true" />
     </MGroup>
   </MSection>
 
