@@ -629,6 +629,7 @@ if (WIN32)
     # Windows-only suites include fake APIs or backend paths of their own.
     list(REMOVE_ITEM TEST_SOURCES
             ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_ds5_component_manifest.cpp
+            ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_ds5_auto_selection.cpp
             ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_ds5_sidecar_client.cpp
             ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_microphone_client.cpp
             ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_nvprefs.cpp
@@ -767,6 +768,7 @@ if (WIN32)
     add_executable(ds5_sidecar_client_unit_tests
             ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_ds5_sidecar_client.cpp
             ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_ds5_component_manifest.cpp
+            ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_ds5_auto_selection.cpp
             ${CMAKE_SOURCE_DIR}/tests/tools/ds5_sidecar_test_stubs.cpp
             ${CMAKE_SOURCE_DIR}/src/ds5/config.cpp
             ${CMAKE_SOURCE_DIR}/src/platform/windows/ds5/ds5_sidecar_client.cpp)

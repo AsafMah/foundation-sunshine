@@ -17,6 +17,7 @@
 
 #include "dsu_server.h"
 #include "ds5/ds5_sidecar_client.h"
+#include "ds5/auto_selection.h"
 #include "src/ds5/config.h"
 #include "keylayout.h"
 #include "misc.h"
@@ -1989,6 +1990,17 @@ namespace platf {
     const auto per_app_override = !client_declared && current_gamepad_mode.load(std::memory_order_relaxed) != 0;
     const char *selection_source = client_declared ? "client selection" : (per_app_override ? "per-app selection" : "global selection");
 
+    // Auto keeps a positively identified DualSense as a DualSense when the
+    // optional component can provide it; PlayStation pads without that
+    // identification still go through the DualShock 4 rules below.
+    if (const auto resolved = ds5::resolve_auto_gamepad_mode(gamepad_mode, metadata.type, metadata.capabilities, ds5_available);
+        resolved != gamepad_mode) {
+      BOOST_LOG(info) << "Gamepad " << id.globalIndex
+                      << " is a client-identified DualSense; automatic selection uses DualSense emulation"sv;
+      gamepad_mode = resolved;
+      selection_source = "auto-selected by client-identified DualSense";
+    }
+
     if (gamepad_mode == 4 && !ds5_available) {
       BOOST_LOG(warning) << "DualSense emulation was requested by "sv << selection_source
                          << ", but its optional component is unavailable; falling back to automatic gamepad selection"sv;
@@ -2672,7 +2684,8 @@ namespace platf {
     }
 
     const auto ds5_settings = ds5_config::current();
-    if (gamepad_mode == 4 && ds5_settings.audio_haptics && ds5_available) {
+    // Auto may allocate a DualSense for a client-identified DualSense controller.
+    if (ds5::mode_may_allocate_dualsense(gamepad_mode, ds5_available) && ds5_settings.audio_haptics) {
       caps |= platform_caps::ds5_haptics_pcm;
     }
 
