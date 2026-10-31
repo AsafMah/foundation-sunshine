@@ -33,7 +33,6 @@ extern "C" {
 
 // local includes
 #include "clipboard_bridge.h"
-#include "text_context/bridge.h"
 #include "config.h"
 #include "cursor_channel.h"
 #include "globals.h"
@@ -41,14 +40,16 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
-#include "pyrowave/runtime.h"
-#include "pyrowave/packet.h"
 #include "nvhttp.h"
+#include "pyrowave/packet.h"
+#include "pyrowave/runtime.h"
 #include "rtsp.h"
+#include "spatial_transport/mat_live_session.h"
 #include "stream.h"
 #include "streaming/fec.h"
+#include "streaming/restart_intent.h"
 #include "sync.h"
-#include "spatial_transport/mat_live_session.h"
+#include "text_context/bridge.h"
 #include "video.h"
 
 namespace asio = boost::asio;
@@ -1228,6 +1229,12 @@ namespace rtsp_stream {
       if (stream::client_resolution_change_enabled(config::video, session.enable_sops)) {
         caps |= platf::platform_caps::client_resolution_change;
       }
+      session.restart_intent_described = streaming::restart_intent::bridge_available.load();
+      if (session.restart_intent_described) {
+        caps |= streaming::restart_intent::LI_FF_HOST_RESTART;
+        ss << "a=" << streaming::restart_intent::HOST_VERSION_ATTRIBUTE << ":"
+           << streaming::restart_intent::LI_HOST_RESTART_PROTOCOL_VERSION << std::endl;
+      }
       ss << "a=x-ss-general.featureFlags:" << caps << std::endl;
 #ifdef _WIN32
       if (config::input.mouse && (caps & platf::platform_caps::pen_touch)) {
@@ -1788,6 +1795,15 @@ namespace rtsp_stream {
       config.audioQosType = getArg("x-nv-aqos.qosTrafficType"sv);
       config.videoQosType = getArg("x-nv-vqos[0].qosTrafficType"sv);
       config.encryptionFlagsEnabled = getArg("x-ss-general.encryptionEnabled"sv);
+      const auto restart_version = args.find(streaming::restart_intent::CLIENT_VERSION_ATTRIBUTE);
+      const auto version = restart_version == args.end() ? std::string_view() : std::string_view(restart_version->second);
+      config.restart_intent_accepted = streaming::restart_intent::accepts_restart(
+        streaming::restart_intent::bridge_available.load(), session.restart_intent_described,
+        config.mlFeatureFlags, version,
+        config.controlProtocolType == 13);
+      if (restart_version != args.end() && version != "1") {
+        BOOST_LOG(warning) << "Unsupported restart-intent protocol version; using legacy termination";
+      }
       const auto fec_summary = args.find("x-ml-video.fecSummaryVersion"sv);
       config.fec_feedback = fec_summary != args.end() && fec_summary->second == "1" && config.controlProtocolType == 13;
       if (const auto requested = args.find("x-ml-video.fecPercentage"sv); requested != args.end()) {

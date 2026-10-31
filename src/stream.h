@@ -78,6 +78,7 @@ namespace stream {
     int minRequiredFecPackets;
     std::shared_ptr<video_fec::controller_t> fec_control;
     bool fec_feedback = false;
+    bool restart_intent_accepted = false;
     int mlFeatureFlags;
     int controlProtocolType;
     int audioQosType;

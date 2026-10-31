@@ -43,7 +43,6 @@ extern "C" {
 
 #include "client_fingerprint.h"
 #include "config.h"
-#include "streaming/fec.h"
 #include "display_device/display_device.h"
 #include "display_device/parsed_config.h"
 #include "display_device/session.h"
@@ -51,17 +50,20 @@ extern "C" {
 #include "haptics/authored_ir.h"
 #include "haptics/authored_ir_extended.h"
 #include "haptics/wire.h"
-#include "rtsp.h"
 #include "input.h"
 #include "logging.h"
 #include "mic_mixer.h"
 #include "network.h"
-#include "streaming/perf_recorder.h"
+#include "rtsp.h"
 #include "stream.h"
+#include "streaming/fec.h"
+#include "streaming/perf_recorder.h"
+#include "streaming/restart_intent.h"
+#include "streaming/restart_intent_enet.h"
 #include "sync.h"
+#include "thread_safe.h"
 #include "tray/system_tray.h"
 #include "tray/tray_state.h"
-#include "thread_safe.h"
 #include "utility.h"
 #include "webhook/webhook.h"
 
@@ -537,11 +539,18 @@ namespace stream {
       enet_host_flush(_host.get());
     }
 
+    bool
+    drain_shutdown() {
+      return streaming::restart_intent::drain_enet(_host.get());
+    }
+
     // Callbacks
     std::unordered_map<std::uint16_t, std::function<void(session_t *, const std::string_view &)>> _map_type_cb;
 
     // All active sessions (including those still waiting for a peer to connect)
     sync_util::sync_t<std::vector<session_t *>> _sessions;
+    // Protected by _sessions.lock(); no admission after final drain begins.
+    bool shutting_down = false;
 
     // ENet peer to session mapping for sessions with a peer connected
     sync_util::sync_t<std::unordered_map<net::peer_t, session_t *>> _peer_to_session;
@@ -2732,46 +2741,51 @@ namespace stream {
                       cursor_channel::local_mode_active() ? 16ms : 150ms);
     }
 
-    // Let all remaining connections know the server is shutting down
-    // reason: graceful termination
-    std::uint32_t reason = 0x80030023;
-
-    control_terminate_t plaintext;
-    plaintext.header.type = packetTypes[IDX_TERMINATION];
-    plaintext.header.payloadLength = sizeof(plaintext.ec);
-    plaintext.ec = util::endian::big<uint32_t>(reason);
-
+    static_assert(sizeof(control_terminate_t) == 8);
     std::array<std::uint8_t,
-      sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
+      sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(control_terminate_t)) + crypto::cipher::tag_size>
       encrypted_payload;
 
-    auto lg = server->_sessions.lock();
-    for (auto pos = std::begin(*server->_sessions); pos != std::end(*server->_sessions); ++pos) {
-      auto session = *pos;
+    {
+      auto lg = server->_sessions.lock();
+      server->shutting_down = true;
+      for (const auto session : *server->_sessions) {
+        // Match the paired lifecycle updates in the normal STOPPING path.
+        clipboard_bridge::bridge_t::instance().session_stopped(session->launch_session_id);
+        text_context::bridge_t::instance().session_stopped(session->launch_session_id);
+        cursor_channel::remove_session(session->launch_session_id);
 
-      // The normal STOPPING path removes sessions from _sessions and updates
-      // the clipboard bridge immediately. If the control thread exits via the
-      // final shutdown path instead, make the same paired lifecycle update here
-      // so capability/session_count cannot retain stale launch IDs.
-      clipboard_bridge::bridge_t::instance().session_stopped(session->launch_session_id);
-      text_context::bridge_t::instance().session_stopped(session->launch_session_id);
-      cursor_channel::remove_session(session->launch_session_id);
-
-      // We may not have gotten far enough to have an ENet connection yet
-      if (session->control.peer) {
-        auto payload = encode_control(session, util::view(plaintext), encrypted_payload);
-
-        if (server->send(payload, session->control.peer)) {
-          TUPLE_2D(port, addr, platf::from_sockaddr_ex((sockaddr *) &session->control.peer->address.address));
-          BOOST_LOG(warning) << "Couldn't send termination code to ["sv << addr << ':' << port << ']';
-        }
+        // A session that has not connected its ENet peer cannot receive intent.
+        streaming::restart_intent::shutdown.send_reason(
+          session->config.restart_intent_accepted, [&](std::uint32_t reason) {
+            bool sent = false;
+            if (session->control.peer) {
+              const auto plaintext = streaming::restart_intent::termination_packet(packetTypes[IDX_TERMINATION], reason);
+              const auto payload = encode_control(session, util::view(plaintext), encrypted_payload);
+              sent = !payload.empty() && server->send(payload, session->control.peer) == 0;
+            }
+            BOOST_LOG(info) << "Control termination: reason=0x" << std::hex << reason << std::dec
+                            << ", restart_negotiated=" << session->config.restart_intent_accepted
+                            << ", peer_present=" << (session->control.peer != nullptr) << ", queued=" << sent;
+            if (session->control.peer && !sent) {
+              BOOST_LOG(warning) << "Could not queue control termination";
+            }
+          });
       }
+    }
 
+    // Keep peers and their owning sessions alive until ENet has serviced final
+    // ACK/retransmission work. In particular, do not unblock join() beforehand.
+    const bool drained = server->drain_shutdown();
+    BOOST_LOG(info) << "Control shutdown ENet drain completed: success=" << drained;
+    if (!drained) {
+      BOOST_LOG(warning) << "Control shutdown ENet service failed; termination delivery is not guaranteed";
+    }
+    auto lg = server->_sessions.lock();
+    for (const auto session : *server->_sessions) {
       session->shutdown_event->raise(true);
       session->controlEnd.raise(true);
     }
-
-    server->flush();
   }
 
   namespace {
@@ -4643,14 +4657,17 @@ namespace stream {
       // once the pointer is in the shared list the control thread may dispatch
       // input immediately, and an unregistered launch ID would silently drop
       // that first click/touch candidate.
-      text_context::bridge_t::instance().session_started(session.launch_session_id);
-
       // 将完成初始化的会话加入共享列表。
       {
         auto lg = session.broadcast_ref->control_server._sessions.lock();
+        if (session.broadcast_ref->control_server.shutting_down) {
+          BOOST_LOG(warning) << "Refusing stream session during control shutdown";
+          return -1;
+        }
+        text_context::bridge_t::instance().session_started(session.launch_session_id);
         session.broadcast_ref->control_server._sessions->push_back(&session);
+        clipboard_bridge::bridge_t::instance().session_started(session.launch_session_id);
       }
-      clipboard_bridge::bridge_t::instance().session_started(session.launch_session_id);
 
       // 仅控制流会话不启动视频/音频线程
       if (!session.control_only) {

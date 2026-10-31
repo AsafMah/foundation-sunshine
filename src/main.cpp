@@ -20,26 +20,28 @@
 #include "client_fingerprint.h"
 #include "confighttp.h"
 #include "display_device/session.h"
+#include "ds5/config.h"
 #include "entry_handler.h"
 #include "file_handler.h"
 #include "globals.h"
 #include "httpcommon.h"
+#include "image_enhancement/config.h"
 #include "logging.h"
 #include "main.h"
 #include "nvhttp.h"
 #include "process.h"
+#include "streaming/restart_intent.h"
 #include "tray/system_tray.h"
 #include "upnp.h"
 #include "version.h"
 #include "video.h"
 #include "webhook/webhook.h"
 #include "webhook/webhook_auth.h"
-#include "ds5/config.h"
-#include "image_enhancement/config.h"
 
 #ifdef _WIN32
   #include "platform/windows/misc.h"
   #include "platform/windows/win_dark_mode.h"
+  #include "tools/service_control.h"
 #endif
 
 #ifdef _WIN32
@@ -197,6 +199,16 @@ probe_encoders_with_watchdog() {
 
 int
 main(int argc, char *argv[]) {
+#ifdef _WIN32
+  auto service_args = sunshinesvc::service_control::parse_arguments(argc, argv);
+  argc = static_cast<int>(service_args.filtered.size()) - 1;
+  argv = service_args.filtered.data();
+  sunshinesvc::service_control::listener service_listener;
+  auto service_bridge_lifetime = util::fail_guard([] {
+    streaming::restart_intent::bridge_available.store(false);
+    streaming::restart_intent::shutdown.set_terminal_probe({});
+  });
+#endif
   lifetime::argv = argv;
 
 #ifdef _WIN32
@@ -228,6 +240,18 @@ main(int argc, char *argv[]) {
 #pragma GCC diagnostic pop
 
   mail::man = std::make_shared<safe::mail_raw_t>();
+#ifdef _WIN32
+  if (service_args.present) {
+    is_running_as_system_user = platf::is_running_as_system();
+    const auto bridge_error = sunshinesvc::service_control::validate(service_args, is_running_as_system_user);
+    if (!bridge_error.empty()) {
+      // Reject even --version/command startup before config or device work.
+      std::cerr << "Invalid service control bridge: " << bridge_error << std::endl;
+      g_final_exit_code.store(ERROR_INVALID_PARAMETER);
+      return ERROR_INVALID_PARAMETER;
+    }
+  }
+#endif
   for (int i = 1; i < argc; ++i) {
     if (std::string_view(argv[i]) == "--version"sv) {
       std::cout << PROJECT_NAME << " version: " << PROJECT_VER << std::endl;
@@ -252,7 +276,9 @@ main(int argc, char *argv[]) {
 
 #ifdef _WIN32
   // Cache the result of is_running_as_system() check once at startup
-  is_running_as_system_user = platf::is_running_as_system();
+  if (!service_args.present) {
+    is_running_as_system_user = platf::is_running_as_system();
+  }
   if (is_running_as_system_user) {
     BOOST_LOG(info) << "Running as SYSTEM user (service mode)";
   }
@@ -293,6 +319,33 @@ main(int argc, char *argv[]) {
     }
 
     return fn->second(argv[0], config::sunshine.cmd.argc, config::sunshine.cmd.argv);
+  }
+
+  auto shutdown_event = mail::man->event<bool>(mail::shutdown);
+#ifdef _WIN32
+  if (service_args.present) {
+    namespace ri = streaming::restart_intent;
+    ri::shutdown.set_terminal_probe([stop = service_args.stop]() {
+      const auto result = WaitForSingleObject(stop, 0);
+      if (result == WAIT_FAILED) {
+        BOOST_LOG(error) << "Service stop event query failed: " << GetLastError();
+      }
+      return result != WAIT_TIMEOUT;
+    });
+    const auto listener_error = service_listener.start(service_args, [shutdown_event] { ri::shutdown.request(ri::shutdown_state::intent::migration, [&] { shutdown_event->raise(true); }); }, [shutdown_event] { ri::shutdown.request(ri::shutdown_state::intent::terminal, [&] { shutdown_event->raise(true); }); }, [shutdown_event](DWORD listener_error) {
+        BOOST_LOG(error) << "Service event listener failed: " << listener_error;
+        ri::bridge_available.store(false);
+        ri::shutdown.request(ri::shutdown_state::intent::terminal, [&] { shutdown_event->raise(true); }); }, [] { ri::bridge_available.store(true); });
+    if (listener_error != ERROR_SUCCESS) {
+      ri::bridge_available.store(false);
+      BOOST_LOG(fatal) << "Service event listener could not start: " << listener_error;
+      g_final_exit_code.store(listener_error);
+      return listener_error;
+    }
+  }
+#endif
+  if (shutdown_event->peek()) {
+    return 0;
   }
 
   // Adding this guard here first as it also performs recovery after crash,
@@ -385,13 +438,12 @@ main(int argc, char *argv[]) {
   task_pool.start(1);
 
   // Create signal handler after logging has been initialized
-  auto shutdown_event = mail::man->event<bool>(mail::shutdown);
   on_signal(SIGINT, [shutdown_event]() {
-    shutdown_event->raise(true);
+    streaming::restart_intent::shutdown.request_terminal_from_signal([&] { shutdown_event->raise(true); });
   });
 
   on_signal(SIGTERM, [shutdown_event]() {
-    shutdown_event->raise(true);
+    streaming::restart_intent::shutdown.request_terminal_from_signal([&] { shutdown_event->raise(true); });
   });
 
 #ifdef _WIN32

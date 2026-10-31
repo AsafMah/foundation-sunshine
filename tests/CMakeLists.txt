@@ -221,6 +221,28 @@ if (WIN32)
 endif ()
 add_test(NAME sunshinesvc_state_unit_tests COMMAND sunshinesvc_state_unit_tests)
 
+add_executable(restart_intent_unit_tests
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_restart_intent.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_restart_intent_enet.cpp)
+target_include_directories(restart_intent_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}"
+        "${CMAKE_SOURCE_DIR}/third-party/moonlight-common-c/enet/include")
+target_link_libraries(restart_intent_unit_tests PRIVATE gtest_main enet
+        sunshine_project_options sunshine_coverage)
+target_compile_options(restart_intent_unit_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>)
+set_target_properties(restart_intent_unit_tests PROPERTIES CXX_STANDARD 23)
+if (WIN32)
+    target_sources(restart_intent_unit_tests PRIVATE ${CMAKE_SOURCE_DIR}/tests/unit/test_service_control.cpp)
+    add_executable(service_control_test_child ${CMAKE_SOURCE_DIR}/tests/unit/service_control_test_child.cpp)
+    target_include_directories(service_control_test_child PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(service_control_test_child PRIVATE sunshine_project_options)
+    set_target_properties(service_control_test_child PROPERTIES CXX_STANDARD 23 LINK_SEARCH_START_STATIC 1)
+    add_dependencies(restart_intent_unit_tests service_control_test_child)
+    target_link_libraries(restart_intent_unit_tests PRIVATE ws2_32 winmm)
+    set_target_properties(restart_intent_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
+endif ()
+add_test(NAME restart_intent_unit_tests COMMAND restart_intent_unit_tests)
+set_tests_properties(restart_intent_unit_tests PROPERTIES TIMEOUT 30)
+
 # The log sink tests exercise Windows file-sharing behavior from the service wrapper.
 if (WIN32)
     add_executable(sunshinesvc_log_unit_tests
@@ -617,6 +639,10 @@ list(REMOVE_ITEM TEST_SOURCES
         ${CMAKE_SOURCE_DIR}/tests/unit/test_perf_frame_rates.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_pyrowave.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_remote_usb_host_controller.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_restart_intent.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_restart_intent_enet.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_service_control.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/service_control_test_child.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_rtsp.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_sunshinesvc_state.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_tray_state.cpp

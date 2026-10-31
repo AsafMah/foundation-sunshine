@@ -50,6 +50,7 @@ namespace rtsp_stream {
   };
 
   struct launch_session_t {
+    bool restart_intent_described = false;
     uint32_t id;
 
     crypto::aes_t gcm_key;

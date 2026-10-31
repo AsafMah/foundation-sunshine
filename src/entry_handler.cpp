@@ -21,6 +21,7 @@
 #include "platform/common.h"
 #include "src/display_device/display_device.h"
 #include "src/platform/windows/display_device/windows_utils.h"
+#include "streaming/restart_intent.h"
 #include "version.h"
 
 extern "C" {
@@ -89,7 +90,9 @@ namespace lifetime {
     int zero = 0;
     desired_exit_code.compare_exchange_strong(zero, exit_code);
 
-    mail::man->event<bool>(mail::shutdown)->raise(true);
+    streaming::restart_intent::shutdown.request(streaming::restart_intent::shutdown_state::intent::terminal, [] {
+      mail::man->event<bool>(mail::shutdown)->raise(true);
+    });
 
     // Termination will happen asynchronously, but the caller may
     // have wanted synchronous behavior.
