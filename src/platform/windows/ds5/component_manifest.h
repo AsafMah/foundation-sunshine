@@ -24,12 +24,29 @@ namespace platf::ds5 {
   bool validate_component_manifest(const std::filesystem::path &active_root,
                                    Hash hash, std::string &error) {
     try {
+      // A component older than the compatibility contract has no contract
+      // file; reading it would surface Boost's "<unspecified file>(1): expected value".
+      for (const auto *name : { "component.json", "component-compatibility.json" }) {
+        std::error_code missing;
+        if (!std::filesystem::is_regular_file(active_root / name, missing)) {
+          error = std::string("The active DualSense component is outdated or incomplete (") + name +
+                  " is missing). Update the DualSense component in the Sunshine control panel";
+          return false;
+        }
+      }
       boost::property_tree::ptree manifest;
       std::ifstream stream(active_root / "component.json", std::ios::binary);
       boost::property_tree::read_json(stream, manifest);
       boost::property_tree::ptree compatibility;
       std::ifstream contract(active_root / "component-compatibility.json", std::ios::binary);
-      boost::property_tree::read_json(contract, compatibility);
+      try {
+        boost::property_tree::read_json(contract, compatibility);
+      }
+      catch (const boost::property_tree::json_parser_error &) {
+        error = "The active DualSense component is outdated or damaged (component-compatibility.json is unreadable). "
+                "Update the DualSense component in the Sunshine control panel";
+        return false;
+      }
       if (manifest.get<std::uint32_t>("protocol", 0) != virtual_device_host::protocol::VERSION ||
           compatibility.get<std::uint32_t>("schema", 0) != 1 ||
           compatibility.get<std::string>("component_version", "").empty() ||
@@ -39,7 +56,8 @@ namespace platf::ds5 {
           compatibility.get<std::string>("usbip.version", "").empty() ||
           manifest.get<std::string>("usbip_version", "") != compatibility.get<std::string>("usbip.version") ||
           manifest.get<std::string>("sidecar_file", "") != "Sunshine.Ds5Sidecar.exe") {
-        error = "The active DualSense component manifest is incomplete or incompatible";
+        error = "The active DualSense component is outdated or incompatible with this Sunshine build. "
+                "Update the DualSense component in the Sunshine control panel";
         return false;
       }
       // sha256 is the installed Core DLL digest. sidecar_package_sha256, when

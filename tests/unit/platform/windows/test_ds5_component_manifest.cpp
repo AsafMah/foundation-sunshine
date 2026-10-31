@@ -149,5 +149,36 @@ namespace {
     save();
     EXPECT_FALSE(validate());
   }
+
+  // Installed 1.4.1 (2026-10-31): component.json without usbip_* fields and no
+  // contract file. The log showed "<unspecified file>(1): expected value".
+  TEST_F(Ds5ComponentManifest, PreContractComponentAsksForAnUpdate) {
+    manifest.erase("usbip_policy");
+    manifest.erase("usbip_version");
+    manifest.erase("compatibility_sha256");
+    manifest.put("component_version", "1.4.1");
+    save();
+    std::filesystem::remove(active / "component-compatibility.json");
+    EXPECT_FALSE(validate());
+    EXPECT_EQ(error.find("<unspecified file>"), std::string::npos) << error;
+    EXPECT_NE(error.find("outdated or incomplete"), std::string::npos) << error;
+    EXPECT_NE(error.find("component-compatibility.json is missing"), std::string::npos) << error;
+    EXPECT_NE(error.find("Update the DualSense component"), std::string::npos) << error;
+  }
+
+  TEST_F(Ds5ComponentManifest, MalformedContractAsksForAnUpdate) {
+    save();
+    write(active / "component-compatibility.json", "");
+    EXPECT_FALSE(validate());
+    EXPECT_EQ(error.find("<unspecified file>"), std::string::npos) << error;
+    EXPECT_NE(error.find("Update the DualSense component"), std::string::npos) << error;
+  }
+
+  TEST_F(Ds5ComponentManifest, OldVersionWithContractAsksForAnUpdate) {
+    manifest.put("component_version", "1.4.1");
+    save();
+    EXPECT_FALSE(validate());
+    EXPECT_NE(error.find("Update the DualSense component"), std::string::npos) << error;
+  }
 }  // namespace
 #endif
