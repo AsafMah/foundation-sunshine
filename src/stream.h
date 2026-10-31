@@ -18,6 +18,7 @@
 #include "audio.h"
 #include "crypto.h"
 #include "video.h"
+#include "streaming/abr_session.h"
 
 namespace rtsp_stream {
   struct launch_session_t;

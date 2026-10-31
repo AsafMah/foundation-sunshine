@@ -13,6 +13,7 @@
  */
 
 #include "abr.h"
+#include "abr_session.h"
 #include "src/config.h"
 #include "src/ai/proxy.h"
 #include "src/logging.h"
@@ -22,6 +23,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <sstream>
 #include <thread>
@@ -35,17 +37,8 @@ using json = nlohmann::json;
 
 namespace abr {
 
-  // NOTE: sessions are keyed by client_name (the device display name), which is the
-  // identifier that bridges the stateless HTTPS REST endpoints (abrFeedback/
-  // configureAbr resolve the client by source IP) and the streaming layer
-  // (stream::session::change_dynamic_param_for_client also routes by client_name).
-  // Limitation: two concurrently-running sessions that share the same device name
-  // would collide on a single entry and cross-contaminate state. This is acceptable
-  // because single-session deployments are immune and normally-paired devices have
-  // distinct names; supporting multi-session-same-name would require a coordinated
-  // rekey to a session-level id across resolve_client, this map, and
-  // change_dynamic_param_for_client.
-  //
+  // Keys are opaque stream allocation tokens. Callers in stream.cpp hold the
+  // session-list lock before entering ABR; ABR never acquires that outer lock.
   // The LLM worker runs on a detached thread and may still be in flight (its HTTP
   // call has a 300s timeout) when the process begins shutting down. To avoid a
   // static-destruction-order crash — where the worker reacquires the lock and
@@ -519,7 +512,8 @@ namespace abr {
       state.consecutive_high_loss = 0;
       state.stable_ticks++;
       if (state.stable_ticks >= 5) {
-        int new_bitrate = static_cast<int>(state.current_bitrate_kbps * 1.05);
+        int new_bitrate = static_cast<int>(std::min<double>(
+          state.current_bitrate_kbps * 1.05, state.config.max_bitrate_kbps));
         new_bitrate = std::clamp(new_bitrate, state.config.min_bitrate_kbps, state.config.max_bitrate_kbps);
         if (new_bitrate != state.current_bitrate_kbps) {
           action.new_bitrate_kbps = new_bitrate;
@@ -531,11 +525,11 @@ namespace abr {
     return action;
   }
 
-  void
-  enable(const std::string &client_name, const config_t &cfg, int initial_bitrate_kbps, const std::string &app_name) {
+  config_t
+  enable(const std::string &session_token, const config_t &cfg, int initial_bitrate_kbps, const std::string &app_name) {
     std::lock_guard lock(sessions_mutex);
 
-    auto &state = sessions[client_name];
+    auto &state = sessions[session_token];
     state.config = cfg;
     state.config.enabled = true;
     state.initial_bitrate_kbps = initial_bitrate_kbps;
@@ -573,16 +567,17 @@ namespace abr {
       switch (cfg.mode) {
         case mode_e::QUALITY:
           preset_min_bitrate_kbps = std::max(5000, initial_bitrate_kbps / 2);
-          preset_max_bitrate_kbps = std::min(150000, initial_bitrate_kbps * 3 / 2);
+          preset_max_bitrate_kbps = std::min<std::int64_t>(150000, std::int64_t {initial_bitrate_kbps} * 3 / 2);
           break;
         case mode_e::LOW_LATENCY:
           preset_min_bitrate_kbps = 2000;
-          preset_max_bitrate_kbps = initial_bitrate_kbps * 6 / 5;
+          preset_max_bitrate_kbps = std::min<std::int64_t>(std::numeric_limits<int>::max(),
+            std::int64_t {initial_bitrate_kbps} * 6 / 5);
           break;
         case mode_e::BALANCED:
         default:
-          preset_min_bitrate_kbps = std::max(3000, initial_bitrate_kbps * 3 / 10);
-          preset_max_bitrate_kbps = std::min(150000, initial_bitrate_kbps * 2);
+          preset_min_bitrate_kbps = std::max<std::int64_t>(3000, std::int64_t {initial_bitrate_kbps} * 3 / 10);
+          preset_max_bitrate_kbps = std::min<std::int64_t>(150000, std::int64_t {initial_bitrate_kbps} * 2);
           break;
       }
       if (state.config.min_bitrate_kbps <= 0) {
@@ -603,25 +598,26 @@ namespace abr {
       state.config.min_bitrate_kbps,
       state.config.max_bitrate_kbps);
 
-    BOOST_LOG(info) << "ABR enabled for client '" << client_name
+    BOOST_LOG(info) << "ABR enabled for session '" << session_token
                     << "': app=" << app_name
                     << " mode=" << mode_to_string(cfg.mode)
                     << " bitrate=" << initial_bitrate_kbps
                     << " range=[" << state.config.min_bitrate_kbps
                     << "," << state.config.max_bitrate_kbps << "] Kbps";
+    return state.config;
   }
 
   void
-  disable(const std::string &client_name) {
+  disable(const std::string &session_token) {
     std::lock_guard lock(sessions_mutex);
-    sessions.erase(client_name);
-    BOOST_LOG(info) << "ABR disabled for client '" << client_name << "'";
+    sessions.erase(session_token);
+    BOOST_LOG(info) << "ABR disabled for session '" << session_token << "'";
   }
 
   bool
-  is_enabled(const std::string &client_name) {
+  is_enabled(const std::string &session_token) {
     std::lock_guard lock(sessions_mutex);
-    auto it = sessions.find(client_name);
+    auto it = sessions.find(session_token);
     return it != sessions.end() && it->second.config.enabled;
   }
 
@@ -631,11 +627,11 @@ namespace abr {
    * Unlike old design, the LLM sets a target (not an immediate action).
    */
   static void
-  llm_worker(const std::string &client_name, uint64_t generation, std::string request_body) {
+  llm_worker(const std::string &session_token, uint64_t generation, std::string request_body) {
     auto result = ai::processAiChat(request_body);
 
     std::lock_guard lock(sessions_mutex);
-    auto it = sessions.find(client_name);
+    auto it = sessions.find(session_token);
     // The BOOST_LOG calls below touch the global severity loggers, which (unlike
     // sessions/sessions_mutex) are destroyed at static teardown. A late worker
     // logging after logging::deinit() would be a use-after-free. This is safe in
@@ -658,19 +654,19 @@ namespace abr {
     auto action = parse_llm_response(result.body, state);
     if (action.target_bitrate_kbps > 0) {
       state.llm_target_bitrate_kbps = action.target_bitrate_kbps;
-      BOOST_LOG(info) << "ABR LLM target for '" << client_name
+      BOOST_LOG(info) << "ABR LLM target for '" << session_token
                       << "': " << action.target_bitrate_kbps << " Kbps"
                       << " (" << action.reason << ")";
     }
   }
 
   action_t
-  process_feedback(const std::string &client_name, const network_feedback_t &raw_feedback) {
+  process_feedback(const std::string &session_token, const network_feedback_t &raw_feedback) {
     auto feedback = sanitize_feedback(raw_feedback);
 
     std::lock_guard lock(sessions_mutex);
 
-    auto it = sessions.find(client_name);
+    auto it = sessions.find(session_token);
     if (it == sessions.end() || !it->second.config.enabled) {
       return { .reason = "ABR not enabled" };
     }
@@ -740,7 +736,7 @@ namespace abr {
         }
         if (action.new_bitrate_kbps > 0) {
           state.current_bitrate_kbps = action.new_bitrate_kbps;
-          BOOST_LOG(info) << "ABR fallback for '" << client_name
+          BOOST_LOG(info) << "ABR fallback for '" << session_token
                           << "': " << action.new_bitrate_kbps << " Kbps"
                           << " (" << action.reason << ")";
           result_action = action;
@@ -770,7 +766,7 @@ namespace abr {
         auto prompt = build_llm_prompt(state);
         auto request_body = build_llm_request(prompt);
 
-        std::thread(llm_worker, client_name, state.generation, std::move(request_body)).detach();
+        std::thread(llm_worker, session_token, state.generation, std::move(request_body)).detach();
       }
     }
 
@@ -779,12 +775,58 @@ namespace abr {
 
   capabilities_t
   get_capabilities() {
-    return { true, 1 };
+    return { true, 2 };
   }
 
   void
-  cleanup(const std::string &client_name) {
-    disable(client_name);
+  cleanup(const std::string &session_token) {
+    disable(session_token);
+  }
+
+  session_result_t
+  apply_session_request(const std::string &token, const std::string &app_name,
+    streaming::bitrate_budget_t &budget, const session_request_t &request, int host_max_bitrate_kbps) {
+    session_result_t result { .error = session_error_e::none, .token = token };
+    const auto request_bitrate = [&](int bitrate) {
+      if (host_max_bitrate_kbps > 0) {
+        bitrate = std::min(bitrate, host_max_bitrate_kbps);
+      }
+      result.requested_bitrate_kbps = budget.request(bitrate);
+      result.bitrate_requested = true;
+    };
+    switch (request.operation) {
+      case operation_e::configure: {
+        const int current = budget.total();
+        int initial = current > 0 ? current : request.config.max_bitrate_kbps > 0 ? request.config.max_bitrate_kbps :
+                                                                                    20000;
+        if (request.config.max_bitrate_kbps > 0) {
+          initial = std::min(initial, request.config.max_bitrate_kbps);
+        }
+        if (request.config.min_bitrate_kbps > 0) {
+          initial = std::max(initial, request.config.min_bitrate_kbps);
+        }
+        result.config = enable(token, request.config, initial, app_name);
+        result.initial_bitrate_kbps = std::clamp(initial, result.config.min_bitrate_kbps, result.config.max_bitrate_kbps);
+        if (current > result.config.max_bitrate_kbps) {
+          request_bitrate(result.config.max_bitrate_kbps);
+        }
+        break;
+      }
+      case operation_e::disable:
+        disable(token);
+        break;
+      case operation_e::feedback:
+        if (!is_enabled(token)) {
+          return { .error = session_error_e::abr_not_enabled };
+        }
+        result.action = process_feedback(token, request.feedback);
+        if (result.action.new_bitrate_kbps > 0) {
+          request_bitrate(result.action.new_bitrate_kbps);
+          result.action.new_bitrate_kbps = result.requested_bitrate_kbps;
+        }
+        break;
+    }
+    return result;
   }
 
 }  // namespace abr

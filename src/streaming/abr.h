@@ -55,7 +55,7 @@ namespace abr {
   /// ABR capabilities reported to client
   struct capabilities_t {
     bool supported = true;
-    int version = 1;
+    int version = 2;
   };
 
   /// Recent feedback snapshot for LLM context window
@@ -109,25 +109,26 @@ namespace abr {
 
   /**
    * @brief Enable ABR for a client session.
-   * @param client_name Client identifier.
+   * @param session_token Stream allocation token, never a device display name.
    * @param cfg ABR configuration.
    * @param initial_bitrate_kbps The bitrate at stream start.
    * @param app_name The game/application currently running.
+   * @return Effective mode/host bounds stored in the controller.
    */
-  void
-  enable(const std::string &client_name, const config_t &cfg, int initial_bitrate_kbps, const std::string &app_name);
+  config_t
+  enable(const std::string &session_token, const config_t &cfg, int initial_bitrate_kbps, const std::string &app_name);
 
   /**
    * @brief Disable ABR for a client session.
    */
   void
-  disable(const std::string &client_name);
+  disable(const std::string &session_token);
 
   /**
-   * @brief Check if ABR is enabled for a client.
+   * @brief Check if ABR is enabled for a stream allocation.
    */
   bool
-  is_enabled(const std::string &client_name);
+  is_enabled(const std::string &session_token);
 
   /**
    * @brief Process network feedback and produce a bitrate action.
@@ -135,12 +136,12 @@ namespace abr {
    * Runs fallback logic (threshold-based) on every call for real-time response.
    * Triggers LLM asynchronously on app change or network recovery events.
    *
-   * @param client_name Client identifier.
+   * @param session_token Stream allocation token.
    * @param feedback Network metrics from the client.
    * @return Bitrate adjustment action (new_bitrate_kbps == 0 means no change).
    */
   action_t
-  process_feedback(const std::string &client_name, const network_feedback_t &feedback);
+  process_feedback(const std::string &session_token, const network_feedback_t &feedback);
 
   /**
    * @brief Get ABR capabilities for capability negotiation.
@@ -149,9 +150,9 @@ namespace abr {
   get_capabilities();
 
   /**
-   * @brief Remove all ABR state for a client (call on session end).
+   * @brief Remove all ABR state for a stream allocation (call on session end).
    */
   void
-  cleanup(const std::string &client_name);
+  cleanup(const std::string &session_token);
 
 }  // namespace abr

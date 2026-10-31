@@ -612,6 +612,9 @@ list(REMOVE_ITEM TEST_SOURCES
 
 set(ABR_TEST_STUB_SOURCE ${CMAKE_SOURCE_DIR}/tests/unit/abr_test_stubs.cpp)
 list(REMOVE_ITEM TEST_SOURCES ${ABR_TEST_STUB_SOURCE})
+list(REMOVE_ITEM TEST_SOURCES
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_abr_api.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_abr_session.cpp)
 if (WIN32)
     # Windows-only suites include fake APIs or backend paths of their own.
     list(REMOVE_ITEM TEST_SOURCES
@@ -676,6 +679,8 @@ set_tests_properties(${PROJECT_NAME} PROPERTIES TIMEOUT 600)
 
 add_executable(abr_unit_tests
         ${CMAKE_SOURCE_DIR}/src/streaming/abr.cpp
+        ${CMAKE_SOURCE_DIR}/src/streaming/bitrate.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_abr_session.cpp
         ${ABR_TEST_STUB_SOURCE})
 target_include_directories(abr_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(abr_unit_tests
@@ -691,6 +696,24 @@ foreach(dep ${SUNSHINE_TARGET_DEPENDENCIES})
     add_dependencies(abr_unit_tests ${dep})  # compile these before abr_unit_tests
 endforeach()
 add_test(NAME abr_unit_tests COMMAND abr_unit_tests)
+
+add_executable(abr_api_unit_tests
+        ${CMAKE_SOURCE_DIR}/src/nvhttp/abr_api.cpp
+        ${CMAKE_SOURCE_DIR}/src/streaming/abr.cpp
+        ${CMAKE_SOURCE_DIR}/src/streaming/bitrate.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_abr_api.cpp
+        ${ABR_TEST_STUB_SOURCE})
+target_include_directories(abr_api_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
+target_link_libraries(abr_api_unit_tests PRIVATE sunshine_http Boost::log Boost::filesystem Boost::thread
+        gtest_main nlohmann_json::nlohmann_json sunshine_project_options sunshine_coverage)
+target_compile_definitions(abr_api_unit_tests PRIVATE ${SUNSHINE_DEFINITIONS})
+set_target_properties(abr_api_unit_tests PROPERTIES CXX_STANDARD 23)
+if (WIN32)
+    target_link_libraries(abr_api_unit_tests PRIVATE psapi mswsock)
+    set_target_properties(abr_api_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
+endif ()
+add_test(NAME abr_api_unit_tests COMMAND abr_api_unit_tests)
+set_tests_properties(abr_api_unit_tests PROPERTIES TIMEOUT 30)
 
 add_executable(input_activity_unit_tests
         ${CMAKE_SOURCE_DIR}/tests/unit/test_input_activity.cpp
