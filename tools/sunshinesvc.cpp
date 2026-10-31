@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+#include "service_control.h"
+#include "src/streaming/restart_intent.h"
 #include "sunshinesvc_log.h"
 #include "sunshinesvc_state.h"
 
@@ -460,15 +462,6 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
     return;
   }
 
-  // Only allow Sunshine.exe to inherit the log file handle, not all inheritable handles
-  UpdateProcThreadAttribute(startup_info.lpAttributeList,
-    0,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    &log_file_handle,
-    sizeof(log_file_handle),
-    NULL,
-    NULL);
-
   // Tell SCM we're running (and stoppable now)
   service_status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PRESHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE;
   service_status.dwCurrentState = SERVICE_RUNNING;
@@ -600,6 +593,22 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
       continue;
     }
 
+    sunshinesvc::service_control::generation_events control_events;
+    const auto bridge_error = control_events.create(stop_event);
+    if (bridge_error != ERROR_SUCCESS) {
+      WriteServiceLog(log_file_handle, "Core event bridge creation failed (Win32 error " + std::to_string(bridge_error) + ")");
+      CloseHandle(console_token);
+      continue;
+    }
+    const HANDLE inherited_handles[] = { log_file_handle, control_events.child_restart(), control_events.child_stop() };
+    const auto whitelist_error = sunshinesvc::service_control::set_handle_list(startup_info, inherited_handles);
+    if (whitelist_error != ERROR_SUCCESS) {
+      WriteServiceLog(log_file_handle, "Core event handle whitelist failed (Win32 error " + std::to_string(whitelist_error) + ")");
+      CloseHandle(console_token);
+      continue;
+    }
+    auto core_command = control_events.command();
+
     // Job objects cannot span sessions, so we must create one for each process
     auto job_handle = CreateJobObjectForChildProcess();
     if (job_handle == NULL) {
@@ -619,7 +628,7 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
     PROCESS_INFORMATION process_info;
     if (!CreateProcessAsUserW(console_token,
           L"Sunshine.exe",
-          NULL,
+          core_command.data(),
           NULL,
           NULL,
           TRUE,
@@ -686,14 +695,59 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
           still_running = true;
           break;
 
-        case WAIT_OBJECT_0 + 2:
-          if (WTSGetActiveConsoleSessionId() == console_session_id) {
+        case WAIT_OBJECT_0 + 2: {
+          namespace ri = streaming::restart_intent;
+          auto action = ri::classify_console_change(console_session_id, WTSGetActiveConsoleSessionId(),
+            WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0);
+          while (action == ri::console_action::requery) {
+            const bool stopping = WaitForSingleObject(stop_event, 100) == WAIT_OBJECT_0;
+            if (WaitForSingleObject(process_info.hProcess, 0) == WAIT_OBJECT_0) {
+              break;
+            }
+            action = ri::classify_console_change(console_session_id, WTSGetActiveConsoleSessionId(), stopping);
+          }
+          if (WaitForSingleObject(process_info.hProcess, 0) == WAIT_OBJECT_0) {
+            still_running = false;
+            break;
+          }
+          if (action == ri::console_action::keep) {
             // The active console session didn't actually change. Let Sunshine keep running.
             still_running = true;
             continue;
           }
-          // Fall-through to terminate Sunshine.exe and start it again.
+          if (action == ri::console_action::migrate) {
+            WriteServiceLog(log_file_handle, "Core console-session migration requested");
+            const auto outcome = sunshinesvc::service_control::finish_migration(
+              [&] {
+                if (!SetEvent(control_events.restart())) {
+                  WriteServiceLog(log_file_handle, "Core restart event failed (Win32 error " + std::to_string(GetLastError()) + ")");
+                  return false;
+                }
+                return true;
+              },
+              [&](DWORD timeout) {
+                const auto result = WaitForSingleObject(process_info.hProcess, timeout);
+                if (result == WAIT_FAILED) {
+                  WriteServiceLog(log_file_handle, "Core migration exit wait failed (Win32 error " + std::to_string(GetLastError()) + ")");
+                }
+                return result == WAIT_OBJECT_0;
+              },
+              [&] {
+                WriteServiceLog(log_file_handle, "Core migration did not exit orderly; force terminating (intent delivery is not guaranteed)");
+                if (!TerminateProcess(process_info.hProcess, ERROR_PROCESS_ABORTED)) {
+                  WriteServiceLog(log_file_handle, "Forced Core migration termination failed (Win32 error " + std::to_string(GetLastError()) + ")");
+                  return false;
+                }
+                return true;
+              });
+            if (outcome == sunshinesvc::service_control::migration_exit::incomplete) {
+              WriteServiceLog(log_file_handle, "Core did not exit after forced migration termination");
+            }
+            still_running = false;
+            break;
+          }
           [[fallthrough]];
+        }
         case WAIT_OBJECT_0:
           // The service is shutting down, so try to gracefully terminate Sunshine.exe.
           // If it doesn't terminate in 20 seconds, we will forcefully terminate it.

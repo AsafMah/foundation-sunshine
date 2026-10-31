@@ -36,6 +36,36 @@ cd foundation-sunshine
 - [NVIDIA HDR 构建](https://github.com/AlkaidLab/foundation-sunshine/blob/master/docs/rtx_hdr_build.md)
 - [主程序与 GUI 配对构建](https://github.com/AlkaidLab/foundation-sunshine/blob/master/docs/paired-gui-build.md)
 
+## 实验性 Windows Core 重启意图
+
+服务通过私有、继承的手动复位事件区分控制台会话迁移与真正停止。Core 在启用
+RTSP 重启能力之前验证 SYSTEM 身份和事件句柄；便携启动不提供此桥接。
+暂时不存在的控制台会话会重新查询，不立即触发迁移。
+
+v1 协议值与经过审查的 common-c 定义一致，见
+`AsafMah/moonlight-common-c` 提交
+`080e04dd3c26bede976a8434ddc3defe8fc4b6e8`：
+`SS_TERMINATION_HOST_RESTART_V1=0x53535201`、
+`LI_FF_HOST_RESTART=0x800`、`ML_FF_HOST_RESTART=0x100`、
+`LI_HOST_RESTART_PROTOCOL_VERSION=1`。双方必须协商各自的能力位、
+`x-ss-restart.protocolVersion:1` / `x-ml-restart.protocolVersion:1`
+及加密控制通道。只有接受协议的会话收到 `53 53 52 01`；
+真正停止及旧客户端保持 `80 03 00 23`，不改变现有包布局或加密方式。
+
+控制线程在释放会话和 ENet peer 之前最多执行 250 ms 的 ENet 协议工作。
+这不是应用层确认，强制终止或丢包仍可能表现为普通连接丢失。
+没有恢复凭证持久化或受管理游戏状态保存；自动恢复也依赖支持该协议的客户端
+及认证后的主机状态刷新，客户端第一阶段仅重新启动原先无命令的 Desktop。
+主机常量保留在 `src/streaming/restart_intent.h`；仅供客户端使用的
+`ML_ERROR_HOST_RESTART` 不在主机定义。启用主机发送功能之前，先发布
+common-c 与客户端支持。兼容客户端提交为
+`AsafMah/moonlight-qt` 的 `6425ac90b38e52ef5ef7e5f73b0f6610f94ec3c7`，
+其 common-c 子模块固定为上述提交。
+
+独立目标 `restart_intent_unit_tests` 使用模拟服务事件、无设备操作的模拟 Core
+子进程及回环 ENet，不运行 Sunshine，也不切换 Windows 会话。
+真实服务、WTS、RDP 互操作仍须单独验证，不能由这些测试推断。
+
 ## WebUI 开发
 
 使用主仓库 `.node-version` 指定的 Node.js 和 `package.json` 指定的 npm 版本，在仓库根目录执行：

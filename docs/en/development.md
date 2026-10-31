@@ -36,6 +36,42 @@ For optional components, check package origin, version, capability, and fallback
 - [NVIDIA HDR build](https://github.com/AlkaidLab/foundation-sunshine/blob/master/docs/rtx_hdr_build.md)
 - [Paired host and GUI builds](https://github.com/AlkaidLab/foundation-sunshine/blob/master/docs/paired-gui-build.md)
 
+## Experimental Windows Core restart intent
+
+The service distinguishes a console-session migration from a genuine stop using
+private inherited manual-reset events. Core validates SYSTEM identity and the
+event handles before enabling RTSP restart support. Portable startup has no
+restart bridge. A transient absent console session is rechecked, not treated as
+a migration.
+
+These v1 protocol allocations match the reviewed common-c definitions in
+`AsafMah/moonlight-common-c` commit
+`080e04dd3c26bede976a8434ddc3defe8fc4b6e8`:
+`SS_TERMINATION_HOST_RESTART_V1=0x53535201`,
+`LI_FF_HOST_RESTART=0x800`, `ML_FF_HOST_RESTART=0x100`, and
+`LI_HOST_RESTART_PROTOCOL_VERSION=1`. Host and client must both negotiate their
+feature bit and `x-ss-restart.protocolVersion:1` /
+`x-ml-restart.protocolVersion:1`, with encrypted control. Only an accepted
+session receives restart reason bytes `53 53 52 01`; genuine stops and legacy
+sessions retain `80 03 00 23`. No packet layout or existing encryption changes.
+
+The owning control thread services ENet for up to 250 ms before session/peer
+teardown. This improves delivery but adds no application acknowledgement:
+forced termination or packet loss can still appear as generic connection loss.
+There is no recovery tombstone or managed-game persistence. Automatic recovery
+also requires a restart-aware client and authenticated host-state refresh;
+the initial client scope is a fresh launch of the original commandless Desktop.
+The host deliberately keeps its constants in `src/streaming/restart_intent.h`;
+the client-only `ML_ERROR_HOST_RESTART` is not defined by the host. Ship the
+common-c/client support before enabling host emission; the compatible client
+commit is `AsafMah/moonlight-qt` `6425ac90b38e52ef5ef7e5f73b0f6610f94ec3c7`
+and pins the common-c commit above.
+
+The dedicated `restart_intent_unit_tests` target uses fake service events, a
+device-free fake Core child, and loopback ENet. It does not run Sunshine or alter
+Windows sessions. Live service/WTS/RDP interoperability requires separate
+validation and cannot be inferred from these tests.
+
 ## Develop the WebUI
 
 Use the Node.js version in `.node-version` and npm requirements in `package.json`. From the host repository root:
