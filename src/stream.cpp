@@ -4762,10 +4762,16 @@ namespace stream {
 
       return abr::with_authenticated_session(broadcast_ref->control_server._sessions, client_cert_uuid, request, [](const session_t &session) {
           const auto lifecycle = session.lifecycle.state();
-          return abr::session_candidate_t {session.client_cert_uuid, session.abr_session_token,
-            lifecycle == state_e::RUNNING, lifecycle == state_e::STARTING, session.control_only}; }, [&](session_t &session) {
+          return abr::make_session_candidate(session.client_cert_uuid, session.abr_session_token,
+            lifecycle, session.control_only); }, [&](session_t &session) {
           auto result = abr::apply_session_request(session.abr_session_token, session.app_name,
             *session.config.monitor.bitrate_budget, request, config::video.max_bitrate);
+          if (result.error == abr::session_error_e::none && request.operation == abr::operation_e::configure) {
+            BOOST_LOG(info) << "ABR stream binding client_cert="
+                            << session.client_cert_uuid.substr(0, std::min<std::size_t>(session.client_cert_uuid.size(), 8))
+                            << " launch_session_id=" << session.launch_session_id
+                            << " token_prefix=" << session.abr_session_token.substr(0, std::min<std::size_t>(session.abr_session_token.size(), 8));
+          }
           if (result.bitrate_requested) {
             perf::update_session_bitrate(session.launch_session_id, result.requested_bitrate_kbps);
           }

@@ -102,7 +102,7 @@ namespace nvhttp::abr_api {
       case abr::session_error_e::session_starting:
         return { 409, "session_starting", "Video session is starting", unbound_configure };
       case abr::session_error_e::ambiguous_session:
-        return { 409, "ambiguous_session", "Multiple video sessions belong to this client", false };
+        return { 409, "ambiguous_session", "Multiple video sessions belong to this client", unbound_configure };
       case abr::session_error_e::stale_session:
         return { 409, "stale_session", "Session token no longer identifies this client's active stream", false };
       case abr::session_error_e::abr_not_enabled:

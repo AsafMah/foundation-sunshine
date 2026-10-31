@@ -1,6 +1,9 @@
 #include "src/nvhttp/abr_request.h"
+#include "src/nvhttp/abr_rejection_log_limiter.h"
 #include "src/streaming/abr_session.h"
+#include <chrono>
 #include <gtest/gtest.h>
+#include <string>
 
 TEST(AbrSessionIdentity, MappedIpv4FixtureUsesCertificateNotAddress) {
   // Reported HTTPS peer: 84.229.28.83; RTSP/ENet peer: ::ffff:84.229.28.83.
@@ -40,11 +43,14 @@ TEST(AbrSessionIdentity, MissingStartingControlOnlyAndAmbiguityFailClosed) {
   EXPECT_EQ(abr::select_session(sessions, "paired-a").error, error::session_starting);
   sessions.push_back({ "paired-a", "running", true, false, false });
   EXPECT_EQ(abr::select_session(sessions, "paired-a").error, error::ambiguous_session);
-  EXPECT_EQ(abr::select_session(sessions, "paired-a", "running").error, error::ambiguous_session);
+  EXPECT_EQ(abr::select_session(sessions, "paired-a", "running").error, error::none);
   sessions[1].starting = false;
   EXPECT_EQ(abr::select_session(sessions, "paired-a", "running").error, error::none);
   sessions.push_back({ "paired-a", "another", true, false, false });
   EXPECT_EQ(abr::select_session(sessions, "paired-a").error, error::ambiguous_session);
+  EXPECT_EQ(abr::select_session(sessions, "paired-a", "running").error, error::none);
+  EXPECT_EQ(abr::select_session(sessions, "paired-a", "another").error, error::none);
+  EXPECT_EQ(abr::select_session(sessions, "paired-a", "stale").error, error::stale_session);
 }
 
 TEST(AbrSessionIdentity, ReplacementRejectsOldTokenAndAnotherCertificatesToken) {
@@ -57,6 +63,79 @@ TEST(AbrSessionIdentity, ReplacementRejectsOldTokenAndAnotherCertificatesToken) 
   EXPECT_EQ(abr::select_session({}, "paired-a", "new-generation").error, abr::session_error_e::stale_session);
 }
 
+TEST(AbrSessionIdentity, BoundTokenRequiresItsOwnRunningNonControlAllocation) {
+  using error = abr::session_error_e;
+  std::vector<abr::session_candidate_t> sessions {
+    { "paired-a", "old-running", true, false, false },
+    { "paired-a", "new-running", true, false, false },
+    { "paired-a", "starting", false, true, false },
+    { "paired-a", "control-only", true, false, true },
+  };
+  const auto selected = abr::select_session(sessions, "paired-a", "new-running");
+  EXPECT_EQ(selected.error, error::none);
+  EXPECT_EQ(selected.index, 1u);
+  EXPECT_EQ(abr::select_session(sessions, "paired-a", "old-running").index, 0u);
+  EXPECT_EQ(abr::select_session(sessions, "paired-a", "starting").error, error::stale_session);
+  EXPECT_EQ(abr::select_session(sessions, "paired-a", "control-only").error, error::stale_session);
+  EXPECT_EQ(abr::select_session(sessions, "paired-b", "new-running").error, error::stale_session);
+}
+
+TEST(AbrSessionIdentity, ProductionLifecycleProjectionExcludesNonVideoStates) {
+  using lifecycle = stream::session::state_e;
+  const auto stopped = abr::make_session_candidate("paired-a", "stopped", lifecycle::STOPPED, false);
+  const auto stopping = abr::make_session_candidate("paired-a", "stopping", lifecycle::STOPPING, false);
+  const auto starting = abr::make_session_candidate("paired-a", "starting", lifecycle::STARTING, false);
+  const auto running = abr::make_session_candidate("paired-a", "running", lifecycle::RUNNING, false);
+  const auto control = abr::make_session_candidate("paired-a", "control", lifecycle::RUNNING, true);
+  EXPECT_FALSE(stopped.running);
+  EXPECT_FALSE(stopped.starting);
+  EXPECT_FALSE(stopping.running);
+  EXPECT_FALSE(stopping.starting);
+  EXPECT_FALSE(running.starting);
+  EXPECT_TRUE(running.running);
+  EXPECT_TRUE(starting.starting);
+  EXPECT_FALSE(starting.running);
+  EXPECT_TRUE(control.control_only);
+  EXPECT_EQ(abr::select_session({ stopped, stopping, control }, "paired-a").error,
+    abr::session_error_e::no_active_stream);
+  EXPECT_EQ(abr::select_session({ starting }, "paired-a").error, abr::session_error_e::session_starting);
+  EXPECT_EQ(abr::select_session({ running }, "paired-a").error, abr::session_error_e::none);
+  for (const auto &candidate : { stopped, stopping, starting, control }) {
+    EXPECT_EQ(abr::select_session({ candidate }, "paired-a", candidate.token).error,
+      abr::session_error_e::stale_session);
+  }
+  EXPECT_EQ(abr::select_session({ running }, "paired-a", "running").error, abr::session_error_e::none);
+}
+
+TEST(AbrRejectionLogging, ClientChurnCannotEvictRateLimitStateOrFloodWarnings) {
+  nvhttp::abr_api::rejection_log_limiter_t limiter;
+  using clock = nvhttp::abr_api::rejection_log_limiter_t::clock_t;
+  auto now = clock::time_point {} + std::chrono::seconds(1);
+  std::uint64_t suppressed = 0;
+  std::size_t logged = 0;
+  for (std::size_t i = 0; i < 1000; ++i) {
+    const auto uuid = "paired-client-" + std::to_string(i);
+    if (limiter.should_log(uuid, "invalid_body", now, suppressed)) {
+      ++logged;
+    }
+    now += std::chrono::milliseconds(50);
+  }
+  EXPECT_LE(logged, 11u);
+  EXPECT_GT(suppressed, 0u);
+}
+
+TEST(AbrRejectionLogging, ReportsSuppressedCountOnce) {
+  nvhttp::abr_api::rejection_log_limiter_t limiter;
+  using clock = nvhttp::abr_api::rejection_log_limiter_t::clock_t;
+  const auto now = clock::time_point {} + std::chrono::seconds(1);
+  std::uint64_t suppressed = 0;
+  EXPECT_TRUE(limiter.should_log("paired-a", "invalid_body", now, suppressed));
+  EXPECT_EQ(suppressed, 0u);
+  EXPECT_FALSE(limiter.should_log("paired-a", "invalid_body", now + std::chrono::seconds(1), suppressed));
+  EXPECT_TRUE(limiter.should_log("paired-b", "stale_session", now + std::chrono::seconds(6), suppressed));
+  EXPECT_EQ(suppressed, 1u);
+}
+
 TEST(AbrRequestContract, InvalidBodiesCannotDisableOrSilentlyCoerceMetrics) {
   using nlohmann::json;
   using nvhttp::abr_api::parse_request;
@@ -67,7 +146,7 @@ TEST(AbrRequestContract, InvalidBodiesCannotDisableOrSilentlyCoerceMetrics) {
          { { "enabled", 1 } },
          { { "enabled", false } },
          { { "enabled", true }, { "minBitrate", -1 } },
-         { { "enabled", true }, { "maxBitrate", 1.5 } },
+         { { "enabled", true }, { "maxBitrate", 20000.0 } },
          { { "enabled", true }, { "maxBitrate", 2147483648ULL } },
          { { "enabled", true }, { "minBitrate", 20000 }, { "maxBitrate", 10000 } },
          { { "enabled", true }, { "mode", "unknown" } },
@@ -104,7 +183,8 @@ TEST(AbrRequestContract, SuccessAndRetryContractIsTypedAndBound) {
     EXPECT_TRUE(nvhttp::abr_api::error_contract(error, true).retryable);
     EXPECT_FALSE(nvhttp::abr_api::error_contract(error, false).retryable);
   }
-  EXPECT_FALSE(nvhttp::abr_api::error_contract(abr::session_error_e::ambiguous_session, true).retryable);
+  EXPECT_TRUE(nvhttp::abr_api::error_contract(abr::session_error_e::ambiguous_session, true).retryable);
+  EXPECT_FALSE(nvhttp::abr_api::error_contract(abr::session_error_e::ambiguous_session, false).retryable);
   EXPECT_EQ(nvhttp::abr_api::error_contract(abr::session_error_e::missing_client_identity, true).status, 403);
 }
 

@@ -8,7 +8,10 @@
 
 namespace {
   struct fake_session_t {
-    abr::session_candidate_t candidate;
+    std::string client_uuid = "paired-a";
+    std::string token;
+    stream::session::state_e lifecycle = stream::session::state_e::RUNNING;
+    bool control_only = false;
     std::string name = "asaf";
     std::string address = "::ffff:84.229.28.83";
     unsigned launch_id = 42;
@@ -35,14 +38,15 @@ namespace {
       auto lock = session_list.lock();
       session_list->clear();
       for (const auto &session : sessions) {
-        abr::cleanup(session->candidate.token);
+        abr::cleanup(session->token);
       }
       sessions.clear();
     }
     fake_session_t &
     add(std::string uuid, std::string token) {
       auto session = std::make_unique<fake_session_t>();
-      session->candidate = { std::move(uuid), std::move(token), true, false, false };
+      session->client_uuid = std::move(uuid);
+      session->token = std::move(token);
       auto lock = session_list.lock();
       session_list->push_back(session.get());
       sessions.push_back(std::move(session));
@@ -104,7 +108,11 @@ namespace stream::session {
   abr::session_result_t
   apply_abr_for_client(const std::string &uuid, const abr::session_request_t &request) {
     if (fail_operation) throw std::runtime_error("private internal detail");
-    return abr::with_authenticated_session(session_list, uuid, request, [](const fake_session_t &session) { return session.candidate; }, [&](fake_session_t &session) { return abr::apply_session_request(session.candidate.token, "app", session.budget, request, config::video.max_bitrate); });
+    return abr::with_authenticated_session(session_list, uuid, request, [](const fake_session_t &session) {
+      return abr::make_session_candidate(session.client_uuid, session.token, session.lifecycle, session.control_only);
+    }, [&](fake_session_t &session) {
+      return abr::apply_session_request(session.token, "app", session.budget, request, config::video.max_bitrate);
+    });
   }
 }  // namespace stream::session
 
@@ -167,23 +175,46 @@ TEST_F(AbrHttp, ReusedLaunchIdAndNameRejectOldFeedbackDisableAndConfigureTokens)
 TEST_F(AbrHttp, MissingStartingAmbiguousAndDisabledHaveExactErrorContract) {
   expect_error(post(R"({"enabled":true})", false, ""), 403, "missing_client_identity", false);
   expect_error(post(R"({"enabled":true})", false, "unpaired"), 409, "no_active_stream", true);
-  sessions[0]->candidate.running = false;
-  sessions[0]->candidate.starting = true;
+  sessions[0]->lifecycle = stream::session::state_e::STARTING;
   expect_error(post(R"({"enabled":true})"), 409, "session_starting", true);
-  expect_error(post(R"({"enabled":true,"sessionToken":"allocation-a"})"), 409, "session_starting", false);
+  expect_error(post(R"({"enabled":true,"sessionToken":"allocation-a"})"), 409, "stale_session", false);
   add("paired-a", "second");
-  expect_error(post(R"({"enabled":true})"), 409, "ambiguous_session", false);
-  sessions[0]->candidate.starting = false;
-  sessions[0]->candidate.control_only = true;
+  expect_error(post(R"({"enabled":true})"), 409, "ambiguous_session", true);
+  sessions[0]->lifecycle = stream::session::state_e::STOPPING;
+  sessions[0]->control_only = true;
   expect_error(post(R"({"sessionToken":"second"})", true), 409, "abr_not_enabled", false);
   clear();
   expect_error(post(R"({"sessionToken":"second"})", true), 409, "stale_session", false);
 }
 
+TEST_F(AbrHttp, BoundRequestsSelectExactAllocationDuringReconnectOverlap) {
+  sessions[0]->lifecycle = stream::session::state_e::STARTING;
+  auto &replacement = add("paired-a", "replacement");
+  const auto configured = post(R"({"enabled":true,"sessionToken":"replacement"})");
+  ASSERT_EQ(configured.status, 200);
+  EXPECT_EQ(configured.body.at("sessionToken"), "replacement");
+  abr::enable("allocation-a", { true, 2000, 50000, abr::mode_e::BALANCED }, 20000, "app");
+  abr::enable("replacement", { true, 2000, 50000, abr::mode_e::BALANCED }, 40000, "app");
+
+  expect_error(post(R"({"sessionToken":"allocation-a","packetLoss":6})", true), 409, "stale_session", false);
+  const auto feedback = post(R"({"sessionToken":"replacement","packetLoss":6,"currentBitrate":40000})", true);
+  ASSERT_EQ(feedback.status, 200);
+  EXPECT_EQ(feedback.body.at("sessionToken"), "replacement");
+  EXPECT_EQ(replacement.budget.total(), 28000);
+  EXPECT_EQ(sessions[0]->budget.total(), 20000);
+
+  expect_error(post(R"({"enabled":true})"), 409, "ambiguous_session", true);
+  expect_error(post(R"({"sessionToken":"missing","packetLoss":6})", true), 409, "stale_session", false);
+  const auto disabled = post(R"({"enabled":false,"sessionToken":"replacement"})");
+  ASSERT_EQ(disabled.status, 200);
+  EXPECT_FALSE(abr::is_enabled("replacement"));
+  EXPECT_TRUE(abr::is_enabled("allocation-a"));
+}
+
 TEST_F(AbrHttp, MalformedBodiesCannotDisableAndInternalErrorsAreNotLeaked) {
   ASSERT_EQ(post(R"({"enabled":true})").status, 200);
   for (const std::string body : { "{", "[]", "{}", R"({"enabled":false})",
-         R"({"enabled":true,"maxBitrate":1.5})", R"({"enabled":true,"maxBitrate":2147483648})" }) {
+         R"({"enabled":true,"maxBitrate":20000.0})", R"({"enabled":true,"maxBitrate":2147483648})" }) {
     expect_error(post(body), 400, "invalid_body", false);
   }
   expect_error(post(R"({"packetLoss":6})", true), 400, "invalid_body", false);
@@ -204,6 +235,7 @@ TEST_F(AbrHttp, HostCapAndEffectiveBoundsPreserveBudgetRequestMeaning) {
   EXPECT_EQ(reply.body.at("requestedMaxBitrate"), 80000);
   EXPECT_EQ(reply.body.at("bitrateRequested"), true);
   EXPECT_EQ(reply.body.at("bitrateApplied"), true);
+  EXPECT_FALSE(reply.body.contains("bitrateApplyError"));
   EXPECT_EQ(sessions[0]->budget.total(), 15000);
   EXPECT_EQ(sessions[0]->budget.applied().total_kbps, 20000);
 }
@@ -233,10 +265,12 @@ TEST_F(AbrHttp, RemovalAndReplacementCannotInterleaveSelectionAndBudgetMutation)
   abr::session_request_t request;
   request.config = { true, 2000, 10000, abr::mode_e::BALANCED };
   auto operation = std::async(std::launch::async, [&] {
-    return abr::with_authenticated_session(session_list, "paired-a", request, [](const fake_session_t &session) { return session.candidate; }, [&](fake_session_t &session) {
+    return abr::with_authenticated_session(session_list, "paired-a", request, [](const fake_session_t &session) {
+      return abr::make_session_candidate(session.client_uuid, session.token, session.lifecycle, session.control_only);
+    }, [&](fake_session_t &session) {
         selected.set_value();
         release_future.wait();
-        return abr::apply_session_request(session.candidate.token, "app", session.budget, request); });
+        return abr::apply_session_request(session.token, "app", session.budget, request); });
   });
   selected.get_future().wait();
   auto replacement = std::async(std::launch::async, [&] {

@@ -26,6 +26,7 @@
 #include <limits>
 #include <nlohmann/json.hpp>
 #include <sstream>
+#include <string_view>
 #include <thread>
 
 #ifdef _WIN32
@@ -46,6 +47,11 @@ namespace abr {
   // process lifetime and intentionally never freed, so a late worker is always safe.
   static std::mutex &sessions_mutex = *new std::mutex();
   static std::unordered_map<std::string, session_state_t> &sessions = *new std::unordered_map<std::string, session_state_t>();
+
+  static std::string_view
+  token_log_prefix(const std::string &token) {
+    return std::string_view(token).substr(0, std::min<std::size_t>(token.size(), 8));
+  }
 
   /**
    * @brief Sanitize client-provided network feedback values.
@@ -598,8 +604,8 @@ namespace abr {
       state.config.min_bitrate_kbps,
       state.config.max_bitrate_kbps);
 
-    BOOST_LOG(info) << "ABR enabled for session '" << session_token
-                    << "': app=" << app_name
+    BOOST_LOG(info) << "ABR enabled token_prefix=" << token_log_prefix(session_token)
+                    << " app=" << app_name
                     << " mode=" << mode_to_string(cfg.mode)
                     << " bitrate=" << initial_bitrate_kbps
                     << " range=[" << state.config.min_bitrate_kbps
@@ -611,7 +617,7 @@ namespace abr {
   disable(const std::string &session_token) {
     std::lock_guard lock(sessions_mutex);
     sessions.erase(session_token);
-    BOOST_LOG(info) << "ABR disabled for session '" << session_token << "'";
+    BOOST_LOG(info) << "ABR disabled token_prefix=" << token_log_prefix(session_token);
   }
 
   bool
@@ -654,7 +660,7 @@ namespace abr {
     auto action = parse_llm_response(result.body, state);
     if (action.target_bitrate_kbps > 0) {
       state.llm_target_bitrate_kbps = action.target_bitrate_kbps;
-      BOOST_LOG(info) << "ABR LLM target for '" << session_token
+      BOOST_LOG(info) << "ABR LLM target token_prefix=" << token_log_prefix(session_token)
                       << "': " << action.target_bitrate_kbps << " Kbps"
                       << " (" << action.reason << ")";
     }
@@ -736,7 +742,7 @@ namespace abr {
         }
         if (action.new_bitrate_kbps > 0) {
           state.current_bitrate_kbps = action.new_bitrate_kbps;
-          BOOST_LOG(info) << "ABR fallback for '" << session_token
+          BOOST_LOG(info) << "ABR fallback token_prefix=" << token_log_prefix(session_token)
                           << "': " << action.new_bitrate_kbps << " Kbps"
                           << " (" << action.reason << ")";
           result_action = action;

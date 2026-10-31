@@ -1,11 +1,13 @@
 #include "abr_api.h"
 #include "abr_request.h"
+#include "abr_rejection_log_limiter.h"
 
 #include "src/ai/proxy.h"
 #include "src/config.h"
 #include "src/http/server.h"
 #include "src/logging.h"
 #include <algorithm>
+#include <string_view>
 
 using json = nlohmann::json;
 
@@ -17,8 +19,21 @@ namespace nvhttp::abr_api {
     }
 
     void
-    write_error(resp_https_t response, int status, const char *code, const char *message, bool retryable = false) {
-      BOOST_LOG(warning) << "ABR request rejected: " << code << ": " << message;
+    log_rejection(std::string_view code, std::string_view client_uuid) {
+      static rejection_log_limiter_t limiter;
+      std::uint64_t suppressed = 0;
+      if (!limiter.should_log(client_uuid, code, rejection_log_limiter_t::clock_t::now(), suppressed)) {
+        return;
+      }
+      BOOST_LOG(warning) << "ABR request rejected code=" << code
+                         << " client=" << client_uuid.substr(0, std::min<std::size_t>(client_uuid.size(), 8))
+                         << " suppressed=" << suppressed;
+    }
+
+    void
+    write_error(resp_https_t response, int status, const char *code, const char *message,
+      bool retryable = false, std::string_view client_uuid = {}) {
+      log_rejection(code, client_uuid);
       response->write(static_cast<web::StatusCode>(status),
         json { { "success", false }, { "error_code", code }, { "error", message }, { "retryable", retryable } }.dump(),
         json_headers());
@@ -45,7 +60,8 @@ namespace nvhttp::abr_api {
     handle_request(resp_https_t response, req_https_t request, bool feedback) {
       const auto uuid = nvhttp::get_client_cert_uuid_from_request(request);
       if (uuid.empty()) {
-        write_error(response, 403, "missing_client_identity", "Authenticated paired-client identity is required");
+        write_error(response, 403, "missing_client_identity", "Authenticated paired-client identity is required",
+          false, uuid);
         return;
       }
       try {
@@ -60,7 +76,7 @@ namespace nvhttp::abr_api {
         if (result.error != abr::session_error_e::none) {
           const auto error = error_contract(result.error,
             parsed.operation == abr::operation_e::configure && parsed.token.empty());
-          write_error(response, error.status, error.code, error.message, error.retryable);
+          write_error(response, error.status, error.code, error.message, error.retryable, uuid);
           return;
         }
         json body { { "success", true }, { "sessionToken", result.token } };
@@ -90,16 +106,15 @@ namespace nvhttp::abr_api {
         }
         response->write(web::StatusCode::ok, body.dump(), json_headers());
       }
-      catch (const json::exception &e) {
-        BOOST_LOG(warning) << "ABR JSON validation: " << e.what();
-        write_error(response, 400, "invalid_body", "Invalid JSON body or field type");
+      catch (const json::exception &) {
+        write_error(response, 400, "invalid_body", "Invalid JSON body or field type", false, uuid);
       }
       catch (const std::invalid_argument &e) {
-        write_error(response, 400, "invalid_body", e.what());
+        write_error(response, 400, "invalid_body", e.what(), false, uuid);
       }
       catch (const std::exception &e) {
         BOOST_LOG(error) << "ABR request failed: " << e.what();
-        write_error(response, 500, "internal_error", "ABR request failed");
+        write_error(response, 500, "internal_error", "ABR request failed", false, uuid);
       }
     }
   }  // namespace

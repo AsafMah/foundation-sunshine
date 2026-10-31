@@ -2,8 +2,10 @@
 
 #include "abr.h"
 #include "bitrate.h"
+#include "session_state.h"
 #include <cstddef>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace abr {
@@ -25,6 +27,17 @@ namespace abr {
     bool control_only;
   };
 
+  inline session_candidate_t
+  make_session_candidate(std::string client_uuid, std::string token, stream::session::state_e lifecycle, bool control_only) {
+    return {
+      std::move(client_uuid),
+      std::move(token),
+      lifecycle == stream::session::state_e::RUNNING,
+      lifecycle == stream::session::state_e::STARTING,
+      control_only,
+    };
+  }
+
   struct session_selection_t {
     session_error_e error = session_error_e::no_active_stream;
     std::size_t index = 0;
@@ -36,6 +49,27 @@ namespace abr {
     if (client_uuid.empty()) {
       return { session_error_e::missing_client_identity };
     }
+    if (!expected_token.empty()) {
+      std::size_t match = sessions.size();
+      for (std::size_t i = 0; i < sessions.size(); ++i) {
+        const auto &candidate = sessions[i];
+        if (candidate.client_uuid == client_uuid && candidate.token == expected_token) {
+          if (match != sessions.size()) {
+            return { session_error_e::stale_session };
+          }
+          match = i;
+        }
+      }
+      if (match == sessions.size()) {
+        return { session_error_e::stale_session };
+      }
+      const auto &candidate = sessions[match];
+      if (!candidate.running || candidate.starting || candidate.control_only) {
+        return { session_error_e::stale_session };
+      }
+      return { session_error_e::none, match };
+    }
+
     session_selection_t selected;
     std::size_t count = 0;
     for (std::size_t i = 0; i < sessions.size(); ++i) {
@@ -48,10 +82,6 @@ namespace abr {
     }
     if (count > 1) {
       return { session_error_e::ambiguous_session };
-    }
-    if (!expected_token.empty() &&
-        (count == 0 || sessions[selected.index].token != expected_token)) {
-      return { session_error_e::stale_session };
     }
     return selected;
   }
