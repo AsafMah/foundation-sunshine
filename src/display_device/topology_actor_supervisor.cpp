@@ -58,15 +58,24 @@ namespace display_device::topology {
 
     auto self = std::make_shared<actor_supervisor_t>(private_t {}, std::move(store), std::move(intent), std::move(exclusion),
       std::move(body), started + std::min(options.deadline, actor_launch_deadline_limit));
+    if (options.cleanup_sink) {
+      self->sink_ = std::move(options.cleanup_sink);
+      self->automatic_ = true;
+    }
 
     // Settles a supervisor whose body can no longer run. Only the claimant may call it.
     const auto abandon = [&self](std::string detail) {
       const bool settled = self->settle_record();
-      std::lock_guard lock { self->mutex_ };
-      self->decide_launch_locked({ actor_launch_e::not_launched, {}, detail });
-      self->phase_ = settled ? actor_phase_e::settled : actor_phase_e::blocked;
-      self->detail_ = std::move(detail);
-      self->changed_.notify_all();
+      {
+        std::lock_guard lock { self->mutex_ };
+        self->decide_launch_locked({ actor_launch_e::not_launched, {}, detail });
+      }
+      if (settled) {
+        self->finish_settled(std::move(detail));
+      }
+      else {
+        self->finish(actor_phase_e::blocked, std::move(detail));
+      }
     };
 
     result_t<void> published;
@@ -190,6 +199,23 @@ namespace display_device::topology {
   }
 
   void
+  actor_supervisor_t::finish_settled(std::string detail) {
+    std::shared_ptr<actor_cleanup_sink_t> sink;
+    actor_cleanup_handoff_t handoff;
+    {
+      std::lock_guard lock { mutex_ };
+      if (automatic_ && !handed_off_) {
+        handed_off_ = true;
+        sink = std::move(sink_);
+        handoff = { record_, std::move(exclusion_) };
+      }
+    }
+    // Outside the lock, so the sink may inspect the supervisor; it is noexcept.
+    if (sink) sink->accept(std::move(handoff));
+    finish(actor_phase_e::settled, std::move(detail));
+  }
+
+  void
   actor_supervisor_t::run() noexcept {
     {
       std::lock_guard lock { mutex_ };
@@ -252,7 +278,7 @@ namespace display_device::topology {
       finish(actor_phase_e::blocked, "The external actor's settlement is not durable");
       return;
     }
-    finish(actor_phase_e::settled, result.detail);
+    finish_settled(result.detail);
   }
 
   actor_launch_result_t
@@ -282,6 +308,9 @@ namespace display_device::topology {
     std::lock_guard lock { mutex_ };
     if (handed_off_) {
       return std::unexpected(error_t { error_code_e::already_finalized, "The external actor's cleanup was already handed off", {} });
+    }
+    if (automatic_) {
+      return std::unexpected(error_t { error_code_e::invalid_transition, "The external actor's cleanup is delivered to its sink", {} });
     }
     if (phase_ != actor_phase_e::settled) {
       return std::unexpected(error_t { error_code_e::invalid_transition, "Only a settled external actor can hand off its cleanup", {} });

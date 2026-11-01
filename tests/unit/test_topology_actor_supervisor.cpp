@@ -910,4 +910,154 @@ namespace display_device::topology {
     ASSERT_TRUE((*started)->wait_finished(5s));
   }
 
+  namespace {
+    /** Records each delivery and what the supervisor reported while it was being delivered. */
+    class recording_sink_t final: public actor_cleanup_sink_t {
+    public:
+      void
+      accept(actor_cleanup_handoff_t handoff) noexcept override {
+        std::optional<actor_phase_e> phase;
+        if (supervisor) phase = supervisor->snapshot().phase;
+        std::lock_guard lock { mutex };
+        ++calls;
+        phase_seen = phase;
+        thread = std::this_thread::get_id();
+        received = std::move(handoff);
+      }
+
+      int
+      count() {
+        std::lock_guard lock { mutex };
+        return calls;
+      }
+
+      std::mutex mutex;
+      int calls {};
+      std::shared_ptr<actor_supervisor_t> supervisor;
+      std::optional<actor_phase_e> phase_seen;
+      std::thread::id thread;
+      std::optional<actor_cleanup_handoff_t> received;
+    };
+
+    actor_supervisor_options_t
+    delivering(std::shared_ptr<actor_cleanup_sink_t> sink) {
+      actor_supervisor_options_t options;
+      options.cleanup_sink = std::move(sink);
+      return options;
+    }
+  }  // namespace
+
+  TEST(ActorSupervisor, ACleanupSinkReceivesTheSettledHandoffOnceBeforeSettlementIsReported) {
+    fixture_t f;
+    auto sink = std::make_shared<recording_sink_t>();
+    gate_t exit_gate;
+    std::thread::id body_thread;
+    const auto *exclusion = f.exclusion.get();
+    std::weak_ptr<int> watched = f.exclusion;
+    auto started = actor_supervisor_t::start(f.store, intent(), std::move(f.exclusion), f.publish(), [&](actor_body_context_t &context) {
+      body_thread = std::this_thread::get_id();
+      context.report_launched(receipt);
+      exit_gate.wait();
+      return actor_body_result_t { actor_body_exit_e::exited, "exit 0" };
+    },
+      delivering(sink));
+    ASSERT_TRUE(started) << started.error().detail;
+    sink->supervisor = *started;
+    EXPECT_EQ((*started)->wait_launch().status, actor_launch_e::launched);
+    EXPECT_EQ(sink->count(), 0);
+    exit_gate.open();
+    ASSERT_TRUE((*started)->wait_finished(5s));
+
+    EXPECT_EQ(sink->count(), 1);
+    ASSERT_TRUE(sink->received);
+    EXPECT_EQ(sink->received->record, *f.durable());
+    EXPECT_EQ(sink->received->record.stage, actor_stage_e::cleanup_pending);
+    EXPECT_EQ(sink->received->exclusion.get(), exclusion);
+    EXPECT_NE(sink->phase_seen, actor_phase_e::settled);
+    EXPECT_EQ(sink->thread, body_thread);
+    EXPECT_EQ((*started)->snapshot().phase, actor_phase_e::settled);
+    // The supervisor kept no copy of the exclusion.
+    sink->received->exclusion.reset();
+    EXPECT_TRUE(watched.expired());
+    sink->supervisor.reset();
+  }
+
+  TEST(ActorSupervisor, AConfiguredSinkRefusesManualHandOffBeforeAndAfterDelivery) {
+    fixture_t f;
+    auto sink = std::make_shared<recording_sink_t>();
+    gate_t exit_gate;
+    auto started = actor_supervisor_t::start(f.store, intent(), f.exclusion, f.publish(), [&](actor_body_context_t &context) {
+      context.report_launched(receipt);
+      exit_gate.wait();
+      return actor_body_result_t { actor_body_exit_e::exited, "" };
+    },
+      delivering(sink));
+    ASSERT_TRUE(started);
+    EXPECT_FALSE((*started)->hand_off_cleanup());
+    exit_gate.open();
+    ASSERT_TRUE((*started)->wait_finished(5s));
+    EXPECT_FALSE((*started)->hand_off_cleanup());
+    EXPECT_EQ(sink->count(), 1);
+  }
+
+  TEST(ActorSupervisor, ABlockedSupervisorNeverDeliversAndKeepsTheExclusion) {
+    for (const bool settle_fails : { false, true }) {
+      fixture_t f;
+      if (settle_fails) f.store->fail_replace_to = actor_stage_e::cleanup_pending;
+      auto sink = std::make_shared<recording_sink_t>();
+      std::weak_ptr<int> watched = f.exclusion;
+      auto started = actor_supervisor_t::start(f.store, intent(), std::move(f.exclusion), f.publish(),
+        [&](actor_body_context_t &context) -> actor_body_result_t {
+          context.report_launched(receipt);
+          if (!settle_fails) throw std::runtime_error("body failed");
+          return { actor_body_exit_e::exited, "" };
+        },
+        delivering(sink));
+      ASSERT_TRUE(started);
+      ASSERT_TRUE((*started)->wait_finished(5s));
+      EXPECT_EQ((*started)->snapshot().phase, actor_phase_e::blocked);
+      EXPECT_EQ(sink->count(), 0);
+      EXPECT_FALSE(watched.expired());
+    }
+  }
+
+  TEST(ActorSupervisor, AnAbandonedLaunchStillDeliversItsNeverLaunchedCleanup) {
+    for (const bool publication_fails : { true, false }) {
+      SCOPED_TRACE(publication_fails ? "publication failed" : "spawn failed");
+      fixture_t f;
+      auto sink = std::make_shared<recording_sink_t>();
+      auto options = delivering(sink);
+      if (!publication_fails) {
+        options.spawn = [](std::function<void()>) {
+          throw std::system_error(std::make_error_code(std::errc::resource_unavailable_try_again));
+        };
+      }
+      std::weak_ptr<int> watched = f.exclusion;
+      auto started = actor_supervisor_t::start(f.store, intent(), std::move(f.exclusion),
+        [&](const std::shared_ptr<actor_supervisor_t> &supervisor) -> result_t<void> {
+          f.published = supervisor;
+          if (publication_fails) return std::unexpected(error_t { error_code_e::owner_busy, "refused", {} });
+          return {};
+        },
+        [&](actor_body_context_t &) {
+          ++f.body_runs;
+          return actor_body_result_t {};
+        },
+        options);
+      EXPECT_EQ(static_cast<bool>(started), !publication_fails);
+      ASSERT_TRUE(f.published);
+      ASSERT_TRUE(f.published->wait_finished(1s));
+      EXPECT_EQ(f.published->snapshot().phase, actor_phase_e::settled);
+      EXPECT_EQ(f.body_runs, 0);
+      EXPECT_EQ(sink->count(), 1);
+      ASSERT_TRUE(sink->received);
+      EXPECT_EQ(sink->received->record, *f.durable());
+      EXPECT_EQ(sink->received->record.stage, actor_stage_e::cleanup_pending);
+      EXPECT_FALSE(sink->received->record.receipt);
+      EXPECT_FALSE(watched.expired());
+      sink->received->exclusion.reset();
+      EXPECT_TRUE(watched.expired());
+    }
+  }
+
 }  // namespace display_device::topology

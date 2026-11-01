@@ -227,6 +227,7 @@ namespace display_device::topology {
 
   private:
     friend class coordinator_t;
+    friend class external_cleanup_t;
     struct link_t {
       std::mutex mutex;
       coordinator_t *owner {};
@@ -234,6 +235,52 @@ namespace display_device::topology {
     explicit external_recovery_t(std::shared_ptr<link_t> link):
         link_ { std::move(link) } {}
     std::shared_ptr<link_t> link_;
+  };
+
+  /** Returns true only once the obligation is durably discharged. */
+  using external_cleanup_body_t = std::function<bool(const mutation_capability_t &, const command_context_t &)>;
+
+  /**
+   * Cleanup obligation of one external actor launched from a worker command.
+   * The coordinator keeps a strong reference, so dropping every handle never
+   * releases the exclusion: until `queue_first` succeeds, dispatch stays held
+   * until stop. Non-cleanup admission stays fenced until a queued cleanup
+   * returns true; failure, cancellation or stop leave it fenced.
+   */
+  class external_cleanup_t {
+  public:
+    ~external_cleanup_t() = default;
+    external_cleanup_t(const external_cleanup_t &) = delete;
+    external_cleanup_t &
+    operator=(const external_cleanup_t &) = delete;
+
+    /** A copy for the actor's supervisor. Dispatch stays held while any copy lives. */
+    std::shared_ptr<void>
+    exclusion() const;
+
+    /**
+     * Queue `cleanup` ahead of every pending command while dispatch is still held,
+     * then release this handle's exclusion. Once, from any thread, also after the
+     * coordinator is gone. Refused (keeping the exclusion) when `cleanup` is empty,
+     * already queued, or the coordinator is stopping or gone. Never call it while
+     * holding a lock that a coordinator probe, observer or worker body may need.
+     */
+    bool
+    queue_first(external_cleanup_body_t cleanup);
+
+    bool
+    discharged() const noexcept;
+
+  private:
+    friend class coordinator_t;
+    explicit external_cleanup_t(std::shared_ptr<external_recovery_t::link_t> link):
+        link_ { std::move(link) } {}
+    std::shared_ptr<external_recovery_t::link_t> link_;
+    /** Read by the admission fence under the coordinator lock. */
+    std::shared_ptr<std::atomic_bool> discharged_ { std::make_shared<std::atomic_bool>(false) };
+    /** Guarded by the link mutex. */
+    std::shared_ptr<const external_mutation_fence_t> exclusion_;
+    bool queued_ {};
   };
 
   /** Shared admission and dispatch exclusion for a separately supervised encoder probe. */
@@ -295,6 +342,7 @@ namespace display_device::topology {
 
   class coordinator_t {
     friend class external_recovery_t;
+    friend class external_cleanup_t;
 
   public:
     /**
@@ -486,6 +534,15 @@ namespace display_device::topology {
     hold_external_mutation(const mutation_capability_t &capability);
 
     /**
+     * As hold_external_mutation, for an actor whose cleanup this coordinator must
+     * own: acquire before launching it and give `exclusion()` to its supervisor.
+     * Also fences non-cleanup admission until the cleanup is discharged. Only one
+     * undischarged obligation may exist; another throws std::logic_error.
+     */
+    std::shared_ptr<external_cleanup_t>
+    begin_external_cleanup(const mutation_capability_t &capability);
+
+    /**
      * Adopt an existing or possibly existing actor during startup recovery.
      * Requires this worker's exact startup kind and native-recovery permission;
      * it never grants permission to launch another actor. Adoption may occur
@@ -672,6 +729,10 @@ namespace display_device::topology {
     std::shared_ptr<const external_mutation_fence_t>
     resume_external_startup_locked();
 
+    /** From external_cleanup_t::queue_first(); the link mutex is held, mutex_ is not. */
+    bool
+    queue_external_cleanup(external_cleanup_t &cleanup, external_cleanup_body_t body);
+
     void
     tick_loop();
 
@@ -697,6 +758,10 @@ namespace display_device::topology {
     std::vector<std::function<bool()>> fences_;
     std::shared_ptr<std::atomic_bool> external_mutation_ { std::make_shared<std::atomic_bool>(false) };
     std::shared_ptr<external_startup_t> external_startup_;
+    /** The undischarged obligation until its cleanup is queued; released at stop. */
+    std::shared_ptr<external_cleanup_t> external_cleanup_;
+    /** Discharge flag of the latest obligation, until it is discharged. */
+    std::shared_ptr<std::atomic_bool> external_cleanup_discharged_;
     /** Shared with every external_recovery_t; cleared under its mutex before teardown begins. */
     std::shared_ptr<external_recovery_t::link_t> recovery_link_;
     native_health_t native_;

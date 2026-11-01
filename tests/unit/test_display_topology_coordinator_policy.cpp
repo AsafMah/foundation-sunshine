@@ -2774,6 +2774,217 @@ namespace {
     EXPECT_FALSE(coordinator.status().fence_active);
   }
 
+  auto
+  discharging(event_log_t &log, std::string name, bool result = true) {
+    return [&log, name = std::move(name), result](const mutation_capability_t &capability, const command_context_t &) {
+      EXPECT_EQ(capability.kind(), command_kind_e::launch_failed_restore);
+      EXPECT_NO_THROW(capability.require(operation_e::vdd_destroy));
+      log.add(name);
+      return result;
+    };
+  }
+
+  TEST(DisplayTopologyCoordinator, ExternalCleanupRunsAheadOfPrequeuedCleanupAndLiftsItsFenceOnlyWhenDischarged) {
+    fake_clock_t clock;
+    event_log_t log;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    std::shared_ptr<external_cleanup_t> cleanup;
+    std::shared_ptr<void> supervisor;
+    ASSERT_TRUE(coordinator.run(command_kind_e::reconfigure, [&](const auto &capability, const auto &) {
+      cleanup = coordinator.begin_external_cleanup(capability);
+      supervisor = cleanup->exclusion();
+      EXPECT_NE(supervisor, nullptr);
+      EXPECT_THROW(capability.require(operation_e::restore_state), capability_error_t);
+    }).completed());
+    ASSERT_NE(cleanup, nullptr);
+    EXPECT_TRUE(coordinator.status().fence_active);
+    EXPECT_EQ(coordinator.admit_launch({ 460, "actor alive" }).reason, reject_reason_e::fence_active);
+    const auto prequeued = coordinator.post_tracked(command_kind_e::stream_restore, logging(log, "prequeued"));
+    ASSERT_EQ(prequeued.reason, reject_reason_e::none);
+    EXPECT_EQ(prequeued.completion.wait_for(50ms), std::future_status::timeout);
+
+    EXPECT_TRUE(cleanup->queue_first(discharging(log, "actor-cleanup")));
+    EXPECT_EQ(cleanup->exclusion(), nullptr);
+    // The supervisor's copy still holds dispatch.
+    EXPECT_EQ(prequeued.completion.wait_for(50ms), std::future_status::timeout);
+    EXPECT_TRUE(log.events().empty());
+    EXPECT_FALSE(cleanup->discharged());
+    supervisor.reset();
+    ASSERT_EQ(prequeued.completion.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_TRUE(prequeued.completion.get().completed());
+    EXPECT_EQ(log.events(), (std::vector<std::string> { "actor-cleanup", "prequeued" }));
+    EXPECT_TRUE(cleanup->discharged());
+    EXPECT_FALSE(coordinator.status().fence_active);
+    EXPECT_TRUE(coordinator.admit_launch({ 461, "discharged" }));
+  }
+
+  TEST(DisplayTopologyCoordinator, UndischargedExternalCleanupKeepsAdmissionFencedButLetsCleanupRun) {
+    for (const bool throws : { false, true }) {
+      SCOPED_TRACE(throws);
+      fake_clock_t clock;
+      event_log_t log;
+      coordinator_t coordinator { make_options(clock) };
+      ASSERT_TRUE(start_ready(coordinator).completed());
+      std::shared_ptr<external_cleanup_t> cleanup;
+      ASSERT_TRUE(coordinator.run(command_kind_e::reconfigure, [&](const auto &capability, const auto &) {
+        cleanup = coordinator.begin_external_cleanup(capability);
+      }).completed());
+      EXPECT_TRUE(cleanup->queue_first([&](const auto &, const auto &) -> bool {
+        log.add("actor-cleanup");
+        if (throws) throw std::runtime_error { "cleanup record could not be completed" };
+        return false;
+      }));
+      const auto later = coordinator.post_tracked(command_kind_e::stream_restore, logging(log, "later"));
+      ASSERT_EQ(later.completion.wait_for(real_timeout), std::future_status::ready);
+      EXPECT_TRUE(later.completion.get().completed());
+      EXPECT_EQ(log.events(), (std::vector<std::string> { "actor-cleanup", "later" }));
+      EXPECT_FALSE(cleanup->discharged());
+      cleanup.reset();
+      EXPECT_TRUE(coordinator.status().fence_active);
+      EXPECT_EQ(coordinator.admit_launch({ 462, "unknown cleanup" }).reason, reject_reason_e::fence_active);
+      EXPECT_EQ(coordinator.run(command_kind_e::rotate, {}).reason, reject_reason_e::fence_active);
+      EXPECT_TRUE(coordinator.run(command_kind_e::shutdown_restore, logging(log, "shutdown")).completed());
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, DroppedExternalCleanupHandleNeverReleasesItsExclusion) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    std::weak_ptr<external_cleanup_t> weak;
+    ASSERT_TRUE(coordinator.run(command_kind_e::reconfigure, [&](const auto &capability, const auto &) {
+      weak = coordinator.begin_external_cleanup(capability);
+    }).completed());
+    EXPECT_FALSE(weak.expired());
+    EXPECT_TRUE(coordinator.status().fence_active);
+    std::atomic_int mutations {};
+    const auto queued = coordinator.post_tracked(command_kind_e::stream_restore, counting(mutations));
+    ASSERT_EQ(queued.reason, reject_reason_e::none);
+    EXPECT_EQ(queued.completion.wait_for(50ms), std::future_status::timeout);
+    coordinator.stop();
+    EXPECT_EQ(queued.completion.get().outcome, outcome_e::stopped);
+    EXPECT_EQ(mutations.load(), 0);
+    EXPECT_TRUE(weak.expired());
+  }
+
+  TEST(DisplayTopologyCoordinator, ExternalCleanupQueuesOnceAndNeverAfterStopOrDestruction) {
+    fake_clock_t clock;
+    event_log_t log;
+    {
+      coordinator_t coordinator { make_options(clock) };
+      ASSERT_TRUE(start_ready(coordinator).completed());
+      std::shared_ptr<external_cleanup_t> cleanup;
+      ASSERT_TRUE(coordinator.run(command_kind_e::reconfigure, [&](const auto &capability, const auto &) {
+        cleanup = coordinator.begin_external_cleanup(capability);
+      }).completed());
+      EXPECT_FALSE(cleanup->queue_first({}));
+      EXPECT_NE(cleanup->exclusion(), nullptr);
+      EXPECT_TRUE(cleanup->queue_first(discharging(log, "first")));
+      EXPECT_FALSE(cleanup->queue_first(discharging(log, "second")));
+      const auto flushed = coordinator.post_tracked(command_kind_e::stream_restore, {});
+      ASSERT_EQ(flushed.completion.wait_for(real_timeout), std::future_status::ready);
+      EXPECT_TRUE(flushed.completion.get().completed());
+      EXPECT_EQ(log.events(), (std::vector<std::string> { "first" }));
+      EXPECT_TRUE(cleanup->discharged());
+      // Once queued, the coordinator keeps no reference to the handle.
+      std::weak_ptr<external_cleanup_t> weak = cleanup;
+      cleanup.reset();
+      EXPECT_TRUE(weak.expired());
+    }
+    auto coordinator = std::make_unique<coordinator_t>(make_options(clock));
+    ASSERT_TRUE(start_ready(*coordinator).completed());
+    std::shared_ptr<external_cleanup_t> cleanup;
+    ASSERT_TRUE(coordinator->run(command_kind_e::reconfigure, [&](const auto &capability, const auto &) {
+      cleanup = coordinator->begin_external_cleanup(capability);
+    }).completed());
+    auto supervisor = cleanup->exclusion();
+    coordinator->stop();
+    EXPECT_FALSE(cleanup->queue_first(discharging(log, "after-stop")));
+    EXPECT_NE(cleanup->exclusion(), nullptr);
+    coordinator.reset();
+    EXPECT_FALSE(cleanup->queue_first(discharging(log, "after-destruction")));
+    EXPECT_NE(cleanup->exclusion(), nullptr);
+    std::thread late { [cleanup = std::move(cleanup), supervisor = std::move(supervisor)]() mutable {
+      supervisor.reset();
+      cleanup.reset();
+    } };
+    late.join();
+    EXPECT_EQ(log.events(), (std::vector<std::string> { "first" }));
+  }
+
+  TEST(DisplayTopologyCoordinator, ExternalCleanupRequiresWorkerAuthorityAndOneOutstandingObligation) {
+    fake_clock_t clock;
+    event_log_t log;
+    coordinator_t coordinator { make_options(clock) };
+    coordinator_t other { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    ASSERT_TRUE(start_ready(other).completed());
+    for (const auto kind : { command_kind_e::rotate, command_kind_e::stream_restore }) {
+      EXPECT_TRUE(coordinator.run(kind, [&](const auto &capability, const auto &) {
+        EXPECT_THROW(coordinator.begin_external_cleanup(capability), capability_error_t);
+      }).completed());
+      EXPECT_FALSE(coordinator.status().fence_active);
+    }
+    ASSERT_TRUE(coordinator.run(command_kind_e::reconfigure, [&](const auto &capability, const auto &) {
+      std::thread outsider { [&]() {
+        EXPECT_THROW(coordinator.begin_external_cleanup(capability), capability_error_t);
+      } };
+      outsider.join();
+      EXPECT_THROW(other.begin_external_cleanup(capability), std::logic_error);
+      EXPECT_FALSE(coordinator.status().fence_active);
+      auto first = coordinator.begin_external_cleanup(capability);
+      EXPECT_THROW(coordinator.begin_external_cleanup(capability), capability_error_t);
+      // Queued from inside the body: it runs after the body returns.
+      EXPECT_TRUE(first->queue_first(discharging(log, "actor-cleanup")));
+      EXPECT_NO_THROW(capability.require(operation_e::restore_state));
+      EXPECT_THROW(coordinator.begin_external_cleanup(capability), std::logic_error);
+      log.add("body-returning");
+    }).completed());
+    EXPECT_TRUE(coordinator.run(command_kind_e::reconfigure, [&](const auto &capability, const auto &) {
+      auto next = coordinator.begin_external_cleanup(capability);
+      EXPECT_TRUE(next->queue_first(discharging(log, "next-cleanup")));
+    }).completed());
+    EXPECT_TRUE(coordinator.run(command_kind_e::stream_restore, {}).completed());
+    EXPECT_EQ(log.events(), (std::vector<std::string> { "body-returning", "actor-cleanup", "next-cleanup" }));
+    EXPECT_FALSE(coordinator.status().fence_active);
+    EXPECT_FALSE(other.status().fence_active);
+
+    gate_t worker;
+    auto running = std::async(std::launch::async, [&]() {
+      return coordinator.run(command_kind_e::reconfigure, [&](const auto &capability, const auto &) {
+        worker.hook()();
+        EXPECT_THROW(coordinator.begin_external_cleanup(capability), std::logic_error);
+      });
+    });
+    const finally_t release { [&]() { worker.release(); } };
+    ASSERT_TRUE(worker.wait_started());
+    coordinator.begin_draining();
+    worker.release();
+    EXPECT_TRUE(running.get().completed());
+    EXPECT_FALSE(coordinator.status().fence_active);
+  }
+
+  TEST(DisplayTopologyCoordinator, ExternalCleanupQueuedWhileDrainingRunsAheadOfShutdownCleanup) {
+    fake_clock_t clock;
+    event_log_t log;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    std::shared_ptr<external_cleanup_t> cleanup;
+    ASSERT_TRUE(coordinator.run(command_kind_e::reconfigure, [&](const auto &capability, const auto &) {
+      cleanup = coordinator.begin_external_cleanup(capability);
+    }).completed());
+    coordinator.begin_draining();
+    const auto shutdown = coordinator.post_tracked(command_kind_e::shutdown_restore, logging(log, "shutdown"));
+    ASSERT_EQ(shutdown.reason, reject_reason_e::none);
+    EXPECT_EQ(shutdown.completion.wait_for(50ms), std::future_status::timeout);
+    EXPECT_TRUE(cleanup->queue_first(discharging(log, "actor-cleanup")));
+    ASSERT_EQ(shutdown.completion.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_TRUE(shutdown.completion.get().completed());
+    EXPECT_EQ(log.events(), (std::vector<std::string> { "actor-cleanup", "shutdown" }));
+    EXPECT_TRUE(cleanup->discharged());
+  }
+
   TEST(DisplayTopologyCoordinator, ExternalRecoveryUsesOnlyStartupAuthorityAndBlocksCurrentRawCleanup) {
     for (const bool managed : { false, true }) {
       fake_clock_t clock;

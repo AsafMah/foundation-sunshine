@@ -109,6 +109,27 @@ namespace display_device::topology {
     std::string detail;
   };
 
+  /** Cleanup ownership handed from a settled supervisor to the next durable owner. */
+  struct actor_cleanup_handoff_t {
+    /** The durable `cleanup_pending` record the new owner must discharge. */
+    actor_record_t record;
+    std::shared_ptr<void> exclusion;
+  };
+
+  /** Receives a settled supervisor's cleanup automatically. */
+  class actor_cleanup_sink_t {
+  public:
+    virtual ~actor_cleanup_sink_t() = default;
+
+    /**
+     * Called once, on whichever thread durably settled the record, before the
+     * supervisor reports `settled`. It must not block or call back into the
+     * supervisor, and it owns the exclusion from here on.
+     */
+    virtual void
+    accept(actor_cleanup_handoff_t handoff) noexcept = 0;
+  };
+
   struct actor_supervisor_options_t {
     /** Clamped to `actor_launch_deadline_limit`; must be positive. */
     std::chrono::milliseconds deadline { actor_launch_deadline_limit };
@@ -118,13 +139,12 @@ namespace display_device::topology {
      * launch first wins, so kept work can never start the actor after a failure.
      */
     actor_spawn_t spawn;
-  };
-
-  /** Cleanup ownership handed from a settled supervisor to the next durable owner. */
-  struct actor_cleanup_handoff_t {
-    /** The durable `cleanup_pending` record the new owner must discharge. */
-    actor_record_t record;
-    std::shared_ptr<void> exclusion;
+    /**
+     * Fixed at start. When set, every settlement (including a launch abandoned
+     * because publication or spawning failed) is delivered here, and
+     * `hand_off_cleanup` is refused. A blocked supervisor never delivers.
+     */
+    std::shared_ptr<actor_cleanup_sink_t> cleanup_sink;
   };
 
   class actor_supervisor_t {
@@ -166,7 +186,8 @@ namespace display_device::topology {
 
     /**
      * Once settled, move the exclusion and the pending cleanup to the next owner,
-     * exactly once. A running or blocked supervisor keeps both.
+     * exactly once. A running or blocked supervisor keeps both. Refused when a
+     * cleanup sink was configured.
      */
     result_t<actor_cleanup_handoff_t>
     hand_off_cleanup();
@@ -209,6 +230,10 @@ namespace display_device::topology {
     void
     finish(actor_phase_e phase, std::string detail);
 
+    /** After a durable settlement: deliver to the sink, if any, then report `settled`. */
+    void
+    finish_settled(std::string detail);
+
     /** Replace the durable record; an ambiguous failure is reconciled by reloading. */
     bool
     write_record(const actor_record_t &current, const actor_record_t &next);
@@ -225,6 +250,9 @@ namespace display_device::topology {
     mutable std::mutex mutex_;
     mutable std::condition_variable changed_;
     std::shared_ptr<void> exclusion_;
+    std::shared_ptr<actor_cleanup_sink_t> sink_;
+    /** Set once at start; never cleared, so manual hand-off stays refused after delivery. */
+    bool automatic_ {};
     actor_record_t record_;
     /** The durable record no longer matches anything this supervisor wrote. */
     bool record_unknown_ {};

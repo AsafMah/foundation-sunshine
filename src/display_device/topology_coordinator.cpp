@@ -1286,12 +1286,14 @@ namespace display_device::topology {
     // Joins the worker once the running command returns; pending ones complete as stopped.
     queue.reset();
     std::shared_ptr<const external_mutation_fence_t> abandoned;
+    std::shared_ptr<external_cleanup_t> unqueued_cleanup;
     {
       std::lock_guard lock { mutex_ };
       if (external_startup_) {
         external_startup_->done = true;
         abandoned = std::move(external_startup_->exclusion);
       }
+      unqueued_cleanup = std::move(external_cleanup_);
     }
     complete_startup(outcome(outcome_e::stopped));
   }
@@ -1318,6 +1320,81 @@ namespace display_device::topology {
   coordinator_t::hold_external_mutation(const mutation_capability_t &capability) {
     capability.require(operation_e::adapter_restart);
     return hold_external_actor(capability, false);
+  }
+
+  std::shared_ptr<void>
+  external_cleanup_t::exclusion() const {
+    std::lock_guard link { link_->mutex };
+    return std::const_pointer_cast<external_mutation_fence_t>(exclusion_);
+  }
+
+  bool
+  external_cleanup_t::queue_first(external_cleanup_body_t cleanup) {
+    std::shared_ptr<const external_mutation_fence_t> released;
+    {
+      std::lock_guard link { link_->mutex };
+      if (!cleanup || queued_ || !link_->owner || !link_->owner->queue_external_cleanup(*this, std::move(cleanup))) {
+        return false;
+      }
+      queued_ = true;
+      released = std::move(exclusion_);
+    }
+    // Released outside every lock; dispatch resumes with the cleanup at the front.
+    return true;
+  }
+
+  bool
+  external_cleanup_t::discharged() const noexcept {
+    return discharged_->load(std::memory_order_acquire);
+  }
+
+  std::shared_ptr<external_cleanup_t>
+  coordinator_t::begin_external_cleanup(const mutation_capability_t &capability) {
+    capability.require(operation_e::adapter_restart);
+    {
+      std::lock_guard lock { mutex_ };
+      if (external_cleanup_discharged_ && !external_cleanup_discharged_->load(std::memory_order_acquire)) {
+        throw std::logic_error { "An earlier external cleanup obligation is still undischarged" };
+      }
+    }
+    auto cleanup = std::shared_ptr<external_cleanup_t> { new external_cleanup_t { recovery_link_ } };
+    // Only this worker begins obligations, so nothing intervenes between the check and the store.
+    auto exclusion = hold_external_actor(capability, false);
+    std::lock_guard link { recovery_link_->mutex };
+    std::lock_guard lock { mutex_ };
+    cleanup->exclusion_ = std::move(exclusion);
+    // Reads only the atomic: the fence is evaluated under mutex_, which queue_first takes after the link mutex.
+    fences_.push_back([discharged = cleanup->discharged_]() { return discharged->load(std::memory_order_acquire); });
+    external_cleanup_discharged_ = cleanup->discharged_;
+    external_cleanup_ = cleanup;
+    return cleanup;
+  }
+
+  bool
+  coordinator_t::queue_external_cleanup(external_cleanup_t &cleanup, external_cleanup_body_t body) {
+    std::shared_ptr<external_cleanup_t> owned;
+    std::lock_guard lock { mutex_ };
+    if (stopping_ || !queue_) {
+      return false;
+    }
+    auto task = make_task(command_kind_e::launch_failed_restore, std::make_shared<command_state_t>(),
+      [body = std::move(body), discharged = cleanup.discharged_](const auto &capability, const auto &context) {
+        // An exception or false leaves the obligation, and its admission fence, in place.
+        if (body(capability, context)) {
+          discharged->store(true, std::memory_order_release);
+        }
+      },
+      std::nullopt);
+    // Ahead of everything queued; the still-held exclusion keeps it unstarted until release.
+    auto submission = queue_->submit_first(queue_generation_, no_deadline, std::move(task));
+    if (submission.completion.wait_for(std::chrono::seconds::zero()) == std::future_status::ready) {
+      return false;
+    }
+    ++submitted_commands_;
+    if (external_cleanup_.get() == &cleanup) {
+      owned = std::move(external_cleanup_);
+    }
+    return true;
   }
 
   std::shared_ptr<const external_mutation_fence_t>
