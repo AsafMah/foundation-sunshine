@@ -49,8 +49,8 @@ namespace display_device::topology {
   adapter_restart_result_t
   restart_adapter(coordinator_t &coordinator, const mutation_capability_t &capability, adapter_restart_plan_t plan,
     external_cleanup_body_t restore) {
+    capability.require(operation_e::adapter_restart);
     if (!plan.store || !plan.process || !restore) {
-      capability.require(operation_e::adapter_restart);
       return { adapter_restart_e::not_started, {}, "The adapter restart needs a record store, a process and a restoration" };
     }
 
