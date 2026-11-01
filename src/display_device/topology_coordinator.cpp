@@ -277,7 +277,9 @@ namespace display_device::topology {
     }
     auto obligation = std::make_shared<startup_restore_t>(std::move(restore));
     std::lock_guard lock { mutex_ };
-    if (phase_ != coordinator_phase_e::recovering || stopping_ || startup_restore_) {
+    // Draining starts while a suspended startup still waits for an external actor;
+    // the resumed startup keeps its authority to defer, and the retry stays fenced.
+    if ((phase_ != coordinator_phase_e::recovering && phase_ != coordinator_phase_e::draining) || stopping_ || startup_restore_) {
       throw std::logic_error { "Startup restoration can only be registered once during initial recovery" };
     }
     startup_restore_ = std::move(obligation);

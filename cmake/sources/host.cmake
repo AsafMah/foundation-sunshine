@@ -28,10 +28,13 @@ set(SUNSHINE_HOST_SOURCES
     src/display_device/parsed_config.cpp src/display_device/parsed_config.h
     src/display_device/session.cpp src/display_device/session.h
     src/display_device/settings.cpp src/display_device/settings.h
+    src/display_device/topology_actor_startup.cpp src/display_device/topology_actor_startup.h
     src/display_device/topology_capability.cpp src/display_device/topology_capability.h
     src/display_device/topology_command_queue.cpp src/display_device/topology_command_queue.h
     src/display_device/topology_coordinator.cpp src/display_device/topology_coordinator.h
+    src/display_device/topology_process_lifecycle.cpp src/display_device/topology_process_lifecycle.h
     src/display_device/topology_routes.cpp src/display_device/topology_routes.h
+    src/display_device/topology_runtime.cpp src/display_device/topology_runtime.h
     src/display_device/to_string.cpp src/display_device/to_string.h
     src/display_device/vdd_capability.cpp src/display_device/vdd_capability.h
     src/display_device/vdd_utils.cpp src/display_device/vdd_utils.h

@@ -443,6 +443,25 @@ if (WIN32)
     set_target_properties(topology_actor_startup_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
 endif ()
 add_test(NAME topology_actor_startup_unit_tests COMMAND topology_actor_startup_unit_tests)
+add_executable(topology_process_lifecycle_unit_tests
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_durable_file.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_actor_record.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_capability.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_command_queue.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_coordinator.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_actor_startup.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_process_lifecycle.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_topology_process_lifecycle.cpp)
+target_include_directories(topology_process_lifecycle_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(topology_process_lifecycle_unit_tests PRIVATE gtest_main nlohmann_json::nlohmann_json
+        sunshine_project_options sunshine_coverage)
+target_compile_options(topology_process_lifecycle_unit_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>)
+target_compile_definitions(topology_process_lifecycle_unit_tests PRIVATE _GLIBCXX_ASSERTIONS)
+set_target_properties(topology_process_lifecycle_unit_tests PROPERTIES CXX_STANDARD 23)
+if (WIN32)
+    set_target_properties(topology_process_lifecycle_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
+endif ()
+add_test(NAME topology_process_lifecycle_unit_tests COMMAND topology_process_lifecycle_unit_tests)
 
 add_executable(display_topology_coordinator_unit_tests
         ${CMAKE_SOURCE_DIR}/src/display_device/topology_capability.cpp

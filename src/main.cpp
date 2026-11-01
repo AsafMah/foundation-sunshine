@@ -20,6 +20,7 @@
 #include "client_fingerprint.h"
 #include "confighttp.h"
 #include "display_device/session.h"
+#include "display_device/topology_runtime.h"
 #include "entry_handler.h"
 #include "file_handler.h"
 #include "globals.h"
@@ -579,11 +580,7 @@ main(int argc, char *argv[]) {
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
   system_tray::end_tray();
 #endif
-  try {
-    display_device::session_t::get().restore_state();
-  }
-  catch (...) {
-  }
+  display_device::coordinated::shutdown_restore();
   display_device_deinit_guard = nullptr;
 
   httpThread.join();
