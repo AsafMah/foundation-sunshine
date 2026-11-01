@@ -19,6 +19,8 @@
 #include "audio.h"
 #include "crypto.h"
 #include "video.h"
+#include "streaming/session_state.h"
+#include "streaming/abr_session.h"
 
 namespace config {
   struct video_t;
@@ -103,13 +105,6 @@ namespace stream {
 
     const char *
     stop_reason_name(stop_reason_e reason);
-
-    enum class state_e : int {
-      STOPPED,  ///< The session is stopped
-      STOPPING,  ///< The session is stopping
-      STARTING,  ///< The session is starting
-      RUNNING,  ///< The session is running
-    };
 
     struct lifecycle_snapshot_t {
       state_e state;

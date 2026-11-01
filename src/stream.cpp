@@ -65,6 +65,7 @@ extern "C" {
 #include "tray/system_tray.h"
 #include "tray/tray_state.h"
 #include "utility.h"
+#include "uuid.h"
 #include "webhook/webhook.h"
 
 #include "clipboard_bridge.h"
@@ -730,6 +731,7 @@ namespace stream {
     } control;
 
     std::uint32_t launch_session_id;
+    std::string abr_session_token;
     std::shared_ptr<void> nvidia_vsync_lease;
 
     // 保存 launch_session 的关键字段，用于动态参数更新
@@ -4568,7 +4570,7 @@ namespace stream {
       perf::end_session(session.launch_session_id);
 
       // Clean up ABR state for this client
-      abr::cleanup(session.client_name);
+      abr::cleanup(session.abr_session_token);
 
       std::string client_ip = session.control.expected_peer_address;
       if (session.control.peer) {
@@ -4764,6 +4766,7 @@ namespace stream {
 
       session->shutdown_event = mail->event<bool>(mail::shutdown);
       session->launch_session_id = launch_session.id;
+      session->abr_session_token = uuid_util::uuid_t::generate().string();
       session->nvidia_vsync_lease = launch_session.nvidia_vsync_lease;
       session->created_at_ms = steady_now_ms();
 
@@ -4863,6 +4866,37 @@ namespace stream {
       session->mail = std::move(mail);
 
       return session;
+    }
+
+    abr::session_result_t
+    apply_abr_for_client(const std::string &client_cert_uuid, const abr::session_request_t &request) {
+      if (client_cert_uuid.empty()) {
+        return { .error = abr::session_error_e::missing_client_identity };
+      }
+      if (request.operation != abr::operation_e::configure && request.token.empty()) {
+        return { .error = abr::session_error_e::stale_session };
+      }
+      auto broadcast_ref = broadcast_shared.try_ref();
+      if (!broadcast_ref) {
+        return { .error = request.token.empty() ? abr::session_error_e::no_active_stream : abr::session_error_e::stale_session };
+      }
+
+      return abr::with_authenticated_session(broadcast_ref->control_server._sessions, client_cert_uuid, request, [](const session_t &session) {
+          const auto lifecycle = session.lifecycle.state();
+          return abr::make_session_candidate(session.client_cert_uuid, session.abr_session_token,
+            lifecycle, session.control_only); }, [&](session_t &session) {
+          auto result = abr::apply_session_request(session.abr_session_token, session.app_name,
+            *session.config.monitor.bitrate_budget, request, config::video.max_bitrate);
+          if (result.error == abr::session_error_e::none && request.operation == abr::operation_e::configure) {
+            BOOST_LOG(info) << "ABR stream binding client_cert="
+                            << session.client_cert_uuid.substr(0, std::min<std::size_t>(session.client_cert_uuid.size(), 8))
+                            << " launch_session_id=" << session.launch_session_id
+                            << " token_prefix=" << session.abr_session_token.substr(0, std::min<std::size_t>(session.abr_session_token.size(), 8));
+          }
+          if (result.bitrate_requested) {
+            perf::update_session_bitrate(session.launch_session_id, result.requested_bitrate_kbps);
+          }
+          return result; });
     }
 
     bool
