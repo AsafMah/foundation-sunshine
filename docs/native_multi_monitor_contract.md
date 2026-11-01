@@ -341,6 +341,13 @@ once, including commands whose body never ran. Observer failures are exposed
 through the receipt. A launch-ticket presence query and an active-only managed
 lease release are also implemented and tested.
 
+The neutral retry scheduler now pairs each attempt with a distinct generation,
+waits for its receipt, and re-arms failed/rejected work unless shutdown prevents
+another attempt. Replacing or disabling a timer invalidates old completions.
+An interleaving fixture exercises an accepted tick rejected later by the real
+coordinator worker. The production timer has not yet been converted to this
+scheduler.
+
 The coordinator enforces its recorded setup deadline through successful ticket
 bind, not merely through display preparation. Tick, bind and subsequent admission
 reap expired preparing leases and cancel only their command. Cleanup is enqueued

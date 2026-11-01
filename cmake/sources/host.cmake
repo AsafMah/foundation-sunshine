@@ -31,6 +31,7 @@ set(SUNSHINE_HOST_SOURCES
     src/display_device/topology_capability.cpp src/display_device/topology_capability.h
     src/display_device/topology_command_queue.cpp src/display_device/topology_command_queue.h
     src/display_device/topology_coordinator.cpp src/display_device/topology_coordinator.h
+    src/display_device/topology_routes.cpp src/display_device/topology_routes.h
     src/display_device/to_string.cpp src/display_device/to_string.h
     src/display_device/vdd_capability.cpp src/display_device/vdd_capability.h
     src/display_device/vdd_utils.cpp src/display_device/vdd_utils.h
