@@ -23,6 +23,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/display_device/topology_call.h"
 #include "src/display_device/topology_capability.h"
 #include "src/display_device/topology_coordinator.h"
 
@@ -4816,5 +4817,130 @@ namespace {
     gate.release();
     ASSERT_EQ(receipt.wait_for(real_timeout), std::future_status::ready);
     EXPECT_TRUE(receipt.get().completed());
+  }
+
+  // ---------------------------------------------------------------------------
+  // run_for_value: the HTTP rotate/scale handlers' route
+  // ---------------------------------------------------------------------------
+
+  TEST(DisplayTopologyCall, ReturnsTheBodyValueFromAScopedCapabilityOnTheWorker) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+
+    const auto value = run_for_value(coordinator, command_kind_e::rotate, [&](const mutation_capability_t &capability) {
+      capability.require(operation_e::rotate);
+      return coordinator.on_worker_thread() ? 90 : -1;
+    });
+
+    ASSERT_TRUE(value.has_value()) << value.error().detail;
+    EXPECT_EQ(*value, 90);
+  }
+
+  TEST(DisplayTopologyCall, ARefusedCallNeverRunsTheBodyAndNamesWhy) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    std::atomic_bool ran {};
+
+    const auto value = run_for_value(coordinator, command_kind_e::scale, [&](const mutation_capability_t &) {
+      ran = true;
+      return true;
+    });
+
+    ASSERT_FALSE(value.has_value());
+    EXPECT_FALSE(ran);
+    EXPECT_EQ(value.error().result.outcome, outcome_e::rejected);
+    EXPECT_EQ(value.error().detail, std::string { "rejected / " } + std::string { to_string(reject_reason_e::not_started) });
+  }
+
+  TEST(DisplayTopologyCall, ABodyExceptionReachesTheCaller) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+
+    EXPECT_THROW(run_for_value(coordinator, command_kind_e::scale, [](const mutation_capability_t &capability) -> bool {
+      capability.require(operation_e::vdd_destroy);
+      return true;
+    }),
+      capability_error_t);
+    EXPECT_THROW(run_for_value(coordinator, command_kind_e::rotate, [](const mutation_capability_t &) -> bool {
+      throw std::runtime_error { "CCD failed" };
+    }),
+      std::runtime_error);
+  }
+
+  TEST(DisplayTopologyCall, AReentrantCallFromTheWorkerIsRefusedWithoutRunning) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    std::atomic_bool inner_ran {};
+    std::optional<call_refused_t> refusal;
+
+    const auto outer = coordinator.run(command_kind_e::rotate, [&](const mutation_capability_t &, const command_context_t &) {
+      auto inner = run_for_value(coordinator, command_kind_e::scale, [&](const mutation_capability_t &) {
+        inner_ran = true;
+        return 0;
+      });
+      if (!inner) {
+        refusal = inner.error();
+      }
+    });
+
+    EXPECT_TRUE(outer.completed());
+    EXPECT_FALSE(inner_ran);
+    ASSERT_TRUE(refusal);
+    EXPECT_EQ(refusal->result.outcome, outcome_e::reentrant);
+    EXPECT_EQ(refusal->detail, "reentrant");
+  }
+
+  TEST(DisplayTopologyCall, ARunningBodyOutlivesStopAndItsValueIsStillReturned) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    gate_t gate;
+    const finally_t release { [&] { gate.release(); } };
+    auto call = std::async(std::launch::async, [&, hold = gate.hook()] {
+      return run_for_value(coordinator, command_kind_e::rotate, [&](const mutation_capability_t &) {
+        hold();
+        return 7;
+      });
+    });
+    ASSERT_TRUE(gate.wait_started());
+    auto stopping = std::async(std::launch::async, [&] { coordinator.stop(); });
+    ASSERT_TRUE(wait_until([&] { return coordinator.status().phase == coordinator_phase_e::stopped; }));
+
+    EXPECT_EQ(call.wait_for(50ms), std::future_status::timeout) << "returned while its body still held references";
+    gate.release();
+    stopping.get();
+    const auto value = call.get();
+    ASSERT_TRUE(value.has_value()) << value.error().detail;
+    EXPECT_EQ(*value, 7);
+  }
+
+  TEST(DisplayTopologyCall, ACallQueuedWhenStopArrivesIsRefusedWithoutRunning) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    gate_t busy;
+    const finally_t release { [&] { busy.release(); } };
+    std::atomic_bool ran {};
+    ASSERT_EQ(coordinator.post(command_kind_e::rotate, busy.body()), reject_reason_e::none);
+    ASSERT_TRUE(busy.wait_started());
+    auto call = std::async(std::launch::async, [&] {
+      return run_for_value(coordinator, command_kind_e::scale, [&](const mutation_capability_t &) {
+        ran = true;
+        return 0;
+      });
+    });
+    ASSERT_EQ(call.wait_for(50ms), std::future_status::timeout);
+    auto stopping = std::async(std::launch::async, [&] { coordinator.stop(); });
+    ASSERT_TRUE(wait_until([&] { return coordinator.status().phase == coordinator_phase_e::stopped; }));
+    busy.release();
+    stopping.get();
+
+    const auto value = call.get();
+    ASSERT_FALSE(value.has_value());
+    EXPECT_FALSE(ran);
+    EXPECT_EQ(value.error().result.outcome, outcome_e::stopped);
   }
 }  // namespace

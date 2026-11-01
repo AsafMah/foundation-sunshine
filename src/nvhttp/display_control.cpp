@@ -15,6 +15,8 @@
 #include "src/platform/common.h"
 
 #ifdef _WIN32
+#include "src/display_device/topology_call.h"
+#include "src/display_device/topology_runtime.h"
 #include "src/platform/windows/display_device/windows_utils.h"
 #endif
 
@@ -51,6 +53,8 @@ namespace nvhttp::display_control {
           return web::StatusCode::internal_server_error;
         case 501:
           return web::StatusCode::not_implemented;
+        case 503:
+          return web::StatusCode::service_unavailable;
         default:
           return web::StatusCode::ok;
       }
@@ -178,8 +182,18 @@ namespace nvhttp::display_control {
       BOOST_LOG(info) << "rotate_display: Requested angle=" << angle << ", display_name=" << (display_name.empty() ? "(primary)" : display_name);
 
 #ifdef _WIN32
-      bool success = display_device::w_utils::rotate_display(angle, display_name);
-      if (success) {
+      const auto rotated = display_device::topology::run_for_value(display_device::coordinated::coordinator(),
+        display_device::topology::command_kind_e::rotate,
+        [&](const display_device::topology::mutation_capability_t &capability) {
+          return display_device::w_utils::rotate_display(capability, angle, display_name);
+        });
+      if (!rotated) {
+        response_json["status_code"] = 503;
+        response_json["status_message"] = "Display topology is busy or unavailable: " + rotated.error().detail;
+        response_json["success"] = false;
+        BOOST_LOG(warning) << "rotate_display: Not run: " << rotated.error().detail;
+      }
+      else if (*rotated) {
         response_json["success"] = true;
         response_json["angle"] = angle;
         response_json["message"] = "Display rotation changed successfully";

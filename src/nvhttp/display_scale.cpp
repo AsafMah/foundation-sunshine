@@ -13,6 +13,8 @@
 
 #ifdef _WIN32
   #include "src/display_device/display_device.h"
+  #include "src/display_device/topology_call.h"
+  #include "src/display_device/topology_runtime.h"
   #include "src/platform/windows/display_device/windows_utils.h"
   #include "src/stream.h"
 #endif
@@ -314,6 +316,20 @@ namespace nvhttp::display_scale {
       const int scale_percent = body["scale_percent"].get<int>();
 
       std::optional<display_device::w_utils::set_display_scale_result_t> applied;
+      std::string refusal;
+      const auto set_scale_coordinated = [&refusal](const std::string &name, const std::string &id, int percent)
+        -> std::optional<display_device::w_utils::set_display_scale_result_t> {
+        auto result = display_device::topology::run_for_value(display_device::coordinated::coordinator(),
+          display_device::topology::command_kind_e::scale,
+          [&](const display_device::topology::mutation_capability_t &capability) {
+            return display_device::w_utils::set_display_scale(capability, name, id, percent);
+          });
+        if (!result) {
+          refusal = result.error().detail;
+          return std::nullopt;
+        }
+        return std::move(*result);
+      };
       if (body.contains("target")) {
         if (!body["target"].is_string() || body["target"].get<std::string>() != "current") {
           response_json["status_code"] = 400;
@@ -328,10 +344,19 @@ namespace nvhttp::display_scale {
           return;
         }
         // Set by device ID only so a reused GDI name cannot redirect the change.
-        applied = display_device::w_utils::set_display_scale({}, scale_info->device_id, scale_percent);
+        applied = set_scale_coordinated(std::string {}, scale_info->device_id, scale_percent);
       }
       else {
-        applied = display_device::w_utils::set_display_scale(display_name, device_id, scale_percent);
+        applied = set_scale_coordinated(display_name, device_id, scale_percent);
+      }
+      if (!applied) {
+        response_json["status_code"] = 503;
+        response_json["status_message"] = "Display topology is busy or unavailable: " + refusal;
+        response_json["success"] = false;
+        response_json["error_code"] = "topology_unavailable";
+        BOOST_LOG(warning) << "set_display_scale: Not run: " << refusal;
+        response->write(web::StatusCode::service_unavailable, response_json.dump(), headers);
+        return;
       }
 
       const auto &set_result = *applied;
