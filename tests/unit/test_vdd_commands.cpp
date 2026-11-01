@@ -23,6 +23,7 @@ namespace topology = display_device::topology;
 namespace {
   std::vector<std::wstring> sent;
   vdd::result transport_result;
+  vdd::gated_send_t gated_result;
   bool use_native_transport {};
   bool send_transport_off_worker {};
   int transport_calls {};
@@ -46,6 +47,7 @@ namespace {
     SetUp() override {
       sent.clear();
       transport_result = vdd::result::success;
+      gated_result = { vdd::delivery_e::delivered, {} };
       use_native_transport = false;
       send_transport_off_worker = false;
       transport_calls = 0;
@@ -69,6 +71,15 @@ namespace {
       });
       return result;
     }
+
+    vdd::gated_send_t
+    send_gated(const vdd::command_t &request, const vdd::driver_gate_t &gate = [](const auto &) { return std::nullopt; }) {
+      vdd::gated_send_t result;
+      with_capability(topology::command_kind_e::launch_prepare, false, [&](const auto &capability) {
+        result = vdd::send_command_gated(capability, request, gate);
+      });
+      return result;
+    }
   };
 }  // namespace
 
@@ -89,6 +100,18 @@ namespace display_device::vdd_ioctl::detail {
 #endif
     sent.push_back(buffer.authorized_bytes());
     return transport_result;
+  }
+
+  gated_send_t
+  send_command_buffer_gated(const encoded_command_t &buffer, const driver_gate_t &gate) {
+    ++transport_calls;
+#ifdef _WIN32
+    if (use_native_transport) {
+      return vdd_transport_test::send_gated(buffer, gate);
+    }
+#endif
+    sent.push_back(buffer.authorized_bytes());
+    return gated_result;
   }
 }  // namespace display_device::vdd_ioctl::detail
 
@@ -234,10 +257,95 @@ namespace {
           EXPECT_EQ(state.payload, L"HARDWARECURSOR true");
           EXPECT_EQ(state.payload_bytes, (state.payload.size() + 1) * sizeof(wchar_t));
         }
+        EXPECT_EQ(state.version_reads, 0) << "the ungated transport must not read the driver version";
       }
     });
   }
+
+  TEST_F(VddCommands, GatedRawTransportGatesOnTheInterfaceDeviceVersionAndReportsDelivery) {
+    use_native_transport = true;
+    using native_outcome = vdd_transport_test::outcome_e;
+    std::vector<std::optional<std::string>> seen;
+    const vdd::driver_gate_t accept = [&](const std::optional<std::string> &version) -> std::optional<std::string> {
+      seen.push_back(version);
+      return std::nullopt;
+    };
+    with_capability(topology::command_kind_e::launch_prepare, false, [&](const auto &capability) {
+      for (const auto outcome : { native_outcome::success, native_outcome::missing,
+             native_outcome::open_failed, native_outcome::write_failed }) {
+        SCOPED_TRACE(static_cast<int>(outcome));
+        vdd_transport_test::state = { .outcome = outcome };
+        seen.clear();
+        const auto sent_result = vdd::send_command_gated(capability, vdd::create_monitor_t { guid }, accept);
+        const auto &state = vdd_transport_test::state;
+        EXPECT_EQ(sent_result.delivery, outcome == native_outcome::success     ? vdd::delivery_e::delivered :
+                                        outcome == native_outcome::write_failed ? vdd::delivery_e::uncertain :
+                                                                                  vdd::delivery_e::not_sent);
+        if (outcome != native_outcome::success) EXPECT_FALSE(sent_result.detail.empty());
+        const bool resolved = outcome != native_outcome::missing;
+        EXPECT_EQ(state.version_reads, resolved ? 1 : 0);
+        EXPECT_EQ(seen, resolved ? std::vector<std::optional<std::string>> { "100.0.18.2" } : std::vector<std::optional<std::string>> {});
+        EXPECT_EQ(state.opens, resolved ? 1 : 0);
+        const bool opened = outcome == native_outcome::success || outcome == native_outcome::write_failed;
+        EXPECT_EQ(state.writes, opened ? 1 : 0);
+        EXPECT_EQ(state.closes, opened ? 1 : 0);
+        EXPECT_EQ(state.list_destroys, resolved ? 1 : 0);
+        if (opened) EXPECT_EQ(state.payload, L"CREATEMONITOR {01234567-89ab-cdef-0123-456789abcdef}:[1000,0.001,1000]");
+      }
+
+      vdd_transport_test::state = {};
+      vdd_transport_test::state.driver_version = L"100.0.15.9";
+      const auto refused = vdd::send_command_gated(capability, vdd::create_monitor_t { guid },
+        [](const std::optional<std::string> &version) -> std::optional<std::string> { return "too old: " + version.value_or("?"); });
+      EXPECT_EQ(refused.delivery, vdd::delivery_e::not_sent);
+      EXPECT_EQ(refused.detail, "too old: 100.0.15.9");
+      EXPECT_EQ(vdd_transport_test::state.opens, 0);
+      EXPECT_EQ(vdd_transport_test::state.writes, 0);
+      EXPECT_EQ(vdd_transport_test::state.list_destroys, 1);
+
+      vdd_transport_test::state = {};
+      vdd_transport_test::state.driver_version.reset();
+      seen.clear();
+      EXPECT_EQ(vdd::send_command_gated(capability, vdd::destroy_monitors_t {}, accept).delivery, vdd::delivery_e::delivered);
+      EXPECT_EQ(seen, (std::vector<std::optional<std::string>> { std::nullopt }));
+      EXPECT_EQ(vdd_transport_test::state.payload, L"DESTROYMONITOR");
+    });
+  }
 #endif
+
+  TEST_F(VddCommands, GatedSendsKeepTheWireBytesAndPassDeliveryThrough) {
+    for (const auto delivery : { vdd::delivery_e::delivered, vdd::delivery_e::not_sent, vdd::delivery_e::uncertain }) {
+      gated_result = { delivery, "transport detail" };
+      sent.clear();
+      const auto created = send_gated(vdd::create_monitor_t { guid });
+      EXPECT_EQ(created.delivery, delivery);
+      EXPECT_EQ(created.detail, "transport detail");
+      EXPECT_EQ(send_gated(vdd::destroy_monitors_t {}).delivery, delivery);
+      ASSERT_EQ(send(vdd::create_monitor_t { guid }), vdd::result::success);
+      ASSERT_EQ(sent.size(), 3u);
+      EXPECT_EQ(sent[0], sent[2]);
+      EXPECT_EQ(sent[1], L"DESTROYMONITOR");
+    }
+  }
+
+  TEST_F(VddCommands, GatedInvalidRequestsAreNotSent) {
+    for (const vdd::command_t &invalid : { vdd::command_t {}, vdd::command_t { vdd::create_monitor_t { "RELOAD_DRIVER" } },
+           vdd::command_t { vdd::set_modes_t {} } }) {
+      const auto result = send_gated(invalid);
+      EXPECT_EQ(result.delivery, vdd::delivery_e::not_sent);
+      EXPECT_FALSE(result.detail.empty());
+    }
+    EXPECT_EQ(transport_calls, 0);
+    EXPECT_TRUE(sent.empty());
+  }
+
+  TEST_F(VddCommands, GatedSendsNeedTheSameCapability) {
+    with_capability(topology::command_kind_e::rotate, false, [&](const auto &capability) {
+      EXPECT_THROW((void) vdd::send_command_gated(capability, vdd::create_monitor_t { guid }, [](const auto &) { return std::nullopt; }),
+        topology::capability_error_t);
+    });
+    EXPECT_EQ(transport_calls, 0);
+  }
 
   TEST_F(VddCommands, SupportedCommandsKeepExistingWireBytesAndResults) {
     for (const auto outcome : { vdd::result::success, vdd::result::failed, vdd::result::interface_missing }) {

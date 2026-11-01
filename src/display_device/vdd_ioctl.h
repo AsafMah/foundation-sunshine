@@ -8,6 +8,8 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -157,6 +159,33 @@ namespace display_device::vdd_ioctl {
    */
   result
   send_command(const topology::mutation_capability_t &capability, const command_t &command);
+
+  /** What a gated send established about the driver receiving the command. */
+  enum class delivery_e {
+    delivered,  ///< The driver completed the command.
+    not_sent,   ///< Nothing reached the driver: invalid request, no interface, gate refusal or open failure.
+    uncertain,  ///< The IOCTL was issued and failed; the driver may have acted on it.
+  };
+
+  struct gated_send_t {
+    delivery_e delivery { delivery_e::not_sent };
+    std::string detail;
+  };
+
+  /**
+   * Refusal reason for the driver version of the control interface about to be opened, or
+   * nullopt to send. The version is `DEVPKEY_Device_DriverVersion` of the interface's own
+   * device, and nullopt when it cannot be read.
+   */
+  using driver_gate_t = std::function<std::optional<std::string>(const std::optional<std::string> &version)>;
+
+  /**
+   * @brief `send_command`, but only to a driver `gate` accepts, reporting delivery rather than a result.
+   *
+   * Authority failures throw exactly as in `send_command`. Nothing is retried.
+   */
+  gated_send_t
+  send_command_gated(const topology::mutation_capability_t &capability, const command_t &command, const driver_gate_t &gate);
 
   /**
    * @brief Cheap liveness probe used to decide whether the IOCTL transport

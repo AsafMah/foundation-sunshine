@@ -34,6 +34,12 @@ namespace display_device::vdd_ioctl {
       3
     };
 
+    // DEVPKEY_Device_DriverVersion.
+    constexpr DEVPROPKEY kDeviceDriverVersionProperty {
+      { 0xa8b865dd, 0x2e3d, 0x4094, { 0xad, 0x97, 0xe5, 0x93, 0xa7, 0x0c, 0x75, 0xd6 } },
+      3
+    };
+
     /**
      * @brief RAII guard for `HDEVINFO` returned by `SetupDiGetClassDevs*`.
      *
@@ -73,10 +79,12 @@ namespace display_device::vdd_ioctl {
      * If the driver isn't installed, or hasn't reached D0 yet, the enumeration
      * returns no interfaces.
      *
+     * @param driver_version When non-null, receives the installed driver version of the device that
+     *        owns the returned interface (nullopt if unreadable), read from the same enumeration.
      * @return Empty wstring on failure (driver not installed / no interface).
      */
     std::wstring
-    resolve_interface_path() {
+    resolve_interface_path(std::optional<std::string> *driver_version = nullptr) {
       HDEVINFO h_raw = SetupDiGetClassDevsW(
         &GUID_DEVINTERFACE_ZAKO_VDD_CONTROL,
         nullptr,
@@ -123,15 +131,40 @@ namespace display_device::vdd_ioctl {
       auto *detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W *>(buffer.data());
       detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
 
+      SP_DEVINFO_DATA device {};
+      device.cbSize = sizeof(device);
       if (!SetupDiGetDeviceInterfaceDetailW(
             h_dev_info.get(),
             &iface_data,
             detail,
             required_size,
             nullptr,
-            nullptr)) {
+            driver_version ? &device : nullptr)) {
         BOOST_LOG(debug) << "vdd_ioctl: SetupDiGetDeviceInterfaceDetailW failed (err=" << GetLastError() << ")";
         return {};
+      }
+
+      if (driver_version) {
+        driver_version->reset();
+        wchar_t text[128] {};
+        DEVPROPTYPE type = DEVPROP_TYPE_EMPTY;
+        if (SetupDiGetDevicePropertyW(h_dev_info.get(), &device, &kDeviceDriverVersionProperty, &type,
+              reinterpret_cast<PBYTE>(text), sizeof(text) - sizeof(wchar_t), nullptr, 0) &&
+            type == DEVPROP_TYPE_STRING) {
+          std::string narrow;
+          bool ascii = true;
+          for (const wchar_t *c = text; *c; ++c) {
+            if (*c > 0x7f) {
+              ascii = false;
+              break;
+            }
+            narrow.push_back(static_cast<char>(*c));
+          }
+          if (ascii) *driver_version = std::move(narrow);
+        }
+        else {
+          BOOST_LOG(debug) << "vdd_ioctl: driver version query failed (err=" << GetLastError() << ")";
+        }
       }
 
       return std::wstring { detail->DevicePath };
@@ -156,7 +189,11 @@ namespace display_device::vdd_ioctl {
       };
 
       open_result open() {
-        const std::wstring path = resolve_interface_path();
+        return open_path(resolve_interface_path());
+      }
+
+      /** Open an interface path the caller already resolved (empty = interface missing). */
+      open_result open_path(const std::wstring &path) {
         if (path.empty()) {
           // Empty path = SetupDi enumeration found no instance of our
           // GUID. This is the "driver isn't installed / hasn't registered
@@ -350,6 +387,43 @@ namespace display_device::vdd_ioctl {
       }
 
       return result::success;
+    }
+
+    gated_send_t
+    send_command_buffer_gated(const encoded_command_t &request, const driver_gate_t &gate) {
+      const auto &command = request.authorized_bytes();
+      // Version and path come from one enumeration: the gate judges the device that is opened.
+      std::optional<std::string> version;
+      const std::wstring path = resolve_interface_path(&version);
+      if (path.empty()) {
+        return { delivery_e::not_sent, "VDD control interface is not registered" };
+      }
+      if (auto refusal = gate(version)) {
+        return { delivery_e::not_sent, std::move(*refusal) };
+      }
+      device_handle dev;
+      if (dev.open_path(path) != device_handle::open_result::success) {
+        return { delivery_e::not_sent, "VDD control interface could not be opened (err=" + std::to_string(GetLastError()) + ")" };
+      }
+
+      const DWORD bytes_to_send = static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t));
+      DWORD bytes_returned = 0;
+      const BOOL ok = DeviceIoControl(
+        dev.get(),
+        IOCTL_VDD_COMMAND,
+        const_cast<wchar_t *>(command.c_str()),
+        bytes_to_send,
+        nullptr,
+        0,
+        &bytes_returned,
+        nullptr);
+      if (!ok) {
+        // The IRP reached the driver, which may have acted before failing: never report not_sent here.
+        const auto error = GetLastError();
+        BOOST_LOG(warning) << "vdd_ioctl: gated DeviceIoControl(IOCTL_VDD_COMMAND) failed (err=" << error << ")";
+        return { delivery_e::uncertain, "DeviceIoControl(IOCTL_VDD_COMMAND) failed (err=" + std::to_string(error) + ")" };
+      }
+      return { delivery_e::delivered, {} };
     }
   }  // namespace detail
 

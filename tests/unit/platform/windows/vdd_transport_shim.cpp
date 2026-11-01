@@ -13,6 +13,8 @@
 
 namespace vdd_transport_test {
   state_t state;
+  // The device behind the one control interface; its properties are served only for it.
+  constexpr DWORD interface_device = 0x5A0;
 
   HDEVINFO
   get_class_devs(const GUID *, PCWSTR, HWND, DWORD) {
@@ -33,10 +35,14 @@ namespace vdd_transport_test {
 
   BOOL
   get_detail(HDEVINFO, PSP_DEVICE_INTERFACE_DATA, PSP_DEVICE_INTERFACE_DETAIL_DATA_W detail, DWORD,
-    PDWORD required, PSP_DEVINFO_DATA) {
+    PDWORD required, PSP_DEVINFO_DATA device) {
     constexpr wchar_t path[] = L"fake-vdd";
     if (required) *required = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W) + sizeof(path);
     if (detail) std::copy(std::begin(path), std::end(path), detail->DevicePath);
+    if (detail && device) {
+      EXPECT_EQ(device->cbSize, sizeof(SP_DEVINFO_DATA));
+      device->DevInst = interface_device;
+    }
     return detail != nullptr;
   }
 
@@ -84,9 +90,25 @@ namespace vdd_transport_test {
     return FALSE;
   }
   BOOL
-  get_property(HDEVINFO, PSP_DEVINFO_DATA, const DEVPROPKEY *, DEVPROPTYPE *, PBYTE, DWORD, PDWORD, DWORD) {
-    ADD_FAILURE() << "adapter probe is outside this fixture";
-    return FALSE;
+  get_property(HDEVINFO, PSP_DEVINFO_DATA device, const DEVPROPKEY *key, DEVPROPTYPE *type, PBYTE buffer, DWORD size, PDWORD required, DWORD flags) {
+    constexpr GUID driver_version_fmtid { 0xa8b865dd, 0x2e3d, 0x4094, { 0xad, 0x97, 0xe5, 0x93, 0xa7, 0x0c, 0x75, 0xd6 } };
+    if (!key || !IsEqualGUID(key->fmtid, driver_version_fmtid) || key->pid != 3) {
+      ADD_FAILURE() << "only the driver version is in this fixture";
+      return FALSE;
+    }
+    EXPECT_EQ(flags, 0u);
+    ++state.version_reads;
+    if (!device || device->DevInst != interface_device) {
+      ADD_FAILURE() << "the driver version was not read from the control interface's device";
+      return FALSE;
+    }
+    if (!state.driver_version) return FALSE;
+    const auto bytes = static_cast<DWORD>((state.driver_version->size() + 1) * sizeof(wchar_t));
+    if (type) *type = DEVPROP_TYPE_STRING;
+    if (required) *required = bytes;
+    if (!buffer || size < bytes) return FALSE;
+    std::copy_n(state.driver_version->c_str(), state.driver_version->size() + 1, reinterpret_cast<wchar_t *>(buffer));
+    return TRUE;
   }
 }  // namespace vdd_transport_test
 
@@ -103,7 +125,9 @@ namespace vdd_transport_test {
 #define GetLastError vdd_transport_test::get_error
 #define GetCurrentProcessId vdd_transport_test::get_process_id
 #define send_command_buffer native_send_command_buffer
+#define send_command_buffer_gated native_send_command_buffer_gated
 #include "src/display_device/vdd_ioctl.cpp"
+#undef send_command_buffer_gated
 #undef send_command_buffer
 #undef GetCurrentProcessId
 #undef GetLastError
@@ -122,5 +146,10 @@ namespace vdd_transport_test {
   display_device::vdd_ioctl::result
   send(const display_device::vdd_ioctl::detail::encoded_command_t &command) {
     return display_device::vdd_ioctl::detail::native_send_command_buffer(command);
+  }
+
+  display_device::vdd_ioctl::gated_send_t
+  send_gated(const display_device::vdd_ioctl::detail::encoded_command_t &command, const display_device::vdd_ioctl::driver_gate_t &gate) {
+    return display_device::vdd_ioctl::detail::native_send_command_buffer_gated(command, gate);
   }
 }  // namespace vdd_transport_test

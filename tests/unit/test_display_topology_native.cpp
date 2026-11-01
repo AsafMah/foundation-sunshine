@@ -298,11 +298,22 @@ namespace {
       if (on_mutation) on_mutation(&capability);
       log_.add("create_head");
       intents.push_back(intent);
+      creating_ = intent;
+      const auto done = [this](auto result) {
+        creating_.reset();
+        return result;
+      };
       if (on_create) {
-        return on_create(intents.size());
+        try {
+          return done(on_create(intents.size()));
+        }
+        catch (...) {
+          creating_.reset();
+          throw;
+        }
       }
       add_head();
-      return delivery_e::accepted;
+      return done(dt::result_t<delivery_e> { delivery_e::accepted });
     }
 
     dt::result_t<void>
@@ -341,10 +352,17 @@ namespace {
     }
 
   public:
+    /** Inside a create, the new head carries that request's identity unless `stamp` replaces it. */
     std::string
     add_head() {
       auto name = "vdd-" + std::to_string(++created);
-      host.displays.push_back(virtual_display(name, 3840));
+      auto display = virtual_display(name, 3840);
+      if (creating_) {
+        display.head = dt::head_identity_t { driver(), *creating_, head_incarnation };
+        if (stamp) stamp(*display.head);
+        if (strip_identity) display.head.reset();
+      }
+      host.displays.push_back(std::move(display));
       return name;
     }
 
@@ -375,8 +393,12 @@ namespace {
     bool throw_on_inventory {};
     bool apply_error {};
     bool ignore_apply {};
+    dt::head_incarnation_t head_incarnation { 1 };
+    std::function<void(dt::head_identity_t &)> stamp;
+    bool strip_identity {};
 
   private:
+    std::optional<dt::head_guid_t> creating_;
     event_log_t &log_;
   };
 
@@ -1101,6 +1123,51 @@ TEST_F(NativeExecutor, ARefusedCreationDoesNotOwnAnAppearingHead) {
   EXPECT_TRUE(in_conflict(recover_with(restarted)));
   EXPECT_EQ(store.bytes, bytes);
   EXPECT_EQ(log.host_writes(), 1u);
+}
+
+TEST_F(NativeExecutor, OnlyAHeadCarryingThisRequestsIdentityIsOwned) {
+  const std::vector<std::pair<std::string, std::function<void(fake_platform_t &)>>> foreign {
+    { "no identity", [](fake_platform_t &p) { p.strip_identity = true; } },
+    { "another request", [](fake_platform_t &p) { p.stamp = [](auto &head) { head.guid = id<dt::head_guid_t>(0x7E); }; } },
+    { "another driver", [](fake_platform_t &p) { p.stamp = [](auto &head) { head.driver = id<dt::driver_instance_id_t>(0x7F); }; } },
+    { "no incarnation", [](fake_platform_t &p) { p.head_incarnation = dt::head_incarnation_t {}; } },
+  };
+  for (const auto delivery : { delivery_e::accepted, delivery_e::uncertain }) {
+    for (const auto &[name, configure] : foreign) {
+      SCOPED_TRACE(name + (delivery == delivery_e::accepted ? " / accepted" : " / uncertain"));
+      event_log_t local_log;
+      fake_platform_t local { local_log };
+      memory_store_t local_store { local_log };
+      configure(local);
+      local.on_create = [&](std::size_t) {
+        local.add_head();
+        return dt::result_t<delivery_e> { delivery };
+      };
+      dt::native_executor_t local_executor { local_store, local, { next_uuid, 2, driver() } };
+      const auto outcome = prepare_with(local_executor, virtual_profile());
+      EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
+      EXPECT_TRUE(mentions(outcome.reason, "identity"));
+      EXPECT_FALSE(outcome.target);
+      EXPECT_EQ(local.intents.size(), 1u);
+      EXPECT_EQ(local.head_count(), 1u);
+      EXPECT_EQ(local_log.host_writes(), 1u);
+      const auto record = local_store.record();
+      ASSERT_TRUE(record);
+      EXPECT_TRUE(record->owned_heads.empty());
+      EXPECT_EQ(record->steps.back().state, step_e::conflict);
+    }
+  }
+}
+
+TEST_F(NativeExecutor, AnOwnedHeadRecordsTheObservedIdentity) {
+  platform.head_incarnation = dt::head_incarnation_t { 9 };
+  const auto outcome = prepare_with(executor, virtual_profile());
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok));
+  const auto record = store.record();
+  ASSERT_TRUE(record);
+  ASSERT_EQ(record->owned_heads.size(), 1u);
+  EXPECT_EQ(record->owned_heads.front().identity, (dt::head_identity_t { driver(), platform.intents.back(), dt::head_incarnation_t { 9 } }));
+  EXPECT_EQ(record->owned_heads.front().identity, find(platform.host, "vdd-1").head);
 }
 
 TEST_F(NativeExecutor, UncertainCreationCannotRemoveAHeadAfterItsProofChanges) {

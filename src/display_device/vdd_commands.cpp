@@ -112,4 +112,21 @@ namespace display_device::vdd_ioctl {
     const detail::encoded_command_t encoded { capability, operation, std::move(command) };
     return detail::send_command_buffer(encoded);
   }
+
+  gated_send_t
+  send_command_gated(const topology::mutation_capability_t &capability, const command_t &request, const driver_gate_t &gate) {
+    std::wstring command;
+    topology::operation_e operation;
+    try {
+      operation = operation_for(request);
+      capability.require(operation);
+      command = encode(request);
+    }
+    catch (const std::invalid_argument &error) {
+      BOOST_LOG(warning) << "vdd_ioctl: rejecting gated mutation request: " << error.what();
+      return { delivery_e::not_sent, error.what() };
+    }
+    const detail::encoded_command_t encoded { capability, operation, std::move(command) };
+    return detail::send_command_buffer_gated(encoded, gate);
+  }
 }  // namespace display_device::vdd_ioctl

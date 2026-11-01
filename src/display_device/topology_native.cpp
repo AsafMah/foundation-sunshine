@@ -509,6 +509,10 @@ namespace display_device::topology {
       if (!created) {
         return unresolved("The driver refused the request but a virtual display appeared: " + created.error().detail);
       }
+      // Only a head carrying this request's full identity can be ours; anything else is left alone.
+      if (!head.head || head.head->driver != options_.driver || head.head->guid != intent || head.head->incarnation.value == 0) {
+        return unresolved("A virtual display appeared that does not carry this request's identity");
+      }
       if (*created != creation_delivery_e::accepted) {
         return roll_back_head(capability, record, head, "The driver delivery is uncertain");
       }
@@ -519,8 +523,7 @@ namespace display_device::topology {
       step.state = journal_step_state_e::observed;
       step.display = head.id;
       step.observed = after;
-      record.owned_heads.push_back({ head_identity_t { options_.driver, intent, head_incarnation_t { 1 } }, owner_,
-        head.adapter.value_or(adapter_luid_t {}), 0 });
+      record.owned_heads.push_back({ *head.head, owner_, head.adapter.value_or(adapter_luid_t {}), 0 });
       if (const auto saved = store_.save(record); !saved) {
         return roll_back_head(capability, record, head, "The native journal could not record the new virtual display: " + saved.error().detail);
       }

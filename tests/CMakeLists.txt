@@ -597,6 +597,33 @@ if (WIN32)
 endif ()
 add_test(NAME display_topology_native_unit_tests COMMAND display_topology_native_unit_tests)
 
+add_executable(display_topology_windows_native_unit_tests
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_journal.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_durable_file.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_journal_store.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_native.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_windows_native.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_capability.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_command_queue.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_coordinator.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology_windows_native.cpp)
+if (WIN32)
+    target_sources(display_topology_windows_native_unit_tests PRIVATE
+            ${CMAKE_SOURCE_DIR}/src/platform/windows/display_device/native_edge_support.cpp
+            ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_native_edge_support.cpp)
+endif ()
+target_include_directories(display_topology_windows_native_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(display_topology_windows_native_unit_tests PRIVATE gtest_main nlohmann_json::nlohmann_json Boost::headers
+        sunshine_project_options sunshine_coverage)
+target_compile_options(display_topology_windows_native_unit_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>)
+target_compile_definitions(display_topology_windows_native_unit_tests PRIVATE _GLIBCXX_ASSERTIONS)
+set_target_properties(display_topology_windows_native_unit_tests PROPERTIES CXX_STANDARD 23)
+if (WIN32)
+    set_target_properties(display_topology_windows_native_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
+endif ()
+add_test(NAME display_topology_windows_native_unit_tests COMMAND display_topology_windows_native_unit_tests)
+
 add_executable(pyrowave_unit_tests
         ${CMAKE_SOURCE_DIR}/src/pyrowave/types.cpp
         ${CMAKE_SOURCE_DIR}/src/pyrowave/config.cpp
@@ -950,6 +977,8 @@ list(REMOVE_ITEM TEST_SOURCES
         ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology_routes.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_topology_retry_timer.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology_native.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology_windows_native.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_native_edge_support.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_topology_actor_record.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_topology_actor_supervisor.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_topology_actor_body.cpp

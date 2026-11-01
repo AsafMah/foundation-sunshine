@@ -25,6 +25,8 @@ namespace display_device::vdd_ioctl::detail {
   private:
     friend result
     vdd_ioctl::send_command(const topology::mutation_capability_t &, const command_t &);
+    friend gated_send_t
+    vdd_ioctl::send_command_gated(const topology::mutation_capability_t &, const command_t &, const driver_gate_t &);
 
     encoded_command_t(const topology::mutation_capability_t &capability,
       topology::operation_e operation, std::wstring bytes):
@@ -37,4 +39,8 @@ namespace display_device::vdd_ioctl::detail {
 
   result
   send_command_buffer(const encoded_command_t &command);
+
+  /** Send only to a control interface whose own driver version `gate` accepts; see `send_command_gated`. */
+  gated_send_t
+  send_command_buffer_gated(const encoded_command_t &command, const driver_gate_t &gate);
 }  // namespace display_device::vdd_ioctl::detail
