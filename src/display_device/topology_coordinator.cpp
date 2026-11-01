@@ -51,9 +51,18 @@ namespace display_device::topology {
       return { value, reject_reason_e::none, {} };
     }
 
+    posted_command_t
+    rejected_post(reject_reason_e reason) {
+      std::promise<command_result_t> signal;
+      auto future = signal.get_future().share();
+      signal.set_value(rejected(reason));
+      return { {}, reason, std::move(future) };
+    }
+
     void
     require_routable(command_kind_e kind) {
-      if (kind == command_kind_e::startup_recovery || kind == command_kind_e::launch_prepare) {
+      if (kind == command_kind_e::startup_recovery || kind == command_kind_e::legacy_startup_restore ||
+          kind == command_kind_e::launch_prepare) {
         throw std::invalid_argument { std::string { "Topology command " } + std::string { to_string(kind) } +
                                       " has a dedicated coordinator entry point" };
       }
@@ -157,6 +166,8 @@ namespace display_device::topology {
     std::promise<command_result_t> posted_completion;
     std::shared_future<command_result_t> posted_future { posted_completion.get_future().share() };
     std::once_flag posted_once;
+    std::shared_ptr<startup_restore_t> startup_restore;
+    bool holds_startup_fence {};
 
     void
     complete_posted(command_result_t result) {
@@ -168,6 +179,14 @@ namespace display_device::topology {
     std::once_flag once;
     std::promise<command_result_t> promise;
     std::shared_future<command_result_t> future { promise.get_future().share() };
+  };
+
+  struct coordinator_t::startup_restore_t {
+    explicit startup_restore_t(command_body_t restore):
+        body { std::move(restore) } {}
+
+    const command_body_t body;
+    posted_command_t attempt;
   };
 
   coordinator_t::coordinator_t(coordinator_options_t options):
@@ -229,6 +248,56 @@ namespace display_device::topology {
     return startup_->future;
   }
 
+  void
+  coordinator_t::defer_startup_restore(const mutation_capability_t &capability, command_body_t restore) {
+    capability.require(operation_e::restore_state);
+    if (!on_worker_thread() || capability.kind() != command_kind_e::startup_recovery) {
+      throw capability_error_t { "Only the initial startup worker can register deferred restoration" };
+    }
+    if (!restore || !options_.probes.startup_restore_quiescent) {
+      throw std::invalid_argument { "Deferred startup restoration needs a body and startup/ticket/session quiescence probe" };
+    }
+    auto obligation = std::make_shared<startup_restore_t>(std::move(restore));
+    std::lock_guard lock { mutex_ };
+    if (phase_ != coordinator_phase_e::recovering || stopping_ || startup_restore_) {
+      throw std::logic_error { "Startup restoration can only be registered once during initial recovery" };
+    }
+    startup_restore_ = std::move(obligation);
+  }
+
+  posted_command_t
+  coordinator_t::retry_startup_restore() {
+    // A previous failure may own an exception with a reentrant destructor.
+    posted_command_t previous;
+    std::lock_guard lock { mutex_ };
+    if (startup_restore_inflight_) {
+      return startup_restore_inflight_->attempt;
+    }
+    if (const auto reason = evaluate_locked(command_kind_e::legacy_startup_restore, std::nullopt, false);
+      reason != reject_reason_e::none) {
+      return rejected_post(reason);
+    }
+    auto state = std::make_shared<command_state_t>();
+    state->startup_restore = startup_restore_;
+    previous = std::move(startup_restore_->attempt);
+    startup_restore_->attempt = submit_posted_locked(command_kind_e::legacy_startup_restore, {}, std::move(state));
+    startup_restore_inflight_ = startup_restore_;
+    return startup_restore_->attempt;
+  }
+
+  void
+  coordinator_t::forget_startup_restore(const mutation_capability_t &capability) {
+    capability.require(operation_e::reset_persistence);
+    if (!on_worker_thread()) {
+      throw capability_error_t { "Only this coordinator worker can forget startup restoration" };
+    }
+    std::shared_ptr<startup_restore_t> forgotten;
+    {
+      std::lock_guard lock { mutex_ };
+      forgotten = std::move(startup_restore_);
+    }
+  }
+
   reject_reason_e
   coordinator_t::evaluate_locked(command_kind_e kind, std::optional<std::uint64_t> transaction, bool legacy_restore_pending) {
     if (stopping_ || phase_ == coordinator_phase_e::stopped) {
@@ -244,6 +313,18 @@ namespace display_device::topology {
     }
     if (phase_ == coordinator_phase_e::recovering) {
       return reject_reason_e::recovering;
+    }
+    if (kind == command_kind_e::legacy_startup_restore) {
+      if (phase_ == coordinator_phase_e::draining) {
+        return reject_reason_e::draining;
+      }
+      if (!startup_restore_) {
+        return reject_reason_e::stale_transaction;
+      }
+      if (lease_) {
+        return reject_reason_e::owner_busy;
+      }
+      return external_fence_active_locked() ? reject_reason_e::fence_active : reject_reason_e::none;
     }
     if (is_cleanup_kind(kind)) {
       if (kind == command_kind_e::shutdown_vdd_destroy && (native_.journal_present || native_.in_conflict)) {
@@ -266,7 +347,7 @@ namespace display_device::topology {
         if (native_.in_conflict) {
           return reject_reason_e::recovery_required;
         }
-        if (legacy_restore_pending) {
+        if (legacy_restore_pending || startup_restore_) {
           return reject_reason_e::legacy_restore_pending;
         }
       }
@@ -298,6 +379,11 @@ namespace display_device::topology {
 
   bool
   coordinator_t::fence_active_locked() {
+    return startup_restore_attempt_active_ || external_fence_active_locked();
+  }
+
+  bool
+  coordinator_t::external_fence_active_locked() {
     std::erase_if(fences_, [](const auto &settled) { return settled(); });
     return !fences_.empty();
   }
@@ -314,10 +400,37 @@ namespace display_device::topology {
         legacy_pending = options_.probes.legacy_restore_pending();
       }
 
+      auto startup_preflight = reject_reason_e::none;
+      bool startup_quiescent = false;
+      if (kind == command_kind_e::legacy_startup_restore) {
+        {
+          std::lock_guard lock { mutex_ };
+          startup_preflight = evaluate_locked(kind, transaction, false);
+          if (startup_preflight == reject_reason_e::none && startup_restore_ != state->startup_restore) {
+            startup_preflight = reject_reason_e::stale_transaction;
+          }
+          if (startup_preflight == reject_reason_e::none) {
+            startup_restore_attempt_active_ = true;
+            state->holds_startup_fence = true;
+          }
+        }
+        if (startup_preflight == reject_reason_e::none) {
+          startup_quiescent = options_.probes.startup_restore_quiescent();
+        }
+      }
+
       reject_reason_e reason;
       {
         std::lock_guard lock { mutex_ };
-        reason = evaluate_locked(kind, transaction, legacy_pending);
+        reason = startup_preflight != reject_reason_e::none ? startup_preflight : evaluate_locked(kind, transaction, legacy_pending);
+        if (kind == command_kind_e::legacy_startup_restore && reason == reject_reason_e::none) {
+          if (startup_restore_ != state->startup_restore) {
+            reason = reject_reason_e::stale_transaction;
+          }
+          else if (!startup_quiescent) {
+            reason = reject_reason_e::owner_busy;
+          }
+        }
         auto expected = stage_e::pending;
         if (reason != reject_reason_e::none) {
           state->reason.store(reason, std::memory_order_release);
@@ -343,6 +456,14 @@ namespace display_device::topology {
       }
 
       const mutation_capability_t capability { kind, options_.managed_mode, std::this_thread::get_id() };
+      if (kind == command_kind_e::legacy_startup_restore) {
+        state->startup_restore->body(capability, context);
+        std::lock_guard lock { mutex_ };
+        if (startup_restore_ == state->startup_restore) {
+          startup_restore_.reset();
+        }
+        return;
+      }
       if (kind != command_kind_e::startup_recovery) {
         if (body) {
           body(capability, context);
@@ -502,10 +623,7 @@ namespace display_device::topology {
     require_routable(kind);
     std::lock_guard lock { mutex_ };
     if (const auto reason = evaluate_locked(kind, std::nullopt, false); reason != reject_reason_e::none) {
-      std::promise<command_result_t> signal;
-      auto future = signal.get_future().share();
-      signal.set_value(rejected(reason));
-      return { {}, reason, std::move(future) };
+      return rejected_post(reason);
     }
     return submit_posted_locked(kind, std::move(body));
   }
@@ -531,6 +649,15 @@ namespace display_device::topology {
         }
         catch (...) {
           result = { outcome_e::failed, reject_reason_e::none, std::current_exception() };
+        }
+        if (state->startup_restore) {
+          std::lock_guard lock { mutex_ };
+          if (state->holds_startup_fence) {
+            startup_restore_attempt_active_ = false;
+          }
+          startup_restore_inflight_.reset();
+          state->complete_posted(std::move(result));
+          return;
         }
         state->complete_posted(std::move(result));
       };
@@ -655,7 +782,7 @@ namespace display_device::topology {
       if (native_.in_conflict) {
         return { std::nullopt, reject_reason_e::recovery_required };
       }
-      if (legacy_pending) {
+      if (legacy_pending || startup_restore_) {
         return { std::nullopt, reject_reason_e::legacy_restore_pending };
       }
     }
@@ -1075,6 +1202,7 @@ namespace display_device::topology {
     }
     const std::lock_guard lifecycle { lifecycle_mutex_ };
     std::unique_ptr<topology_command_queue_t> queue;
+    std::shared_ptr<startup_restore_t> forgotten;
     {
       std::lock_guard lock { mutex_ };
       phase_ = coordinator_phase_e::stopped;
@@ -1083,6 +1211,7 @@ namespace display_device::topology {
         lease_->restore_state->complete_posted(outcome(outcome_e::stopped));
       }
       queue = std::move(queue_);
+      forgotten = std::move(startup_restore_);
     }
 
     {
@@ -1152,7 +1281,9 @@ namespace display_device::topology {
         lease_->attachments.size(), lease_->flavor == launch_flavor_e::managed && lease_->attachments.empty() };
     }
     result.native = native_;
-    result.fence_active = std::any_of(fences_.begin(), fences_.end(), [](const auto &settled) { return !settled(); });
+    result.fence_active = startup_restore_attempt_active_ ||
+                          std::any_of(fences_.begin(), fences_.end(), [](const auto &settled) { return !settled(); });
+    result.startup_restore_pending = static_cast<bool>(startup_restore_);
     result.native_restores_posted = native_restores_posted_;
     result.submitted_commands = submitted_commands_;
     return result;

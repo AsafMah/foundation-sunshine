@@ -61,6 +61,7 @@ namespace {
 
   constexpr std::array all_kinds {
     command_kind_e::startup_recovery,
+    command_kind_e::legacy_startup_restore,
     command_kind_e::launch_prepare,
     command_kind_e::launch_failed_restore,
     command_kind_e::reconfigure,
@@ -338,6 +339,7 @@ namespace {
     using op = operation_e;
     const std::map<kind, std::set<op>> legacy {
       { kind::startup_recovery, { op::native_recover, op::restore_state } },
+      { kind::legacy_startup_restore, { op::restore_state } },
       { kind::launch_prepare, { op::configure_display, op::restore_state, op::native_apply } },
       { kind::launch_failed_restore, { op::restore_state, op::native_restore } },
       { kind::reconfigure, { op::configure_display } },
@@ -355,9 +357,10 @@ namespace {
       { kind::legacy_unlock_restore, { op::legacy_deferred } },
       { kind::native_restore, { op::native_restore } },
     };
-    // Managed mode: the legacy whole-state operations survive only in startup recovery.
+    // Managed mode: whole-state restore survives only for startup and its registered continuation.
     const std::map<kind, std::set<op>> managed {
       { kind::startup_recovery, { op::native_recover, op::restore_state } },
+      { kind::legacy_startup_restore, { op::restore_state } },
       { kind::launch_prepare, { op::native_apply } },
       { kind::launch_failed_restore, { op::native_restore } },
       { kind::reconfigure, {} },
@@ -566,6 +569,357 @@ namespace {
     auto legacy = make_options(clock);
     legacy.native_restore = nullptr;
     EXPECT_NO_THROW({ coordinator_t coordinator { std::move(legacy) }; });
+  }
+
+  TEST(DisplayTopologyCoordinator, StartupRestoreRegistrationIsWorkerScopedAndImmutable) {
+    fake_clock_t clock;
+    std::atomic_int calls {};
+    auto options = make_options(clock);
+    options.probes.startup_restore_quiescent = [] { return true; };
+    coordinator_t coordinator { std::move(options) };
+    coordinator_t foreign { make_options(clock) };
+    ASSERT_TRUE(start_ready(foreign).completed());
+    ASSERT_TRUE(coordinator.start([&](const auto &capability, const auto &) {
+                             EXPECT_THROW(coordinator.defer_startup_restore(capability, {}), std::invalid_argument);
+                             EXPECT_THROW(foreign.defer_startup_restore(capability, counting(calls)), capability_error_t);
+                             std::thread other([&] {
+                               EXPECT_THROW(coordinator.defer_startup_restore(capability, counting(calls)), capability_error_t);
+                             });
+                             other.join();
+                             coordinator.defer_startup_restore(capability, [&](const auto &restore_capability, const auto &) {
+                               EXPECT_TRUE(coordinator.on_worker_thread());
+                               EXPECT_EQ(restore_capability.kind(), command_kind_e::legacy_startup_restore);
+                               for (const auto operation : all_operations) {
+                                 SCOPED_TRACE(to_string(operation));
+                                 if (operation == operation_e::restore_state) {
+                                   EXPECT_NO_THROW(restore_capability.require(operation));
+                                 }
+                                 else {
+                                   EXPECT_THROW(restore_capability.require(operation), capability_error_t);
+                                 }
+                               }
+                               ++calls;
+                             });
+                             EXPECT_THROW(coordinator.defer_startup_restore(capability, counting(calls)), std::logic_error);
+                           })
+        .get()
+        .completed());
+
+    EXPECT_THROW((void) coordinator.run(command_kind_e::legacy_startup_restore, {}), std::invalid_argument);
+    EXPECT_THROW((void) coordinator.post(command_kind_e::legacy_startup_restore, {}), std::invalid_argument);
+    EXPECT_THROW((void) coordinator.post_tracked(command_kind_e::legacy_startup_restore, {}), std::invalid_argument);
+    EXPECT_TRUE(coordinator.run(command_kind_e::shutdown_restore, [&](const auto &capability, const auto &) {
+                             EXPECT_THROW(coordinator.defer_startup_restore(capability, counting(calls)), capability_error_t);
+                             EXPECT_THROW(coordinator.forget_startup_restore(capability), capability_error_t);
+                           })
+        .completed());
+    EXPECT_TRUE(coordinator.retry_startup_restore().completion.get().completed());
+    EXPECT_EQ(calls.load(), 1);
+    EXPECT_FALSE(coordinator.status().startup_restore_pending);
+    EXPECT_EQ(coordinator.retry_startup_restore().reason, reject_reason_e::stale_transaction);
+  }
+
+  TEST(DisplayTopologyCoordinator, StartupRestoreRegistrationRequiresAnExplicitQuiescenceProbe) {
+    for (const bool managed : { false, true }) {
+      SCOPED_TRACE(managed);
+      fake_clock_t clock;
+      coordinator_t coordinator { make_options(clock, managed) };
+      EXPECT_TRUE(coordinator.start([&](const auto &capability, const auto &) {
+                               EXPECT_THROW(coordinator.defer_startup_restore(capability, [](const auto &, const auto &) {}), std::invalid_argument);
+                             })
+          .get()
+          .completed());
+      EXPECT_FALSE(coordinator.status().startup_restore_pending);
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, StartupRestorePendingBlocksManagedButPreservesLegacyMerge) {
+    for (const bool managed : { false, true }) {
+      SCOPED_TRACE(managed);
+      fake_clock_t clock;
+      std::atomic_int attempts {};
+      auto options = make_options(clock, managed);
+      options.probes.startup_restore_quiescent = [] { return true; };
+      coordinator_t coordinator { std::move(options) };
+      ASSERT_TRUE(coordinator.start([&](const auto &capability, const auto &) {
+                               coordinator.defer_startup_restore(capability, [&](const auto &restore_capability, const auto &) {
+                                 restore_capability.require(operation_e::restore_state);
+                                 if (++attempts == 1) throw std::runtime_error { "desktop still locked" };
+                               });
+                             })
+          .get()
+          .completed());
+      EXPECT_TRUE(coordinator.status().startup_restore_pending);
+      const auto launch = coordinator.admit_launch({ 710, "legacy-merge" });
+      if (managed) {
+        EXPECT_FALSE(launch);
+        EXPECT_EQ(launch.reason, reject_reason_e::legacy_restore_pending);
+      }
+      else {
+        ASSERT_TRUE(launch);
+        EXPECT_EQ(coordinator.retry_startup_restore().reason, reject_reason_e::owner_busy);
+        EXPECT_EQ(attempts.load(), 0);
+        ASSERT_TRUE(coordinator.abort_launch(*launch.token, {}));
+      }
+      const auto failed = coordinator.retry_startup_restore().completion.get();
+      EXPECT_EQ(failed.outcome, outcome_e::failed);
+      EXPECT_TRUE(failed.exception);
+      EXPECT_TRUE(coordinator.status().startup_restore_pending);
+      EXPECT_FALSE(coordinator.status().fence_active);
+      EXPECT_TRUE(coordinator.retry_startup_restore().completion.get().completed());
+      EXPECT_EQ(attempts.load(), 2);
+      EXPECT_FALSE(coordinator.status().startup_restore_pending);
+      EXPECT_TRUE(coordinator.admit_launch({ 711, "after-restore" }));
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, StartupRestoreCoalescesAndFencesTheProbeThroughItsObserver) {
+    fake_clock_t clock;
+    gate_t probe;
+    gate_t observer;
+    std::atomic_int calls {};
+    auto options = make_options(clock);
+    options.probes.startup_restore_quiescent = [hold = probe.hook()] { hold(); return true; };
+    options.posted_observer = [hold = observer.hook()](const auto kind, const auto &) {
+      if (kind == command_kind_e::legacy_startup_restore) {
+        hold();
+        throw std::runtime_error { "observer failed after restoration" };
+      }
+    };
+    coordinator_t coordinator { std::move(options) };
+    const finally_t release { [&] { probe.release(); observer.release(); } };
+    ASSERT_TRUE(coordinator.start([&](const auto &capability, const auto &) {
+                             coordinator.defer_startup_restore(capability, counting(calls));
+                           })
+        .get()
+        .completed());
+    const auto before = submitted(coordinator);
+    const auto first = coordinator.retry_startup_restore();
+    ASSERT_TRUE(probe.wait_started());
+    EXPECT_EQ(coordinator.admit_launch({ 712, "during-probe" }).reason, reject_reason_e::fence_active);
+    EXPECT_EQ(coordinator.post(command_kind_e::rotate, counting(calls)), reject_reason_e::fence_active);
+    const auto duplicate = coordinator.retry_startup_restore();
+    EXPECT_EQ(submitted(coordinator), before + 1);
+    EXPECT_EQ(calls.load(), 0);
+    EXPECT_EQ(duplicate.completion.wait_for(0ms), std::future_status::timeout);
+
+    probe.release();
+    ASSERT_TRUE(observer.wait_started());
+    EXPECT_EQ(calls.load(), 1);
+    EXPECT_FALSE(coordinator.status().startup_restore_pending);
+    EXPECT_EQ(coordinator.admit_launch({ 713, "during-observer" }).reason, reject_reason_e::fence_active);
+    const auto observing_duplicate = coordinator.retry_startup_restore();
+    EXPECT_EQ(observing_duplicate.reason, reject_reason_e::none);
+    EXPECT_EQ(submitted(coordinator), before + 1);
+    EXPECT_EQ(observing_duplicate.completion.wait_for(0ms), std::future_status::timeout);
+    EXPECT_EQ(first.completion.wait_for(0ms), std::future_status::timeout);
+    auto independent = coordinator.hold_fence();
+    observer.release();
+    ASSERT_EQ(first.completion.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_EQ(first.completion.get().outcome, outcome_e::failed);
+    EXPECT_EQ(duplicate.completion.get().outcome, outcome_e::failed);
+    EXPECT_EQ(observing_duplicate.completion.get().outcome, outcome_e::failed);
+    EXPECT_FALSE(coordinator.status().startup_restore_pending);
+    EXPECT_EQ(coordinator.admit_launch({ 714, "independent-fence" }).reason, reject_reason_e::fence_active);
+    independent.reset();
+    EXPECT_FALSE(coordinator.status().fence_active);
+    EXPECT_TRUE(coordinator.admit_launch({ 715, "after-observer" }));
+  }
+
+  TEST(DisplayTopologyCoordinator, StartupRestoreRechecksQueuedWorkBeforeEnteringItsBody) {
+    for (const auto expected : { reject_reason_e::owner_busy, reject_reason_e::fence_active,
+           reject_reason_e::draining, reject_reason_e::stale_transaction }) {
+      SCOPED_TRACE(to_string(expected));
+      fake_clock_t clock;
+      gate_t busy;
+      std::atomic_int calls {};
+      auto options = make_options(clock);
+      options.probes.startup_restore_quiescent = [] { return true; };
+      coordinator_t coordinator { std::move(options) };
+      const finally_t release { [&] { busy.release(); } };
+      ASSERT_TRUE(coordinator.start([&](const auto &capability, const auto &) {
+                               coordinator.defer_startup_restore(capability, counting(calls));
+                             })
+          .get()
+          .completed());
+      const bool reset = expected == reject_reason_e::stale_transaction;
+      const auto blocker = coordinator.post_tracked(reset ? command_kind_e::reset_persistence : command_kind_e::rotate,
+        [&, hold = busy.hook()](const auto &capability, const auto &) {
+          hold();
+          if (reset) coordinator.forget_startup_restore(capability);
+        });
+      ASSERT_TRUE(busy.wait_started());
+      const auto retry = coordinator.retry_startup_restore();
+      ASSERT_EQ(retry.reason, reject_reason_e::none);
+      std::shared_ptr<const admission_fence_t> fence;
+      if (expected == reject_reason_e::owner_busy) {
+        ASSERT_TRUE(coordinator.admit_launch({ 716, "queued-race" }));
+      }
+      if (expected == reject_reason_e::fence_active) fence = coordinator.hold_fence();
+      if (expected == reject_reason_e::draining) coordinator.begin_draining();
+      busy.release();
+      ASSERT_EQ(retry.completion.wait_for(real_timeout), std::future_status::ready);
+      EXPECT_EQ(retry.completion.get().reason, expected);
+      EXPECT_EQ(retry.completion.get().outcome, outcome_e::rejected);
+      EXPECT_EQ(calls.load(), 0);
+      EXPECT_EQ(coordinator.status().startup_restore_pending, !reset);
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, StartupRestoreQuiescenceFailureAndExceptionRetainTheObligation) {
+    fake_clock_t clock;
+    std::atomic_int state {};
+    std::atomic_int calls {};
+    auto options = make_options(clock);
+    options.probes.startup_restore_quiescent = [&] {
+      if (state == 1) throw std::runtime_error { "cannot inspect startup work" };
+      return state == 2;
+    };
+    coordinator_t coordinator { std::move(options) };
+    ASSERT_TRUE(coordinator.start([&](const auto &capability, const auto &) {
+                             coordinator.defer_startup_restore(capability, counting(calls));
+                           })
+        .get()
+        .completed());
+    EXPECT_EQ(coordinator.retry_startup_restore().completion.get().reason, reject_reason_e::owner_busy);
+    EXPECT_TRUE(coordinator.status().startup_restore_pending);
+    EXPECT_FALSE(coordinator.status().fence_active);
+    state = 1;
+    const auto failed = coordinator.retry_startup_restore().completion.get();
+    EXPECT_EQ(failed.outcome, outcome_e::failed);
+    EXPECT_TRUE(failed.exception);
+    EXPECT_EQ(calls.load(), 0);
+    EXPECT_TRUE(coordinator.status().startup_restore_pending);
+    EXPECT_FALSE(coordinator.status().fence_active);
+    state = 2;
+    EXPECT_TRUE(coordinator.retry_startup_restore().completion.get().completed());
+    EXPECT_EQ(calls.load(), 1);
+  }
+
+  TEST(DisplayTopologyCoordinator, StartupRestoreRechecksFencesAfterItsUnlockedQuiescenceProbe) {
+    fake_clock_t clock;
+    gate_t probe;
+    std::atomic_int calls {};
+    auto options = make_options(clock);
+    options.probes.startup_restore_quiescent = [hold = probe.hook()] { hold(); return true; };
+    coordinator_t coordinator { std::move(options) };
+    std::future<std::shared_ptr<const admission_fence_t>> installing;
+    const finally_t release { [&] { probe.release(); } };
+    ASSERT_TRUE(coordinator.start([&](const auto &capability, const auto &) {
+                             coordinator.defer_startup_restore(capability, counting(calls));
+                           })
+        .get()
+        .completed());
+    const auto retry = coordinator.retry_startup_restore();
+    ASSERT_TRUE(probe.wait_started());
+    installing = std::async(std::launch::async, [&] { return coordinator.hold_fence(); });
+    ASSERT_EQ(installing.wait_for(real_timeout), std::future_status::ready) << "quiescence probe held the coordinator mutex";
+    auto independent = installing.get();
+    probe.release();
+    ASSERT_EQ(retry.completion.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_EQ(retry.completion.get().reason, reject_reason_e::fence_active);
+    EXPECT_EQ(calls.load(), 0);
+    EXPECT_TRUE(coordinator.status().startup_restore_pending);
+    independent.reset();
+    EXPECT_FALSE(coordinator.status().fence_active);
+    EXPECT_TRUE(coordinator.retry_startup_restore().completion.get().completed());
+    EXPECT_EQ(calls.load(), 1);
+  }
+
+  TEST(DisplayTopologyCoordinator, ForgettingStartupRestoreDestroysCapturesOutsideTheCoordinatorLock) {
+    fake_clock_t clock;
+    auto options = make_options(clock);
+    options.probes.startup_restore_quiescent = [] { return true; };
+    coordinator_t coordinator { std::move(options) };
+    std::atomic_bool destroyed {};
+    std::weak_ptr<int> weak;
+    ASSERT_TRUE(coordinator.start([&](const auto &capability, const auto &) {
+                             auto capture = std::shared_ptr<int>(new int {}, [&](int *value) {
+                               EXPECT_FALSE(coordinator.status().startup_restore_pending);
+                               destroyed = true;
+                               delete value;
+                             });
+                             weak = capture;
+                             coordinator.defer_startup_restore(capability, [capture](const auto &, const auto &) {});
+                           })
+        .get()
+        .completed());
+    ASSERT_FALSE(weak.expired());
+    const auto reset = coordinator.post_tracked(command_kind_e::reset_persistence, [&](const auto &capability, const auto &) {
+      coordinator.forget_startup_restore(capability);
+    });
+    ASSERT_EQ(reset.completion.wait_for(real_timeout), std::future_status::ready) << "capture destructor deadlocked on status()";
+    EXPECT_TRUE(reset.completion.get().completed());
+    EXPECT_TRUE(destroyed.load());
+    EXPECT_TRUE(weak.expired());
+    EXPECT_FALSE(coordinator.status().startup_restore_pending);
+  }
+
+  TEST(DisplayTopologyCoordinator, StoppingSettlesAnUnstartedStartupRestoreWithoutEnteringItsBody) {
+    fake_clock_t clock;
+    gate_t busy;
+    std::atomic_int calls {};
+    auto options = make_options(clock);
+    options.probes.startup_restore_quiescent = [] { return true; };
+    coordinator_t coordinator { std::move(options) };
+    std::future<void> stopping;
+    const finally_t release { [&] { busy.release(); } };
+    ASSERT_TRUE(coordinator.start([&](const auto &capability, const auto &) {
+                             coordinator.defer_startup_restore(capability, counting(calls));
+                           })
+        .get()
+        .completed());
+    coordinator.post(command_kind_e::rotate, busy.body());
+    ASSERT_TRUE(busy.wait_started());
+    const auto retry = coordinator.retry_startup_restore();
+    stopping = std::async(std::launch::async, [&] { coordinator.stop(); });
+    ASSERT_TRUE(wait_until([&] { return coordinator.status().phase == coordinator_phase_e::stopped; }));
+    busy.release();
+    stopping.get();
+    ASSERT_EQ(retry.completion.wait_for(0ms), std::future_status::ready);
+    EXPECT_EQ(retry.completion.get().outcome, outcome_e::stopped);
+    EXPECT_EQ(calls.load(), 0);
+    EXPECT_FALSE(coordinator.status().startup_restore_pending);
+    EXPECT_FALSE(coordinator.status().fence_active);
+    EXPECT_EQ(coordinator.retry_startup_restore().reason, reject_reason_e::stopped);
+  }
+
+  TEST(DisplayTopologyCoordinator, StartupRestoreReleasesThePreviousFailureOutsideTheCoordinatorLock) {
+    struct failure_t: std::runtime_error {
+      explicit failure_t(std::shared_ptr<int> state):
+          std::runtime_error { "deferred" }, state { std::move(state) } {}
+      std::shared_ptr<int> state;
+    };
+    fake_clock_t clock;
+    std::atomic_int attempts {};
+    std::atomic_bool destroyed {};
+    auto options = make_options(clock);
+    options.probes.startup_restore_quiescent = [] { return true; };
+    coordinator_t coordinator { std::move(options) };
+    ASSERT_TRUE(coordinator.start([&](const auto &capability, const auto &) {
+                             coordinator.defer_startup_restore(capability, [&](const auto &, const auto &) {
+                               if (++attempts == 1) {
+                                 throw failure_t { std::shared_ptr<int>(new int {}, [&](int *value) {
+                                   (void) coordinator.status();
+                                   destroyed = true;
+                                   delete value;
+                                 }) };
+                               }
+                             });
+                           })
+        .get()
+        .completed());
+    {
+      const auto first = coordinator.retry_startup_restore();
+      EXPECT_EQ(first.completion.get().outcome, outcome_e::failed);
+    }
+    ASSERT_TRUE(flush(coordinator).completed());
+    EXPECT_FALSE(destroyed.load());
+    auto retry = std::async(std::launch::async, [&] { return coordinator.retry_startup_restore(); });
+    ASSERT_EQ(retry.wait_for(real_timeout), std::future_status::ready) << "previous exception destructor deadlocked on status()";
+    EXPECT_TRUE(retry.get().completion.get().completed());
+    EXPECT_TRUE(destroyed.load());
+    EXPECT_EQ(attempts.load(), 2);
   }
 
   TEST(DisplayTopologyCoordinator, StartupFutureBecomesReadyOnItsOwn) {
@@ -1146,7 +1500,8 @@ namespace {
     ASSERT_TRUE(coordinator.admit_launch({ 61, "cert:a" }));
 
     for (const auto command : all_kinds) {
-      if (command == command_kind_e::startup_recovery || command == command_kind_e::launch_prepare) {
+      if (command == command_kind_e::startup_recovery || command == command_kind_e::legacy_startup_restore ||
+          command == command_kind_e::launch_prepare) {
         continue;
       }
       const auto expected = expected_cleanup_kinds.contains(command) ? reject_reason_e::none : reject_reason_e::managed_session;
@@ -1154,7 +1509,8 @@ namespace {
     }
     ASSERT_TRUE(flush(coordinator).completed());
     for (const auto command : all_kinds) {
-      if (command == command_kind_e::startup_recovery || command == command_kind_e::launch_prepare) {
+      if (command == command_kind_e::startup_recovery || command == command_kind_e::legacy_startup_restore ||
+          command == command_kind_e::launch_prepare) {
         continue;
       }
       EXPECT_EQ(calls[command].load(), expected_cleanup_kinds.contains(command) ? 1 : 0) << to_string(command);
@@ -1169,13 +1525,14 @@ namespace {
     ASSERT_TRUE(coordinator.admit_launch({ 62, "cert:a" }));
 
     for (const auto command : all_kinds) {
-      if (command == command_kind_e::startup_recovery || command == command_kind_e::launch_prepare) {
+      if (command == command_kind_e::startup_recovery || command == command_kind_e::legacy_startup_restore ||
+          command == command_kind_e::launch_prepare) {
         continue;
       }
       EXPECT_EQ(coordinator.post(command, counting(calls)), reject_reason_e::none) << to_string(command);
     }
     ASSERT_TRUE(flush(coordinator).completed());
-    EXPECT_EQ(calls.load(), static_cast<int>(all_kinds.size()) - 2);
+    EXPECT_EQ(calls.load(), static_cast<int>(all_kinds.size()) - 3);
   }
 
   TEST(DisplayTopologyCoordinator, WorkerReevaluatesPolicyBeforeRunningAQueuedBody) {

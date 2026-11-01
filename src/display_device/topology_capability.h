@@ -20,6 +20,7 @@ namespace display_device::topology {
 
   enum class command_kind_e : std::uint8_t {
     startup_recovery,
+    legacy_startup_restore,
     launch_prepare,
     launch_failed_restore,
     reconfigure,
@@ -63,7 +64,8 @@ namespace display_device::topology {
    * @brief Whether bodies of `kind` may perform `operation` in the given mode.
    * @details In managed mode the legacy whole-state operations (`configure_display`,
    *          `restore_state`) are refused for every kind except startup recovery,
-   *          which still recovers legacy state persisted by an earlier legacy run.
+   *          and its registered `legacy_startup_restore` continuation, which recover
+   *          legacy state persisted by an earlier legacy run.
    */
   bool
   kind_allows(command_kind_e kind, operation_e operation, bool managed_mode) noexcept;

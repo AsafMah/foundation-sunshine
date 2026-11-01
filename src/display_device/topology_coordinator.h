@@ -168,6 +168,7 @@ namespace display_device::topology {
     std::uint64_t native_restores_posted {};
     /** Commands handed to the worker queue so far (including startup recovery). */
     std::uint64_t submitted_commands {};
+    bool startup_restore_pending {};
   };
 
   using command_body_t = std::function<void(const mutation_capability_t &, const command_context_t &)>;
@@ -214,6 +215,13 @@ namespace display_device::topology {
     std::function<std::size_t()> active_streams;
     /** Whether a legacy restore is still deferred (for example until unlock). */
     std::function<bool()> legacy_restore_pending;
+    /**
+     * Whether NVHTTP preparation, pending/claimed tickets and all startup/active
+     * sessions are quiescent. Required when registering a startup continuation;
+     * video count alone is insufficient. Queried on the worker under admission
+     * exclusion, but without the coordinator mutex. Teardown must remain fenced.
+     */
+    std::function<bool()> startup_restore_quiescent;
   };
 
   struct coordinator_options_t {
@@ -259,9 +267,31 @@ namespace display_device::topology {
     start(command_body_t recovery);
 
     /**
+     * Register one immutable legacy restore continuation during initial startup.
+     * It owns all captured state until restored, explicitly forgotten, or stopped.
+     * Normal return means fully restored; an exception retains the obligation.
+     * Only the initial startup worker/capability can register it, once.
+     */
+    void
+    defer_startup_restore(const mutation_capability_t &capability, command_body_t restore);
+
+    /**
+     * Retry only the registered continuation, with narrowly scoped authority.
+     * An in-flight attempt is coalesced. Pending restore blocks managed admission,
+     * not the approved legacy merge; an executing attempt fences all admission
+     * through its posted observer. Never wait for its receipt on the worker.
+     */
+    posted_command_t
+    retry_startup_restore();
+
+    /** Explicit reset only: forget the obligation without performing restoration. */
+    void
+    forget_startup_restore(const mutation_capability_t &capability);
+
+    /**
      * @brief Submit a command and wait for it.
-     * @throws std::invalid_argument for `startup_recovery` and `launch_prepare`, which have
-     *         dedicated entry points.
+     * @throws std::invalid_argument for `startup_recovery`, `legacy_startup_restore`
+     *         and `launch_prepare`, which have dedicated entry points.
      */
     command_result_t
     run(command_kind_e kind, command_body_t body);
@@ -269,7 +299,7 @@ namespace display_device::topology {
     /**
      * @brief Submit a command without waiting. Allowed from the worker thread.
      * @return `none` when accepted, otherwise the eager rejection reason.
-     * @throws std::invalid_argument for `startup_recovery` and `launch_prepare`.
+     * @throws std::invalid_argument for kinds with dedicated entry points.
      */
     reject_reason_e
     post(command_kind_e kind, command_body_t body);
@@ -430,6 +460,7 @@ namespace display_device::topology {
   private:
     struct command_state_t;
     struct startup_signal_t;
+    struct startup_restore_t;
 
     enum class prepare_mode_e {
       not_submitted,
@@ -479,6 +510,9 @@ namespace display_device::topology {
 
     bool
     fence_active_locked();
+
+    bool
+    external_fence_active_locked();
 
     topology_command_queue_t::task_t
     make_task(command_kind_e kind, std::shared_ptr<command_state_t> state, command_body_t body,
@@ -552,6 +586,9 @@ namespace display_device::topology {
     mutable std::mutex mutex_;
     coordinator_phase_e phase_ { coordinator_phase_e::not_started };
     bool stopping_ {};
+    std::shared_ptr<startup_restore_t> startup_restore_;
+    std::shared_ptr<startup_restore_t> startup_restore_inflight_;
+    bool startup_restore_attempt_active_ {};
     std::unique_ptr<topology_command_queue_t> queue_;
     std::uint64_t queue_generation_ {};
     std::optional<lease_t> lease_;

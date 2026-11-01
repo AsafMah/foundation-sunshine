@@ -13,6 +13,8 @@ namespace display_device::topology {
     switch (kind) {
       case command_kind_e::startup_recovery:
         return "startup_recovery";
+      case command_kind_e::legacy_startup_restore:
+        return "legacy_startup_restore";
       case command_kind_e::launch_prepare:
         return "launch_prepare";
       case command_kind_e::launch_failed_restore:
@@ -87,6 +89,8 @@ namespace display_device::topology {
       switch (kind) {
         case command_kind_e::startup_recovery:
           return operation == native_recover || operation == restore_state;
+        case command_kind_e::legacy_startup_restore:
+          return operation == restore_state;
         case command_kind_e::launch_prepare:
           return operation == configure_display || operation == restore_state || operation == native_apply;
         case command_kind_e::launch_failed_restore:
@@ -131,7 +135,8 @@ namespace display_device::topology {
     if (!table_allows(kind, operation)) {
       return false;
     }
-    if (managed_mode && legacy_whole_state(operation) && kind != command_kind_e::startup_recovery) {
+    if (managed_mode && legacy_whole_state(operation) &&
+        kind != command_kind_e::startup_recovery && kind != command_kind_e::legacy_startup_restore) {
       return false;
     }
     return true;

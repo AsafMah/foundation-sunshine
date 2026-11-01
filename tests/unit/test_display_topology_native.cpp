@@ -369,6 +369,7 @@ namespace {
   with_capability(dt::command_kind_e kind, const std::function<void(const dt::mutation_capability_t &)> &body, bool managed_mode = false) {
     dt::coordinator_options_t options;
     options.managed_mode = managed_mode;
+    options.probes.startup_restore_quiescent = [] { return true; };
     if (managed_mode) {
       options.probes.active_streams = [] { return std::size_t {}; };
       options.native_restore = [](const auto &, const auto &) {};
@@ -387,6 +388,13 @@ namespace {
     };
     if (kind == dt::command_kind_e::startup_recovery) {
       coordinator.start(wrapped).get();
+    }
+    else if (kind == dt::command_kind_e::legacy_startup_restore) {
+      coordinator.start([&](const auto &capability, const auto &) {
+                   coordinator.defer_startup_restore(capability, wrapped);
+                 })
+        .get();
+      coordinator.retry_startup_restore().completion.get();
     }
     else {
       coordinator.start([](const dt::mutation_capability_t &, const dt::command_context_t &) {}).get();
@@ -692,7 +700,7 @@ TEST_F(NativeExecutor, EveryEntryPointRequiresItsOwnCapability) {
 
 TEST_F(NativeExecutor, PlatformBoundaryChecksEveryCommandKindBeforeEnteringTheBackend) {
   using enum dt::command_kind_e;
-  const std::vector kinds { startup_recovery, launch_prepare, launch_failed_restore, reconfigure,
+  const std::vector kinds { startup_recovery, legacy_startup_restore, launch_prepare, launch_failed_restore, reconfigure,
     stream_restore, shutdown_restore, shutdown_vdd_destroy, rotate, scale, vdd_toggle,
     vdd_toggle_followup, vdd_create, vdd_destroy, reset_persistence, legacy_retry_tick,
     legacy_unlock_restore, native_restore };

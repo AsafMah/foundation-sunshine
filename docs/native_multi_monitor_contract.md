@@ -339,7 +339,7 @@ preparation authority; same-command failed-create rollback remains possible.
 Startup can replay fields, but cannot create or remove heads; P1 preparation
 cannot write host fields. Executor helpers preserve the same capability through
 creation, rollback, restore and recovery, without changing ownership proofs.
-Four fake-backed fixtures cover all 17 command kinds, three mutation surfaces
+Four fake-backed fixtures cover all 18 command kinds, three mutation surfaces
 and both modes, off-worker rejection, absence of ungated public overloads and
 actual executor forwarding. They fail against the former ungated interface and
 under 13 deliberate faults; all 85 native-suite cases pass after restoration.
@@ -353,6 +353,26 @@ waiter thread on every command. Accepted commands notify the observer exactly
 once, including commands whose body never ran. Observer failures are exposed
 through the receipt. A launch-ticket presence query is also implemented and
 tested.
+
+Deferred legacy startup restoration has a dedicated, restricted continuation.
+Only the initial startup worker can register its immutable callback; ordinary
+run/post routes cannot supply a replacement body. It can restore legacy state,
+not configure displays, invoke native recovery or create/destroy heads. Pending
+restoration blocks managed admission, while preserving the approved legacy
+locked-desktop baseline merge. An attempt excludes admission before an unlocked
+probe of all preparation/ticket/startup/session activity, then rechecks ownership,
+phase and independent fences. Exclusion and coalesced receipts last through the
+posted observer, including observer failure after successful restoration.
+Failure retains the obligation; explicit reset invalidates queued attempts.
+Callback captures and previous failed receipts are released outside the mutex.
+
+Ten new fake-backed cases bring the coordinator target to 138 tests. Twenty-seven
+deliberate faults fail the intended assertions, including two bounded deadlock
+mutations. The expanded native-boundary matrix rejects the continuation at all
+three native mutation surfaces in both modes and catches deliberately broadened
+authority. These checks do not wire production startup recovery or its retry
+timer: the runtime must supply the complete activity probe and preserve the
+teardown fence from slot removal through cleanup submission.
 
 The neutral retry scheduler now pairs each attempt with a distinct generation,
 waits for its receipt, and re-arms failed/rejected work unless shutdown prevents
@@ -541,6 +561,9 @@ User-confirmed P1 decisions:
   adapter. Native multi-monitor profiles keep strict resolution.
 - After a crash or interrupted change, recovery of the unfinished journaled
   change completes before any new stream start or display change is admitted.
+  The approved legacy exception permits a locked-desktop launch to inherit/merge
+  its pending legacy restore baseline; it does not permit managed admission
+  before that legacy restoration completes.
 - When a stream-start ticket expires or is cancelled, the monitor command tied
   to that ticket is cancelled by its own handle; unrelated queued work in the
   same generation continues.
