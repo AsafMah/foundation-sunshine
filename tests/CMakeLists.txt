@@ -237,6 +237,18 @@ if (WIN32)
     add_test(NAME sunshinesvc_log_unit_tests COMMAND sunshinesvc_log_unit_tests)
 endif ()
 
+if (WIN32)
+    add_executable(windows_owned_process_unit_tests
+            ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_owned_process.cpp)
+    target_include_directories(windows_owned_process_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(windows_owned_process_unit_tests PRIVATE gtest_main sunshine::host_headers
+            Boost::log Boost::filesystem sunshine_project_options sunshine_coverage)
+    target_compile_definitions(windows_owned_process_unit_tests PRIVATE ${SUNSHINE_DEFINITIONS})
+    set_target_properties(windows_owned_process_unit_tests PROPERTIES CXX_STANDARD 23 LINK_SEARCH_START_STATIC 1)
+    add_test(NAME windows_owned_process_unit_tests COMMAND windows_owned_process_unit_tests)
+    set_tests_properties(windows_owned_process_unit_tests PROPERTIES TIMEOUT 15)
+endif ()
+
 add_executable(video_probe_unit_tests
         ${CMAKE_SOURCE_DIR}/tests/unit/test_video_probe.cpp)
 target_include_directories(video_probe_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")

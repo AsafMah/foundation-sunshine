@@ -469,8 +469,19 @@ Six fake-backed cases cover current-body rollback, every cleanup kind, draining,
 invalid/duplicate acquisition, independent owners and off-worker release after
 stop/destruction. EM1-EM10 assertion-kill their intended faults; the restored
 coordinator suite has 146 cases. Stop cancels the queue; it does not prove an
-external process settled. The actual adapter-process supervisor, original-handle
-handoff and retained cleanup/restart-recovery obligations remain unwired.
+external process settled. The actual adapter-process supervisor and retained
+cleanup/restart-recovery obligations remain unwired.
+
+The Windows launcher now has an opt-in, thread-confined original-handle owner.
+It shares the existing token, environment and command-resolution policy while
+retaining both creation handles before post-create scopes can fail. The legacy
+API still delegates to its existing Boost result bridge. Native observations
+preserve handles on timeout/error and distinguish a process signal from exit
+code availability; 259 is a valid exit code after a signal. Eight actual-policy
+cases with fake process/token/kernel edges pass, and OP1-OP20 assertion-kill
+their intended faults. Both production launcher objects compile. No adapter
+caller uses this API yet: it neither bounds synchronous launch nor supplies
+crash recovery, cleanup retention or a topology fence by itself.
 
 The neutral probe supervisor now runs a separately owned probe thread under the
 recorded absolute setup deadline. An independent watchdog covers construction
