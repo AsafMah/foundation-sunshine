@@ -320,6 +320,21 @@ namespace display_device::topology {
     run_launch_prepare(const launch_token_t &token, command_body_t body, command_body_t legacy_expiry_cleanup = {});
 
     /**
+     * Run one mutation in a staged setup, using the original deadline and owner token.
+     * Steps must complete successfully and sequentially; they cannot mix with one-shot
+     * preparation or resume after sealing. Off-worker probes hold a probe fence between
+     * steps. Supply legacy cleanup only on the first step; it remains the rollback
+     * obligation for abort/expiry if any step started, even when a later step did not.
+     * @throws std::invalid_argument if a continuation supplies replacement cleanup.
+     */
+    command_result_t
+    run_launch_step(const launch_token_t &token, command_body_t body, command_body_t legacy_expiry_cleanup = {});
+
+    /** Seal successful staged preparation after probes end, before atomic ticket binding. */
+    bool
+    finish_launch_prepare(const launch_token_t &token);
+
+    /**
      * @brief Mark the launch's ticket as registered. Called once the handler succeeded.
      * @return false unless `token` identifies a preparing reference, its recorded deadline
      *         has not expired, and the coordinator is running. An owner also needs a
@@ -331,10 +346,13 @@ namespace display_device::topology {
     /**
      * @brief Release a preparing launch and post its cleanup atomically.
      * @details Cancels the launch's own prepare command if it is still queued or running;
-     *          the cleanup runs after it. A managed lease always posts the native restore
-     *          (a no-op when nothing was applied). A legacy lease posts `legacy_cleanup`
+     *          the cleanup runs after it. A one-shot managed lease always posts the native
+     *          restore (a no-op when nothing was applied). A legacy lease posts `legacy_cleanup`
      *          when it is set.
+     *          Staged setup instead uses its first step's registered cleanup, and only
+     *          restores if at least one step started; pass an empty legacy_cleanup.
      * @return false (and nothing posted) unless `token` is the current preparing launch.
+     * @throws std::invalid_argument for replacement cleanup on a staged transaction.
      */
     bool
     abort_launch(const launch_token_t &token, command_body_t legacy_cleanup);
@@ -405,6 +423,12 @@ namespace display_device::topology {
     struct command_state_t;
     struct startup_signal_t;
 
+    enum class prepare_mode_e {
+      not_submitted,
+      one_shot,
+      staged,
+    };
+
     struct attachment_t {
       std::uint64_t serial {};
       std::uint32_t launch_session_id {};
@@ -419,7 +443,9 @@ namespace display_device::topology {
       lease_stage_e stage { lease_stage_e::preparing };
       std::string client_key;
       monotonic_time_t setup_deadline {};
-      bool prepare_submitted {};
+      prepare_mode_e prepare_mode { prepare_mode_e::not_submitted };
+      bool step_completed {};
+      bool prepare_started {};
       std::optional<command_handle_t> prepare_handle;
       std::shared_ptr<command_state_t> prepare_state;
       std::shared_ptr<command_state_t> restore_state;
@@ -433,6 +459,9 @@ namespace display_device::topology {
     };
 
     using submission_t = command_submission_t;
+
+    command_result_t
+    run_prepare(const launch_token_t &token, command_body_t body, command_body_t legacy_expiry_cleanup, prepare_mode_e mode);
 
     reject_reason_e
     evaluate_locked(command_kind_e kind, std::optional<std::uint64_t> transaction, bool legacy_restore_pending);

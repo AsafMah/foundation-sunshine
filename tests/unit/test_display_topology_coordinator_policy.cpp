@@ -2250,6 +2250,330 @@ namespace {
     EXPECT_FALSE(coordinator.status().fence_active);
   }
 
+  TEST(DisplayTopologyCoordinator, StagedPrepareRequiresExplicitCompletionBeforeBinding) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto launch = coordinator.admit_launch({ 430, "staged" });
+    ASSERT_TRUE(launch);
+    EXPECT_FALSE(coordinator.finish_launch_prepare(*launch.token));
+    ASSERT_TRUE(coordinator.run_launch_step(*launch.token, {}).completed());
+    EXPECT_FALSE(coordinator.bind_launch(*launch.token))
+      << "a mutation step alone must not publish the unprobed launch";
+    ASSERT_TRUE(coordinator.finish_launch_prepare(*launch.token));
+    EXPECT_FALSE(coordinator.finish_launch_prepare(*launch.token));
+    EXPECT_TRUE(coordinator.bind_launch(*launch.token));
+  }
+
+  TEST(DisplayTopologyCoordinator, StagedFallbackRunsBetweenSupervisedOffWorkerProbes) {
+    fake_clock_t clock;
+    event_log_t log;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto launch = coordinator.admit_launch({ 431, "fallback" });
+    ASSERT_TRUE(launch);
+    std::shared_ptr<const probe_fence_t> probe;
+    std::thread::id mutation_thread;
+    ASSERT_TRUE(coordinator.run_launch_step(*launch.token, [&](const auto &, const auto &) {
+      mutation_thread = std::this_thread::get_id();
+      log.add("configure");
+      probe = coordinator.hold_probe_fence(); }, logging(log, "rollback")).completed());
+    gate_t probing;
+    auto result = std::async(std::launch::async, [&, guard = std::move(probe)]() mutable {
+      EXPECT_NE(std::this_thread::get_id(), mutation_thread);
+      log.add("probe");
+      probing.hook()();
+      log.add("probe teardown");
+      guard.reset();
+    });
+    const finally_t release { [&]() { probing.release(); } };
+    ASSERT_TRUE(probing.wait_started());
+    EXPECT_FALSE(coordinator.finish_launch_prepare(*launch.token));
+    EXPECT_FALSE(coordinator.bind_launch(*launch.token));
+    EXPECT_EQ(coordinator.run_launch_step(*launch.token, {}).reason, reject_reason_e::fence_active);
+    const auto cleanup = coordinator.post_tracked(command_kind_e::stream_restore, logging(log, "cleanup"));
+    EXPECT_EQ(cleanup.completion.wait_for(50ms), std::future_status::timeout);
+    probing.release();
+    result.get();
+    EXPECT_TRUE(cleanup.completion.get().completed());
+    ASSERT_TRUE(coordinator.run_launch_step(*launch.token, [&](const auto &, const auto &) {
+                             EXPECT_EQ(std::this_thread::get_id(), mutation_thread);
+                             log.add("fallback configure");
+                             probe = coordinator.hold_probe_fence();
+                           })
+        .completed());
+    EXPECT_FALSE(coordinator.finish_launch_prepare(*launch.token));
+    probe.reset();
+    ASSERT_TRUE(coordinator.finish_launch_prepare(*launch.token));
+    EXPECT_TRUE(coordinator.bind_launch(*launch.token));
+    EXPECT_EQ(log.events(), (std::vector<std::string> {
+                              "configure", "probe", "probe teardown", "cleanup", "fallback configure" }));
+  }
+
+  TEST(DisplayTopologyCoordinator, StagedStepsShareTheOriginalDeadlineAndCleanup) {
+    for (const bool managed : { false, true }) {
+      fake_clock_t clock;
+      std::atomic_int restores {}, mutations {};
+      auto options = make_options(clock, managed);
+      if (managed) options.native_restore = counting(restores);
+      coordinator_t coordinator { options };
+      ASSERT_TRUE(start_ready(coordinator).completed());
+      const auto launch = coordinator.admit_launch({ 432, "deadline" });
+      ASSERT_TRUE(launch);
+      ASSERT_TRUE(coordinator.run_launch_step(*launch.token, counting(mutations), counting(restores)).completed());
+      clock.advance(999ms);
+      auto forged = *launch.token;
+      forged.setup_deadline += 1h;
+      ASSERT_TRUE(coordinator.run_launch_step(forged, counting(mutations)).completed());
+      clock.advance(1ms);
+      EXPECT_FALSE(coordinator.finish_launch_prepare(forged));
+      EXPECT_FALSE(coordinator.bind_launch(forged));
+      EXPECT_FALSE(coordinator.status().lease);
+      EXPECT_EQ(coordinator.run_launch_step(forged, counting(mutations)).reason, reject_reason_e::stale_transaction);
+      ASSERT_TRUE(flush(coordinator).completed());
+      EXPECT_EQ(mutations.load(), 2);
+      EXPECT_EQ(restores.load(), 1);
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, StagedTerminationRestoresEarlierMutationWhenLatestStepNeverStarted) {
+    for (const bool managed : { false, true }) {
+      for (const bool expiry : { false, true }) {
+        SCOPED_TRACE(::testing::Message() << "managed=" << managed << ", expiry=" << expiry);
+        fake_clock_t clock;
+        event_log_t log;
+        auto options = make_options(clock, managed);
+        if (managed) options.native_restore = logging(log, "restore");
+        coordinator_t coordinator { options };
+        ASSERT_TRUE(start_ready(coordinator).completed());
+        const auto launch = coordinator.admit_launch({ 433, "queued continuation" });
+        ASSERT_TRUE(launch);
+        ASSERT_TRUE(coordinator.run_launch_step(*launch.token, logging(log, "first"), logging(log, "restore")).completed());
+        gate_t blocker;
+        const auto blocking = coordinator.post_tracked(command_kind_e::stream_restore, blocker.body());
+        ASSERT_TRUE(blocker.wait_started());
+        const auto before = submitted(coordinator);
+        auto step = std::async(std::launch::async, [&]() {
+          return coordinator.run_launch_step(*launch.token, logging(log, "never"));
+        });
+        const finally_t release { [&]() { blocker.release(); } };
+        ASSERT_TRUE(wait_until([&]() { return submitted(coordinator) == before + 1; }));
+        const auto unrelated = coordinator.post_tracked(command_kind_e::stream_restore, logging(log, "unrelated"));
+        if (expiry) {
+          clock.advance(1000ms);
+          coordinator.tick();
+        }
+        else {
+          EXPECT_TRUE(coordinator.abort_launch(*launch.token, {}));
+        }
+        EXPECT_FALSE(coordinator.abort_launch(*launch.token, {}));
+        EXPECT_FALSE(coordinator.status().lease);
+        const auto next = coordinator.admit_launch({ 434, "replacement" });
+        ASSERT_TRUE(next);
+        blocker.release();
+        EXPECT_EQ(step.get().outcome, expiry ? outcome_e::expired_before_start : outcome_e::cancelled);
+        EXPECT_TRUE(blocking.completion.get().completed());
+        EXPECT_TRUE(unrelated.completion.get().completed());
+        ASSERT_TRUE(coordinator.run_launch_step(*next.token, logging(log, "next")).completed());
+        EXPECT_EQ(log.events(), (std::vector<std::string> { "first", "unrelated", "restore", "next" }));
+      }
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, ConcurrentStagedStepCannotRunOrSealAndSealedStepsCannotResume) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto launch = coordinator.admit_launch({ 435, "concurrent" });
+    ASSERT_TRUE(launch);
+    ASSERT_TRUE(coordinator.run_launch_step(*launch.token, {}).completed());
+    gate_t worker;
+    auto running = std::async(std::launch::async, [&]() {
+      return coordinator.run_launch_step(*launch.token, worker.body());
+    });
+    const finally_t release { [&]() { worker.release(); } };
+    ASSERT_TRUE(worker.wait_started());
+    std::atomic_int unexpected {};
+    auto competing = std::async(std::launch::async, [&]() {
+      return coordinator.run_launch_step(*launch.token, counting(unexpected));
+    });
+    EXPECT_EQ(competing.wait_for(real_timeout), std::future_status::ready)
+      << "a concurrent step must reject without waiting on the in-flight mutation";
+    EXPECT_FALSE(coordinator.finish_launch_prepare(*launch.token));
+    EXPECT_FALSE(coordinator.bind_launch(*launch.token));
+    worker.release();
+    EXPECT_TRUE(running.get().completed());
+    EXPECT_EQ(competing.get().reason, reject_reason_e::stale_transaction);
+    ASSERT_TRUE(coordinator.finish_launch_prepare(*launch.token));
+    EXPECT_EQ(coordinator.run_launch_step(*launch.token, counting(unexpected)).reason, reject_reason_e::stale_transaction);
+    EXPECT_EQ(unexpected.load(), 0);
+    EXPECT_TRUE(coordinator.bind_launch(*launch.token));
+    EXPECT_EQ(coordinator.run_launch_step(*launch.token, counting(unexpected)).reason, reject_reason_e::stale_transaction);
+  }
+
+  TEST(DisplayTopologyCoordinator, FailedStagedStepCannotContinueOrSealAndStillRestores) {
+    fake_clock_t clock;
+    std::atomic_int restores {};
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto launch = coordinator.admit_launch({ 436, "failed continuation" });
+    ASSERT_TRUE(launch);
+    ASSERT_TRUE(coordinator.run_launch_step(*launch.token, {}, counting(restores)).completed());
+    const auto result = coordinator.run_launch_step(*launch.token, [](const auto &, const auto &) {
+      throw std::runtime_error { "fallback mutation failed" };
+    });
+    EXPECT_EQ(result.outcome, outcome_e::failed);
+    ASSERT_TRUE(result.exception);
+    EXPECT_FALSE(coordinator.finish_launch_prepare(*launch.token));
+    EXPECT_FALSE(coordinator.bind_launch(*launch.token));
+    EXPECT_EQ(coordinator.run_launch_step(*launch.token, {}).reason, reject_reason_e::stale_transaction);
+    EXPECT_TRUE(coordinator.abort_launch(*launch.token, {}));
+    ASSERT_TRUE(flush(coordinator).completed());
+    EXPECT_EQ(restores.load(), 1);
+  }
+
+  TEST(DisplayTopologyCoordinator, StagedAndOneShotPreparationCannotBeMixed) {
+    for (const bool staged_first : { false, true }) {
+      fake_clock_t clock;
+      coordinator_t coordinator { make_options(clock) };
+      ASSERT_TRUE(start_ready(coordinator).completed());
+      const auto launch = coordinator.admit_launch({ 437, "mode" });
+      ASSERT_TRUE(launch);
+      if (staged_first) {
+        ASSERT_TRUE(coordinator.run_launch_step(*launch.token, {}).completed());
+        EXPECT_EQ(coordinator.run_launch_prepare(*launch.token, {}).reason, reject_reason_e::stale_transaction);
+        EXPECT_TRUE(coordinator.finish_launch_prepare(*launch.token));
+      }
+      else {
+        ASSERT_TRUE(coordinator.run_launch_prepare(*launch.token, {}).completed());
+        EXPECT_EQ(coordinator.run_launch_step(*launch.token, {}).reason, reject_reason_e::stale_transaction);
+        EXPECT_FALSE(coordinator.finish_launch_prepare(*launch.token));
+        EXPECT_EQ(coordinator.run_launch_prepare(*launch.token, {}).reason, reject_reason_e::stale_transaction);
+      }
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, StagedStepAndFinishRequireFullOwnerTokenNotJoinToken) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock, true) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto launch = coordinator.admit_launch({ 438, "owner" });
+    ASSERT_TRUE(launch);
+    ASSERT_TRUE(coordinator.run_launch_step(*launch.token, {}).completed());
+    auto wrong_transaction = *launch.token;
+    ++wrong_transaction.transaction;
+    auto wrong_id = *launch.token;
+    ++wrong_id.launch_session_id;
+    auto wrong_flavor = *launch.token;
+    wrong_flavor.flavor = launch_flavor_e::legacy;
+    auto wrong_serial = *launch.token;
+    ++wrong_serial.attachment_serial;
+    std::atomic_int mutations {};
+    for (const auto &token : { wrong_transaction, wrong_id, wrong_flavor, wrong_serial }) {
+      EXPECT_EQ(coordinator.run_launch_step(token, counting(mutations)).reason, reject_reason_e::stale_transaction);
+      EXPECT_FALSE(coordinator.finish_launch_prepare(token));
+    }
+    ASSERT_TRUE(coordinator.finish_launch_prepare(*launch.token));
+    ASSERT_TRUE(coordinator.bind_launch(*launch.token));
+    const auto join = coordinator.admit_managed_join({ 439, "join" });
+    ASSERT_TRUE(join);
+    EXPECT_EQ(coordinator.run_launch_step(*join.token, counting(mutations)).reason, reject_reason_e::stale_transaction);
+    EXPECT_FALSE(coordinator.finish_launch_prepare(*join.token));
+    EXPECT_EQ(mutations.load(), 0);
+  }
+
+  TEST(DisplayTopologyCoordinator, StagedCleanupCannotBeReplacedByContinuationOrAbort) {
+    fake_clock_t clock;
+    std::atomic_int original {}, replacement {};
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto launch = coordinator.admit_launch({ 440, "cleanup" });
+    ASSERT_TRUE(launch);
+    ASSERT_TRUE(coordinator.run_launch_step(*launch.token, {}, counting(original)).completed());
+    EXPECT_THROW(coordinator.run_launch_step(*launch.token, {}, counting(replacement)), std::invalid_argument);
+    EXPECT_THROW(coordinator.abort_launch(*launch.token, counting(replacement)), std::invalid_argument);
+    ASSERT_TRUE(coordinator.run_launch_step(*launch.token, {}).completed());
+    ASSERT_TRUE(coordinator.abort_launch(*launch.token, {}));
+    ASSERT_TRUE(flush(coordinator).completed());
+    EXPECT_EQ(original.load(), 1);
+    EXPECT_EQ(replacement.load(), 0);
+  }
+
+  TEST(DisplayTopologyCoordinator, UnstartedStagedTerminationDoesNotRestore) {
+    for (const bool managed : { false, true }) {
+      for (const bool expiry : { false, true }) {
+        fake_clock_t clock;
+        std::atomic_int calls {};
+        auto options = make_options(clock, managed);
+        if (managed) options.native_restore = counting(calls);
+        coordinator_t coordinator { options };
+        ASSERT_TRUE(start_ready(coordinator).completed());
+        gate_t blocker;
+        const auto blocking = coordinator.post_tracked(command_kind_e::stream_restore, blocker.body());
+        ASSERT_TRUE(blocker.wait_started());
+        const auto launch = coordinator.admit_launch({ 441, "unstarted" });
+        ASSERT_TRUE(launch);
+        const auto before = submitted(coordinator);
+        auto step = std::async(std::launch::async, [&]() {
+          return coordinator.run_launch_step(*launch.token, counting(calls), counting(calls));
+        });
+        const finally_t release { [&]() { blocker.release(); } };
+        ASSERT_TRUE(wait_until([&]() { return submitted(coordinator) == before + 1; }));
+        if (expiry) {
+          clock.advance(1000ms);
+          coordinator.tick();
+        }
+        else {
+          EXPECT_TRUE(coordinator.abort_launch(*launch.token, {}));
+        }
+        blocker.release();
+        EXPECT_FALSE(step.get().completed());
+        EXPECT_TRUE(blocking.completion.get().completed());
+        ASSERT_TRUE(flush(coordinator).completed());
+        EXPECT_EQ(calls.load(), 0);
+      }
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, ProbeFencePreventsOneShotTicketPublication) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto launch = coordinator.admit_launch({ 442, "one-shot probe" });
+    ASSERT_TRUE(launch);
+    std::shared_ptr<const probe_fence_t> probe;
+    ASSERT_TRUE(coordinator.run_launch_prepare(*launch.token, [&](const auto &, const auto &) {
+                             probe = coordinator.hold_probe_fence();
+                           })
+        .completed());
+    EXPECT_FALSE(coordinator.bind_launch(*launch.token));
+    probe.reset();
+    EXPECT_TRUE(coordinator.bind_launch(*launch.token));
+  }
+
+  TEST(DisplayTopologyCoordinator, StagedPreparationRejectsReentryAndShutdownProgress) {
+    for (const bool stop : { false, true }) {
+      fake_clock_t clock;
+      coordinator_t coordinator { make_options(clock) };
+      ASSERT_TRUE(start_ready(coordinator).completed());
+      const auto launch = coordinator.admit_launch({ 443, "shutdown" });
+      ASSERT_TRUE(launch);
+      ASSERT_TRUE(coordinator.run_launch_step(*launch.token, [&](const auto &, const auto &) {
+                               EXPECT_EQ(coordinator.run_launch_step(*launch.token, {}).outcome, outcome_e::reentrant);
+                               EXPECT_FALSE(coordinator.finish_launch_prepare(*launch.token));
+                             })
+          .completed());
+      if (stop)
+        coordinator.stop();
+      else
+        coordinator.begin_draining();
+      EXPECT_FALSE(coordinator.finish_launch_prepare(*launch.token));
+      EXPECT_FALSE(coordinator.bind_launch(*launch.token));
+      EXPECT_EQ(coordinator.run_launch_step(*launch.token, {}).reason,
+        stop ? reject_reason_e::stopped : reject_reason_e::draining);
+    }
+  }
+
   TEST(DisplayTopologyCoordinator, FenceRefusesNonCleanupWorkUntilItSettles) {
     fake_clock_t clock;
     std::atomic_bool settled {};

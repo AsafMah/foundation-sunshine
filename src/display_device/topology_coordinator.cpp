@@ -329,6 +329,9 @@ namespace display_device::topology {
           // The route stopped waiting before the command started; never run it.
           return;
         }
+        if (reason == reject_reason_e::none && kind == command_kind_e::launch_prepare) {
+          lease_->prepare_started = true;
+        }
       }
 
       if (reason != reject_reason_e::none) {
@@ -568,22 +571,21 @@ namespace display_device::topology {
     if (!lease_ || lease_->stage != lease_stage_e::preparing || now() < lease_->setup_deadline) {
       return false;
     }
-    bool body_started = false;
+    const bool body_started = lease_->prepare_started;
     if (lease_->prepare_state) {
       using stage_e = command_state_t::stage_e;
       auto stage = stage_e::pending;
       lease_->prepare_state->stage.compare_exchange_strong(stage, stage_e::abandoned, std::memory_order_acq_rel);
-      body_started = stage == stage_e::running;
     }
     if (lease_->prepare_handle && queue_) {
       queue_->cancel(*lease_->prepare_handle);
     }
     const bool managed = lease_->flavor == launch_flavor_e::managed;
-    auto cleanup = std::move(lease_->legacy_expiry_cleanup);
-    release_lease_locked(managed && body_started, command_kind_e::launch_failed_restore);
+    auto cleanup = lease_->legacy_expiry_cleanup;
     if (!managed && body_started && cleanup) {
       submit_posted_locked(command_kind_e::launch_failed_restore, std::move(cleanup));
     }
+    release_lease_locked(managed && body_started, command_kind_e::launch_failed_restore);
     return true;
   }
 
@@ -801,6 +803,16 @@ namespace display_device::topology {
 
   command_result_t
   coordinator_t::run_launch_prepare(const launch_token_t &token, command_body_t body, command_body_t legacy_expiry_cleanup) {
+    return run_prepare(token, std::move(body), std::move(legacy_expiry_cleanup), prepare_mode_e::one_shot);
+  }
+
+  command_result_t
+  coordinator_t::run_launch_step(const launch_token_t &token, command_body_t body, command_body_t legacy_expiry_cleanup) {
+    return run_prepare(token, std::move(body), std::move(legacy_expiry_cleanup), prepare_mode_e::staged);
+  }
+
+  command_result_t
+  coordinator_t::run_prepare(const launch_token_t &token, command_body_t body, command_body_t legacy_expiry_cleanup, prepare_mode_e mode) {
     if (on_worker_thread()) {
       return outcome(outcome_e::reentrant);
     }
@@ -817,12 +829,20 @@ namespace display_device::topology {
         reason != reject_reason_e::none) {
         return rejected(reason);
       }
-      if (lease_->prepare_submitted) {
+      const bool first = lease_->prepare_mode == prepare_mode_e::not_submitted;
+      if (!first && (mode != prepare_mode_e::staged || lease_->prepare_mode != prepare_mode_e::staged ||
+                      !lease_->step_completed || lease_->prepared)) {
         return rejected(reject_reason_e::stale_transaction);
       }
-      lease_->prepare_submitted = true;
+      if (!first && legacy_expiry_cleanup) {
+        throw std::invalid_argument { "A staged launch must retain its initial cleanup" };
+      }
+      if (first) {
+        lease_->legacy_expiry_cleanup = std::move(legacy_expiry_cleanup);
+      }
+      lease_->prepare_mode = mode;
+      lease_->step_completed = false;
       lease_->prepare_state = state;
-      lease_->legacy_expiry_cleanup = std::move(legacy_expiry_cleanup);
       deadline = lease_->setup_deadline;
       submission = submit_locked(command_kind_e::launch_prepare, state, std::move(body), token.transaction, deadline, false);
       lease_->prepare_handle = submission.handle;
@@ -831,11 +851,28 @@ namespace display_device::topology {
     auto result = wait(submission, state, deadline);
     if (result.outcome == outcome_e::completed) {
       std::lock_guard lock { mutex_ };
-      if (lease_ && lease_->transaction == token.transaction && lease_->stage == lease_stage_e::preparing) {
-        lease_->prepared = true;
+      if (matches_owner_locked(token) && lease_->stage == lease_stage_e::preparing && lease_->prepare_state == state) {
+        lease_->step_completed = true;
+        lease_->prepared = mode == prepare_mode_e::one_shot;
       }
     }
     return result;
+  }
+
+  bool
+  coordinator_t::finish_launch_prepare(const launch_token_t &token) {
+    std::lock_guard lock { mutex_ };
+    if (phase_ != coordinator_phase_e::running || stopping_) {
+      return false;
+    }
+    expire_preparing_locked();
+    if (!matches_owner_locked(token) || lease_->stage != lease_stage_e::preparing ||
+        lease_->prepare_mode != prepare_mode_e::staged || !lease_->step_completed ||
+        lease_->prepared || fence_active_locked()) {
+      return false;
+    }
+    lease_->prepared = true;
+    return true;
   }
 
   bool
@@ -846,7 +883,7 @@ namespace display_device::topology {
     }
     expire_preparing_locked();
     expire_joins_locked();
-    if (!lease_) {
+    if (!lease_ || fence_active_locked()) {
       return false;
     }
     if (lease_->flavor == launch_flavor_e::managed) {
@@ -886,15 +923,24 @@ namespace display_device::topology {
     if (!matches_owner_locked(token) || lease_->stage != lease_stage_e::preparing) {
       return false;
     }
+    const bool staged = lease_->prepare_mode == prepare_mode_e::staged;
+    if (staged) {
+      if (legacy_cleanup) {
+        throw std::invalid_argument { "A staged abort must use its initial cleanup" };
+      }
+      if (lease_->prepare_started) {
+        legacy_cleanup = lease_->legacy_expiry_cleanup;
+      }
+    }
     if (lease_->prepare_handle && queue_) {
       // Only this launch's own command; the cleanup posted below runs after it returns.
       queue_->cancel(*lease_->prepare_handle);
     }
     const bool managed = lease_->flavor == launch_flavor_e::managed;
-    release_lease_locked(managed, command_kind_e::launch_failed_restore);
     if (!managed && legacy_cleanup) {
       submit_posted_locked(command_kind_e::launch_failed_restore, std::move(legacy_cleanup));
     }
+    release_lease_locked(managed && (!staged || lease_->prepare_started), command_kind_e::launch_failed_restore);
     return true;
   }
 

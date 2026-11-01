@@ -358,6 +358,15 @@ than continuing to apply the setup deadline. Binding after draining/stop is
 refused. Bounding application prep and rolling back published tickets/apps are
 still production-wiring work, not established by these isolated tests.
 
+Staged preparation now supports separate configure/probe/fallback steps under
+one owner token and the original deadline. It cannot mix with the one-shot API,
+overlap steps, continue after failure/sealing, or bind before explicit completion.
+The first cleanup obligation remains registered throughout; a sticky record of
+any started mutation survives later steps that never start. Abort/expiry enqueue
+that cleanup before releasing ownership. Sealing and ticket binding also refuse
+active probe/admission fences. These orchestration fixtures use fake mutations
+and probes; the production launch helper has not yet been converted.
+
 Independent fences now compose instead of replacing one another. A shared
 teardown token can block admission from registry removal through cleanup
 submission, including asynchronous app-cancel callbacks. Releasing one holder
