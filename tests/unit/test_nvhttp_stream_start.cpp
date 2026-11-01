@@ -743,5 +743,41 @@ namespace {
     EXPECT_TRUE(coordinator->bind_launch(coordination.token));
   }
 
+  // The sequence nvhttp runs: prepare, hold, start the app (slower than the setup window), then bind.
+  TEST_F(CoordinatedStreamStart, HeldPreparedLaunchOutlivesASlowAppStart) {
+    for (const bool hold : { false, true }) {
+      topology::coordinator_options_t options;
+      options.setup_timeout = 100ms;
+      reset(options);
+      std::atomic_int cleanups {};
+      auto coordination = route([&](const auto &, const auto &) { ++cleanups; });
+      fake.configurations = { configured(result_e::success) };
+      fake.probes = { probed(probe_error_e::none) };
+      ASSERT_TRUE(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination));
+      if (hold) {
+        ASSERT_TRUE(coordinator->hold_prepared_launch(coordination.token));
+      }
+      std::this_thread::sleep_for(300ms);
+      coordinator->tick();
+      settle();
+      EXPECT_EQ(coordinator->bind_launch(coordination.token), hold) << "hold=" << hold;
+      EXPECT_EQ(cleanups.load(), hold ? 0 : 1) << "hold=" << hold;
+    }
+  }
+
+  TEST_F(CoordinatedStreamStart, OnlyAFullyPreparedOwnerCanHoldItsLaunch) {
+    auto coordination = route();
+    EXPECT_FALSE(coordinator->hold_prepared_launch(coordination.token)) << "nothing was prepared yet";
+    fake.configurations = { configured(result_e::success) };
+    fake.probes = { probed(probe_error_e::none) };
+    ASSERT_TRUE(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination));
+    auto stale = coordination.token;
+    ++stale.transaction;
+    EXPECT_FALSE(coordinator->hold_prepared_launch(stale));
+    EXPECT_TRUE(coordinator->hold_prepared_launch(coordination.token));
+    EXPECT_TRUE(coordinator->bind_launch(coordination.token));
+    EXPECT_FALSE(coordinator->hold_prepared_launch(coordination.token)) << "a bound lease is no longer preparing";
+  }
+
   INSTANTIATE_TEST_SUITE_P(Coordinated, StreamStartPolicy, ::testing::Values(true));
 }  // namespace

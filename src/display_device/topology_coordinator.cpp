@@ -1065,6 +1065,35 @@ namespace display_device::topology {
   }
 
   bool
+  coordinator_t::hold_prepared_launch(const launch_token_t &token) {
+    std::lock_guard lock { mutex_ };
+    if (phase_ != coordinator_phase_e::running || stopping_) {
+      return false;
+    }
+    expire_preparing_locked();
+    expire_joins_locked();
+    if (!lease_ || !lease_->prepared || lease_->stage != lease_stage_e::preparing) {
+      return false;
+    }
+    if (lease_->flavor == launch_flavor_e::managed) {
+      auto *ref = find_attachment_locked(token);
+      if (!ref || ref->stage != lease_stage_e::preparing) {
+        return false;
+      }
+      ref->setup_deadline = no_deadline;
+      if (token.attachment_serial == 0) {
+        lease_->setup_deadline = no_deadline;
+      }
+      return true;
+    }
+    if (!matches_owner_locked(token)) {
+      return false;
+    }
+    lease_->setup_deadline = no_deadline;
+    return true;
+  }
+
+  bool
   coordinator_t::bind_launch(const launch_token_t &token) {
     std::lock_guard lock { mutex_ };
     if (phase_ != coordinator_phase_e::running || stopping_) {

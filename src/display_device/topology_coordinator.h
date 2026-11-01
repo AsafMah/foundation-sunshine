@@ -476,6 +476,15 @@ namespace display_device::topology {
     bool
     finish_launch_prepare(const launch_token_t &token);
 
+    /**
+     * Lift the setup deadline of a fully prepared, still-preparing launch whose owner
+     * guarantees bind or abort (legacy parity: app start had no deadline; the ticket
+     * handshake window governs after bind). Returns false for stale, unprepared,
+     * expired or non-preparing leases.
+     */
+    bool
+    hold_prepared_launch(const launch_token_t &token);
+
     /** Recorded absolute monotonic deadline for a live preparing owner; reaps expiry. */
     std::optional<monotonic_time_t>
     launch_setup_deadline(const launch_token_t &token);

@@ -358,6 +358,16 @@ namespace nvhttp {
       };
     }
 
+    /** Lift the setup deadline once prepared; this owner still binds or aborts. */
+    bool
+    hold(pt::ptree &tree, std::string_view result_node) {
+      if (display_device::coordinated::coordinator().hold_prepared_launch(*token_)) return true;
+      tree.put(std::string { "root." } + std::string { result_node }, 0);
+      stream_start::set_sunshine_error(tree, 503, "The display preparation expired before the application could start",
+        "DISPLAY_SETUP_ABORTED", "Retry after the current display operation completes.", "retry_launch",
+        "display", "display_configuration", true);
+      return false;
+    }
     /** Ticket publication seam: runs under the ticket lock, so it only binds. */
     std::function<bool()>
     bind_before_publish() {
@@ -725,6 +735,10 @@ namespace nvhttp {
       if (!stream_start::prepare_display_and_probe_encoders(tree, launch_session, true, &coordination)) {
         tree.put("root.gamesession", 0);
 
+        return;
+      }
+      // The app start below had no deadline before the topology owner existed; keep it that way.
+      if (!display_launch.hold(tree, "gamesession")) {
         return;
       }
     }
