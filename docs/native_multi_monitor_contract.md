@@ -403,9 +403,10 @@ color association, SETMODES, cursor and adapter-restart writes. Its independent
 matrix covers 18 command kinds, 20 operations and both modes. Actual-worker
 fixtures verify restore-only authority and thread confinement, and distinguish
 native creation from legacy preparation and narrower deferred retry. Eighteen
-deliberate faults fail the intended assertions; the coordinator suite now has
-140 cases. Managed legacy VDD routes and restoring reset are denied without
-blocking native journal-first creation or proven owned removal. The table does
+deliberate faults fail the intended assertions; that authority-table checkpoint
+brought the coordinator suite to 140 cases. Managed legacy VDD routes and
+restoring reset are denied without blocking native journal-first creation or
+proven owned removal. The table does
 not yet gate the production raw signatures; journal suppression and ownership
 remain separate runtime obligations.
 
@@ -458,6 +459,18 @@ preceding mutation completes, so even cleanup cannot start during the probe.
 Independent holds compose and survive queue-generation changes; skipped head
 commands still settle FIFO. Stop cancels queued work without waiting for an
 external holder, which may safely outlive the queue/coordinator.
+
+External adapter mutations have a distinct worker-acquired token. It requires
+the owner's adapter-restart capability and excludes admission, queued cleanup
+and subsequent raw mutations in the current command. Copies retain exclusion
+until their final release, which restores raw authority before waking dispatch.
+It neither broadens the kind table nor changes ordinary probe/teardown fences.
+Six fake-backed cases cover current-body rollback, every cleanup kind, draining,
+invalid/duplicate acquisition, independent owners and off-worker release after
+stop/destruction. EM1-EM10 assertion-kill their intended faults; the restored
+coordinator suite has 146 cases. Stop cancels the queue; it does not prove an
+external process settled. The actual adapter-process supervisor, original-handle
+handoff and retained cleanup/restart-recovery obligations remain unwired.
 
 The neutral probe supervisor now runs a separately owned probe thread under the
 recorded absolute setup deadline. An independent watchdog covers construction

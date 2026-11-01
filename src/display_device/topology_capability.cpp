@@ -5,6 +5,7 @@
 #include "topology_capability.h"
 
 #include <string>
+#include <utility>
 
 namespace display_device::topology {
 
@@ -180,10 +181,12 @@ namespace display_device::topology {
     }
   }
 
-  mutation_capability_t::mutation_capability_t(command_kind_e kind, bool managed_mode, std::thread::id worker) noexcept:
+  mutation_capability_t::mutation_capability_t(command_kind_e kind, bool managed_mode, std::thread::id worker,
+    std::shared_ptr<const std::atomic_bool> external_mutation) noexcept:
       kind_ { kind },
       managed_mode_ { managed_mode },
-      worker_ { worker } {}
+      worker_ { worker },
+      external_mutation_ { std::move(external_mutation) } {}
 
   command_kind_e
   mutation_capability_t::kind() const noexcept {
@@ -205,6 +208,9 @@ namespace display_device::topology {
       throw capability_error_t { std::string { "Topology operation " } + std::string { to_string(operation) } +
                                  " is not allowed for command " + std::string { to_string(kind_) } +
                                  (managed_mode_ ? " in managed mode" : "") };
+    }
+    if (external_mutation_->load(std::memory_order_acquire)) {
+      throw capability_error_t { "An external topology mutation has not settled" };
     }
   }
 

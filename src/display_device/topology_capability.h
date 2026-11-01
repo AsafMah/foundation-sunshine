@@ -11,7 +11,9 @@
  */
 #pragma once
 
+#include <atomic>
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -109,6 +111,7 @@ namespace display_device::topology {
     /**
      * @brief Throw `capability_error_t` unless `operation` is allowed for this kind
      *        and the caller is the worker thread that received the capability.
+     *        An unsettled external mutation also excludes current-body cleanup.
      */
     void
     require(operation_e operation) const;
@@ -116,11 +119,13 @@ namespace display_device::topology {
   private:
     friend class coordinator_t;
 
-    mutation_capability_t(command_kind_e kind, bool managed_mode, std::thread::id worker) noexcept;
+    mutation_capability_t(command_kind_e kind, bool managed_mode, std::thread::id worker,
+      std::shared_ptr<const std::atomic_bool> external_mutation) noexcept;
 
     command_kind_e kind_;
     bool managed_mode_;
     std::thread::id worker_;
+    std::shared_ptr<const std::atomic_bool> external_mutation_;
   };
 
 }  // namespace display_device::topology

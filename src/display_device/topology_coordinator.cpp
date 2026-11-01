@@ -455,7 +455,7 @@ namespace display_device::topology {
         return;
       }
 
-      const mutation_capability_t capability { kind, options_.managed_mode, std::this_thread::get_id() };
+      const mutation_capability_t capability { kind, options_.managed_mode, std::this_thread::get_id(), external_mutation_ };
       if (kind == command_kind_e::legacy_startup_restore) {
         state->startup_restore->body(capability, context);
         std::lock_guard lock { mutex_ };
@@ -1235,6 +1235,34 @@ namespace display_device::topology {
     }
     std::lock_guard lock { mutex_ };
     fences_.push_back(std::move(settled));
+  }
+
+  external_mutation_fence_t::external_mutation_fence_t(std::shared_ptr<std::atomic_bool> blocked,
+    std::shared_ptr<const dispatch_hold_t> dispatch):
+      blocked_ { std::move(blocked) },
+      dispatch_ { std::move(dispatch) } {}
+
+  external_mutation_fence_t::~external_mutation_fence_t() {
+    if (armed_) blocked_->store(false, std::memory_order_release);
+  }
+
+  std::shared_ptr<const external_mutation_fence_t>
+  coordinator_t::hold_external_mutation(const mutation_capability_t &capability) {
+    capability.require(operation_e::adapter_restart);
+    if (!on_worker_thread() || capability.external_mutation_ != external_mutation_) {
+      throw std::logic_error { "External mutation exclusion needs its coordinator's worker capability" };
+    }
+    std::lock_guard lock { mutex_ };
+    if (!queue_ || stopping_ || phase_ == coordinator_phase_e::draining) {
+      throw std::logic_error { "An external topology mutation cannot start while draining or stopped" };
+    }
+    auto token = std::shared_ptr<external_mutation_fence_t> {
+      new external_mutation_fence_t { external_mutation_, queue_->hold_dispatch() }
+    };
+    fences_.push_back([weak = std::weak_ptr { token }]() { return weak.expired(); });
+    external_mutation_->store(true, std::memory_order_release);
+    token->armed_ = true;
+    return token;
   }
 
   std::shared_ptr<const admission_fence_t>

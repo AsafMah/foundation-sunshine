@@ -186,6 +186,22 @@ namespace display_device::topology {
     admission_fence_t() = default;
   };
 
+  /** Excludes queued work and current-body raw mutations until an external actor settles. */
+  class external_mutation_fence_t {
+  public:
+    ~external_mutation_fence_t();
+    external_mutation_fence_t(const external_mutation_fence_t &) = delete;
+    external_mutation_fence_t &
+    operator=(const external_mutation_fence_t &) = delete;
+
+  private:
+    friend class coordinator_t;
+    external_mutation_fence_t(std::shared_ptr<std::atomic_bool> blocked, std::shared_ptr<const dispatch_hold_t> dispatch);
+    std::shared_ptr<std::atomic_bool> blocked_;
+    std::shared_ptr<const dispatch_hold_t> dispatch_;
+    bool armed_ {};
+  };
+
   /** Shared admission and dispatch exclusion for a separately supervised encoder probe. */
   class probe_fence_t {
   public:
@@ -425,6 +441,15 @@ namespace display_device::topology {
     install_fence(std::function<bool()> settled);
 
     /**
+     * Acquire before launching an adapter restart; retain until it actually settles.
+     * Requires this coordinator's worker capability with adapter-restart permission.
+     * Unlike ordinary fences, this blocks cleanup dispatch and later mutations in
+     * the current command. Failed acquisition leaves existing exclusion untouched.
+     */
+    std::shared_ptr<const external_mutation_fence_t>
+    hold_external_mutation(const mutation_capability_t &capability);
+
+    /**
      * @brief Hold an admission fence until every copy of the returned token is released.
      * @details For teardown, acquire before removing a session from the visible registry;
      *          keep it through join and submission of all stream/app cleanup. Cleanup may
@@ -593,6 +618,7 @@ namespace display_device::topology {
     std::uint64_t queue_generation_ {};
     std::optional<lease_t> lease_;
     std::vector<std::function<bool()>> fences_;
+    std::shared_ptr<std::atomic_bool> external_mutation_ { std::make_shared<std::atomic_bool>(false) };
     native_health_t native_;
     std::uint64_t next_transaction_ { 1 };
     std::uint64_t native_restores_posted_ {};

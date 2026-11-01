@@ -2605,6 +2605,175 @@ namespace {
     EXPECT_EQ(coordinator.run(command_kind_e::scale, {}).reason, reject_reason_e::fence_active);
   }
 
+  using external_hold_t = std::shared_ptr<const external_mutation_fence_t>;
+
+  TEST(DisplayTopologyCoordinator, ExternalMutationBlocksCurrentCleanupUntilItsLastHolderSettles) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    std::size_t mutations {};
+    ASSERT_TRUE(coordinator.run(command_kind_e::reconfigure, [&](const auto &capability, const auto &) {
+      auto held = coordinator.hold_external_mutation(capability);
+      auto monitor = held;
+      const auto restore_after_create_failed = [&]() {
+        capability.require(operation_e::restore_state);
+        ++mutations;
+        capability.require(operation_e::vdd_destroy);
+        ++mutations;
+      };
+      EXPECT_THROW(restore_after_create_failed(), capability_error_t);
+      EXPECT_EQ(mutations, 0u);
+      for (const auto operation : all_operations) {
+        if (kind_allows(capability.kind(), operation, false)) {
+          SCOPED_TRACE(to_string(operation));
+          EXPECT_THROW(capability.require(operation), capability_error_t);
+        }
+      }
+      EXPECT_TRUE(coordinator.status().fence_active);
+      held.reset();
+      EXPECT_THROW(capability.require(operation_e::restore_state), capability_error_t);
+      monitor.reset();
+      EXPECT_NO_THROW(capability.require(operation_e::restore_state));
+      EXPECT_NO_THROW(capability.require(operation_e::vdd_destroy));
+    }).completed());
+    EXPECT_EQ(mutations, 0u);
+    EXPECT_FALSE(coordinator.status().fence_active);
+  }
+
+  TEST(DisplayTopologyCoordinator, ExternalMutationQueuesCleanupThroughDrainingAndRejectsAdmission) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    external_hold_t held;
+    ASSERT_TRUE(coordinator.run(command_kind_e::reconfigure, [&](const auto &capability, const auto &) {
+      held = coordinator.hold_external_mutation(capability);
+    }).completed());
+    auto monitor = held;
+    std::atomic_size_t mutations {};
+    EXPECT_TRUE(coordinator.status().fence_active);
+    EXPECT_EQ(coordinator.admit_launch({ 430, "external operation" }).reason, reject_reason_e::fence_active);
+    EXPECT_EQ(coordinator.post_tracked(command_kind_e::rotate, {}).reason, reject_reason_e::fence_active);
+    std::vector<posted_command_t> cleanup;
+    for (const auto kind : expected_cleanup_kinds) {
+      cleanup.push_back(coordinator.post_tracked(kind, [&](const auto &capability, const auto &) {
+        capability.require(operation_e::vdd_destroy);
+        ++mutations;
+      }));
+      EXPECT_EQ(cleanup.back().reason, reject_reason_e::none);
+    }
+    held.reset();
+    coordinator.begin_draining();
+    for (const auto &command : cleanup) {
+      EXPECT_EQ(command.completion.wait_for(50ms), std::future_status::timeout);
+    }
+    EXPECT_EQ(mutations.load(), 0u);
+    monitor.reset();
+    for (const auto &command : cleanup) {
+      EXPECT_TRUE(command.completion.get().completed());
+    }
+    EXPECT_EQ(mutations.load(), expected_cleanup_kinds.size());
+    EXPECT_FALSE(coordinator.status().fence_active);
+  }
+
+  TEST(DisplayTopologyCoordinator, ExternalMutationAcquisitionRejectsInvalidAuthorityWithoutChangingExclusion) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    coordinator_t other { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    ASSERT_TRUE(start_ready(other).completed());
+    for (const auto kind : { command_kind_e::rotate, command_kind_e::stream_restore }) {
+      EXPECT_TRUE(coordinator.run(kind, [&](const auto &capability, const auto &) {
+        EXPECT_THROW(coordinator.hold_external_mutation(capability), capability_error_t);
+      }).completed());
+      EXPECT_FALSE(coordinator.status().fence_active);
+    }
+    EXPECT_TRUE(coordinator.run(command_kind_e::reconfigure, [&](const auto &capability, const auto &) {
+      std::thread outsider { [&]() {
+        EXPECT_THROW(coordinator.hold_external_mutation(capability), capability_error_t);
+      } };
+      outsider.join();
+      EXPECT_THROW(other.hold_external_mutation(capability), std::logic_error);
+      auto held = coordinator.hold_external_mutation(capability);
+      EXPECT_THROW(coordinator.hold_external_mutation(capability), capability_error_t);
+      EXPECT_THROW(capability.require(operation_e::restore_state), capability_error_t);
+      EXPECT_TRUE(coordinator.status().fence_active);
+      held.reset();
+      EXPECT_NO_THROW(capability.require(operation_e::restore_state));
+    }).completed());
+    EXPECT_FALSE(coordinator.status().fence_active);
+    EXPECT_FALSE(other.status().fence_active);
+    EXPECT_TRUE(coordinator.run(command_kind_e::rotate, {}).completed());
+  }
+
+  TEST(DisplayTopologyCoordinator, ExternalMutationIsolationPreservesOtherOwnersAndExistingFences) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    coordinator_t other { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    ASSERT_TRUE(start_ready(other).completed());
+    std::shared_ptr<const admission_fence_t> teardown;
+    std::shared_ptr<const probe_fence_t> probe;
+    EXPECT_TRUE(coordinator.run(command_kind_e::reconfigure, [&](const auto &capability, const auto &) {
+      teardown = coordinator.hold_fence();
+      probe = coordinator.hold_probe_fence();
+      EXPECT_NO_THROW(capability.require(operation_e::restore_state));
+      auto external = coordinator.hold_external_mutation(capability);
+      EXPECT_TRUE(other.run(command_kind_e::reconfigure, [](const auto &other_capability, const auto &) {
+        EXPECT_NO_THROW(other_capability.require(operation_e::restore_state));
+      }).completed());
+      EXPECT_THROW(capability.require(operation_e::restore_state), capability_error_t);
+      external.reset();
+      EXPECT_NO_THROW(capability.require(operation_e::restore_state));
+    }).completed());
+    teardown.reset();
+    EXPECT_TRUE(coordinator.status().fence_active);
+    probe.reset();
+    EXPECT_FALSE(coordinator.status().fence_active);
+    EXPECT_TRUE(coordinator.run(command_kind_e::rotate, {}).completed());
+  }
+
+  TEST(DisplayTopologyCoordinator, ExternalMutationHolderOutlivesStoppedOwnerWithoutRunningCleanup) {
+    fake_clock_t clock;
+    auto coordinator = std::make_unique<coordinator_t>(make_options(clock));
+    ASSERT_TRUE(start_ready(*coordinator).completed());
+    external_hold_t held;
+    ASSERT_TRUE(coordinator->run(command_kind_e::reconfigure, [&](const auto &capability, const auto &) {
+      held = coordinator->hold_external_mutation(capability);
+    }).completed());
+    std::atomic_int mutations {};
+    const auto cleanup = coordinator->post_tracked(command_kind_e::stream_restore, counting(mutations));
+    auto stopped = std::async(std::launch::async, [&]() { coordinator->stop(); });
+    const auto before_release = stopped.wait_for(real_timeout);
+    if (before_release != std::future_status::ready) held.reset();
+    stopped.get();
+    EXPECT_EQ(before_release, std::future_status::ready);
+    EXPECT_EQ(cleanup.completion.get().outcome, outcome_e::stopped);
+    coordinator.reset();
+    std::thread late_monitor { [guard = std::move(held)]() mutable { guard.reset(); } };
+    late_monitor.join();
+    EXPECT_EQ(mutations.load(), 0);
+  }
+
+  TEST(DisplayTopologyCoordinator, ExternalMutationCannotStartAfterDrainingBegan) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    gate_t worker;
+    auto running = std::async(std::launch::async, [&]() {
+      return coordinator.run(command_kind_e::reconfigure, [&](const auto &capability, const auto &) {
+        worker.hook()();
+        EXPECT_THROW(coordinator.hold_external_mutation(capability), std::logic_error);
+        EXPECT_NO_THROW(capability.require(operation_e::restore_state));
+      });
+    });
+    const finally_t release { [&]() { worker.release(); } };
+    ASSERT_TRUE(worker.wait_started());
+    coordinator.begin_draining();
+    worker.release();
+    EXPECT_TRUE(running.get().completed());
+    EXPECT_FALSE(coordinator.status().fence_active);
+  }
+
   TEST(DisplayTopologyCoordinator, ProbeFenceQueuesEveryCleanupAndRejectsAdmission) {
     fake_clock_t clock;
     coordinator_t coordinator { make_options(clock) };
