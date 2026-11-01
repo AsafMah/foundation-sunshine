@@ -331,6 +331,19 @@ if (WIN32)
     set_target_properties(display_topology_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
 endif ()
 add_test(NAME display_topology_unit_tests COMMAND display_topology_unit_tests)
+add_executable(topology_actor_record_unit_tests
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_durable_file.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_actor_record.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_topology_actor_record.cpp)
+target_include_directories(topology_actor_record_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(topology_actor_record_unit_tests PRIVATE gtest_main nlohmann_json::nlohmann_json
+        sunshine_project_options sunshine_coverage)
+target_compile_options(topology_actor_record_unit_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>)
+set_target_properties(topology_actor_record_unit_tests PROPERTIES CXX_STANDARD 23)
+if (WIN32)
+    set_target_properties(topology_actor_record_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
+endif ()
+add_test(NAME topology_actor_record_unit_tests COMMAND topology_actor_record_unit_tests)
 
 add_executable(display_topology_coordinator_unit_tests
         ${CMAKE_SOURCE_DIR}/src/display_device/topology_capability.cpp
@@ -370,6 +383,7 @@ add_test(NAME display_topology_routes_unit_tests COMMAND display_topology_routes
 add_executable(display_topology_native_unit_tests
         ${CMAKE_SOURCE_DIR}/src/display_device/topology.cpp
         ${CMAKE_SOURCE_DIR}/src/display_device/topology_journal.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_durable_file.cpp
         ${CMAKE_SOURCE_DIR}/src/display_device/topology_journal_store.cpp
         ${CMAKE_SOURCE_DIR}/src/display_device/topology_native.cpp
         ${CMAKE_SOURCE_DIR}/src/display_device/topology_capability.cpp
@@ -739,6 +753,7 @@ list(REMOVE_ITEM TEST_SOURCES
         ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology_coordinator_policy.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology_routes.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology_native.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_topology_actor_record.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_frame_contract.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_http_util.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_input_activity.cpp
