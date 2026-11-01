@@ -28,6 +28,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include "topology_capability.h"
 #include "topology_command_queue.h"
@@ -166,6 +167,19 @@ namespace display_device::topology {
   };
 
   using command_body_t = std::function<void(const mutation_capability_t &, const command_context_t &)>;
+
+  /** Shared lifetime token: no coordinator access is needed when the last holder releases it. */
+  class admission_fence_t {
+  public:
+    ~admission_fence_t() = default;
+    admission_fence_t(const admission_fence_t &) = delete;
+    admission_fence_t &
+    operator=(const admission_fence_t &) = delete;
+
+  private:
+    friend class coordinator_t;
+    admission_fence_t() = default;
+  };
 
   /**
    * @brief Read-only probes. They are always called without the coordinator lock held
@@ -323,11 +337,21 @@ namespace display_device::topology {
     stop();
 
     /**
-     * @brief Reject non-cleanup commands until `settled()` returns true.
-     * @details `settled` is evaluated under the coordinator lock; it must not block.
+     * @brief Add a fence rejecting non-cleanup commands until `settled()` returns true.
+     * @details Fences are independent. `settled` is evaluated under the coordinator lock;
+     *          it must not block. An empty predicate is invalid.
      */
     void
     install_fence(std::function<bool()> settled);
+
+    /**
+     * @brief Hold an admission fence until every copy of the returned token is released.
+     * @details For teardown, acquire before removing a session from the visible registry;
+     *          keep it through join and submission of all stream/app cleanup. Cleanup may
+     *          execute while fenced; subsequent prepares are ordered behind it by the queue.
+     */
+    std::shared_ptr<const admission_fence_t>
+    hold_fence();
 
     void
     publish_native_health(native_health_t health);
@@ -432,7 +456,7 @@ namespace display_device::topology {
     std::unique_ptr<topology_command_queue_t> queue_;
     std::uint64_t queue_generation_ {};
     std::optional<lease_t> lease_;
-    std::function<bool()> fence_;
+    std::vector<std::function<bool()>> fences_;
     native_health_t native_;
     std::uint64_t next_transaction_ { 1 };
     std::uint64_t native_restores_posted_ {};

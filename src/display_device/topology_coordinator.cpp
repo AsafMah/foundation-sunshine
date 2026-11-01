@@ -4,6 +4,7 @@
  */
 #include "topology_coordinator.h"
 
+#include <algorithm>
 #include <atomic>
 #include <stdexcept>
 #include <utility>
@@ -284,14 +285,8 @@ namespace display_device::topology {
 
   bool
   coordinator_t::fence_active_locked() {
-    if (!fence_) {
-      return false;
-    }
-    if (fence_()) {
-      fence_ = nullptr;
-      return false;
-    }
-    return true;
+    std::erase_if(fences_, [](const auto &settled) { return settled(); });
+    return !fences_.empty();
   }
 
   topology_command_queue_t::task_t
@@ -873,8 +868,18 @@ namespace display_device::topology {
 
   void
   coordinator_t::install_fence(std::function<bool()> settled) {
+    if (!settled) {
+      throw std::invalid_argument { "Topology fence needs a settlement predicate" };
+    }
     std::lock_guard lock { mutex_ };
-    fence_ = std::move(settled);
+    fences_.push_back(std::move(settled));
+  }
+
+  std::shared_ptr<const admission_fence_t>
+  coordinator_t::hold_fence() {
+    auto token = std::shared_ptr<const admission_fence_t> { new admission_fence_t };
+    install_fence([weak = std::weak_ptr { token }]() { return weak.expired(); });
+    return token;
   }
 
   void
@@ -893,7 +898,7 @@ namespace display_device::topology {
       result.lease = lease_snapshot_t { lease_->transaction, lease_->launch_session_id, lease_->flavor, lease_->stage };
     }
     result.native = native_;
-    result.fence_active = fence_ && !fence_();
+    result.fence_active = std::any_of(fences_.begin(), fences_.end(), [](const auto &settled) { return !settled(); });
     result.native_restores_posted = native_restores_posted_;
     result.submitted_commands = submitted_commands_;
     return result;

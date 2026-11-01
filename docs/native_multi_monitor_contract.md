@@ -351,6 +351,13 @@ than continuing to apply the setup deadline. Binding after draining/stop is
 refused. Bounding application prep and rolling back published tickets/apps are
 still production-wiring work, not established by these isolated tests.
 
+Independent fences now compose instead of replacing one another. A shared
+teardown token can block admission from registry removal through cleanup
+submission, including asynchronous app-cancel callbacks. Releasing one holder
+does not release another holder's fence. Cleanup commands remain admissible;
+new prepares follow submitted cleanup in queue order. The neutral interleaving
+fixtures cover this contract; RTSP has not yet been wired to use it.
+
 Production `session_t`, launch/RTSP lifecycle, Windows mutation paths and the
 administrator profile/status surface do not yet call the coordinator.
 No production display behavior has changed. G1 software evidence remains

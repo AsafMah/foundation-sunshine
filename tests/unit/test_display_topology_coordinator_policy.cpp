@@ -2043,6 +2043,70 @@ namespace {
     EXPECT_EQ(coordinator.status().phase, coordinator_phase_e::running);
   }
 
+  TEST(DisplayTopologyCoordinator, OverlappingFencesCannotReleaseEachOther) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    std::atomic_bool first {}, second {};
+    coordinator.install_fence([&]() { return first.load(); });
+    coordinator.install_fence([&]() { return second.load(); });
+    second = true;
+    EXPECT_EQ(coordinator.run(command_kind_e::rotate, {}).reason, reject_reason_e::fence_active);
+    EXPECT_TRUE(coordinator.status().fence_active);
+    second = false;
+    first = true;
+    EXPECT_TRUE(coordinator.run(command_kind_e::rotate, {}).completed())
+      << "each settled fence is retired independently, even while another fence remains";
+    EXPECT_FALSE(coordinator.status().fence_active);
+  }
+
+  TEST(DisplayTopologyCoordinator, TeardownFenceBridgesRegistryRemovalAndCleanupSubmission) {
+    fake_clock_t clock;
+    event_log_t log;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    auto teardown = coordinator.hold_fence();
+    log.add("remove session");
+    EXPECT_EQ(coordinator.admit_launch({ 320, "early resume" }).reason, reject_reason_e::fence_active);
+    std::atomic_int mutations {};
+    EXPECT_EQ(coordinator.run(command_kind_e::rotate, counting(mutations)).reason, reject_reason_e::fence_active);
+    auto stream_cleanup = coordinator.post_tracked(command_kind_e::stream_restore, logging(log, "stream restore"));
+    auto app_cleanup = coordinator.post_tracked(command_kind_e::stream_restore, logging(log, "app restore"));
+    EXPECT_EQ(stream_cleanup.reason, reject_reason_e::none);
+    EXPECT_EQ(app_cleanup.reason, reject_reason_e::none);
+    teardown.reset();
+    const auto resume = coordinator.admit_launch({ 321, "resume" });
+    ASSERT_TRUE(resume);
+    ASSERT_TRUE(coordinator.run_launch_prepare(*resume.token, logging(log, "prepare")).completed());
+    EXPECT_EQ(mutations, 0);
+    EXPECT_EQ(log.events(), (std::vector<std::string> { "remove session", "stream restore", "app restore", "prepare" }));
+  }
+
+  TEST(DisplayTopologyCoordinator, SharedAndIndependentTeardownFencesAllHaveToFinish) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    auto first = coordinator.hold_fence();
+    auto callback = first;
+    auto second = coordinator.hold_fence();
+    first.reset();
+    second.reset();
+    EXPECT_EQ(coordinator.admit_launch({ 322, "waiting" }).reason, reject_reason_e::fence_active);
+    EXPECT_TRUE(coordinator.status().fence_active);
+    callback.reset();
+    EXPECT_TRUE(coordinator.admit_launch({ 323, "ready" }));
+    EXPECT_FALSE(coordinator.status().fence_active);
+  }
+
+  TEST(DisplayTopologyCoordinator, EmptyFenceCannotClearAnExistingFence) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto held = coordinator.hold_fence();
+    EXPECT_THROW(coordinator.install_fence({}), std::invalid_argument);
+    EXPECT_EQ(coordinator.run(command_kind_e::scale, {}).reason, reject_reason_e::fence_active);
+  }
+
   TEST(DisplayTopologyCoordinator, FenceRefusesNonCleanupWorkUntilItSettles) {
     fake_clock_t clock;
     std::atomic_bool settled {};
