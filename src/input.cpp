@@ -27,6 +27,7 @@ extern "C" {
 #include "logging.h"
 #include "platform/common.h"
 #include "display_device/session.h"
+#include "display_device/topology_runtime.h"
 #include "display_device/vdd_utils.h"
 #include "thread_pool.h"
 #include "tray/tray_state.h"
@@ -341,7 +342,7 @@ namespace input {
             "open_vdd_settings");
           return 1;
         }
-        display_device::session_t::get().toggle_display_power();
+        display_device::coordinated::toggle_display_power();
         return 1;
     }
 

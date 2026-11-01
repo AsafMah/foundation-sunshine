@@ -9,6 +9,7 @@
 #include "src/confighttp/auth.h"
 #include "src/confighttp/common.h"
 #include "src/display_device/session.h"
+#include "src/display_device/topology_runtime.h"
 #include "src/entry_handler.h"
 #include "src/file_handler.h"
 #include "src/logging.h"
@@ -296,7 +297,15 @@ namespace confighttp::diagnostics {
         response->write(data.str());
       });
 
-      display_device::session_t::get().reset_persistence();
+      if (const auto refused = display_device::coordinated::reset_persistence()) {
+        outputTree.put("status", false);
+        outputTree.put("error", "Display device config was not reset: " + *refused);
+        g.disable();
+        std::ostringstream data;
+        pt::write_json(data, outputTree);
+        response->write(web::StatusCode::service_unavailable, data.str());
+        return;
+      }
       outputTree.put("status", true);
     }
 

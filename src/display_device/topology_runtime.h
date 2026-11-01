@@ -4,6 +4,10 @@
  */
 #pragma once
 
+#include <expected>
+#include <optional>
+#include <string>
+
 #include "settings.h"
 #include "topology_coordinator.h"
 
@@ -14,4 +18,12 @@ namespace display_device::coordinated {
   /** Restore displays after already-queued work (bounded); new topology work is rejected afterwards. */
   void shutdown_restore();
   void shutdown_vdd_destroy();
+
+  // User-requested routes. Each waits for its command; a refusal is returned as
+  // "outcome / reason" and nothing ran. Exceptions from the mutation propagate.
+  std::optional<std::string> reset_persistence();
+  std::expected<bool, std::string> create_vdd_monitor_noninteractive();
+  std::expected<bool, std::string> destroy_vdd_monitor();
+  /** Hotkey/tray toggle: prompts on the caller thread; true when the VDD was created or destroyed. Never throws. */
+  bool toggle_display_power();
 }

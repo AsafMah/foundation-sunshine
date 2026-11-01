@@ -18,6 +18,7 @@
 #include "src/config.h"
 #include "src/display_device/display_device.h"
 #include "src/display_device/session.h"
+#include "src/display_device/topology_runtime.h"
 #include "src/display_device/vdd_utils.h"
 #include "src/entry_handler.h"
 #include "src/globals.h"
@@ -250,9 +251,10 @@ namespace tray_http {
           BOOST_LOG(info) << (create ? "Creating"sv : "Closing"sv) << " VDD from GUI tray"sv;
 
           try {
-            const bool success = create ?
-                                   display_device::session_t::get().create_vdd_monitor_noninteractive() :
-                                   display_device::session_t::get().destroy_vdd_monitor();
+            const auto done = create ?
+                                display_device::coordinated::create_vdd_monitor_noninteractive() :
+                                display_device::coordinated::destroy_vdd_monitor();
+            const bool success = done && *done;
             if (create && success) {
               tray_vdd_action_running = false;
               tray_vdd_confirmation_operation_id = operation_id;
@@ -466,7 +468,9 @@ namespace tray_http {
           return action_error("Display device config cannot reset while a VDD action is in progress or cooling down");
         }
         BOOST_LOG(info) << "Resetting display device config from GUI tray"sv;
-        display_device::session_t::get().reset_persistence();
+        if (const auto refused = display_device::coordinated::reset_persistence()) {
+          return action_error("Display device config was not reset: " + *refused);
+        }
         update_tray_vdd_state();
         return action_success("Display device config reset");
       }

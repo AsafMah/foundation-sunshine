@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "src/display_device/topology_call.h"
+#include "src/display_device/topology_toggle.h"
 #include "src/display_device/topology_capability.h"
 #include "src/display_device/topology_coordinator.h"
 
@@ -4942,5 +4943,136 @@ namespace {
     ASSERT_FALSE(value.has_value());
     EXPECT_FALSE(ran);
     EXPECT_EQ(value.error().result.outcome, outcome_e::stopped);
+  }
+
+  // ---------------------------------------------------------------------------
+  // run_toggle: the hotkey/tray VDD toggle
+  // ---------------------------------------------------------------------------
+
+  struct toggle_probe_t {
+    std::atomic_int prepared {};
+    std::atomic_int released {};
+    std::atomic_int applied {};
+    std::atomic_bool applied_on_worker {};
+    std::atomic_bool rotate_refused {};
+    std::atomic_bool topology_write_refused {};
+    std::atomic_int last_follow_up { -1 };
+    std::atomic_int followed {};
+    std::atomic_bool follow_up_on_worker {};
+    bool decline {};
+    bool throw_in_apply {};
+    bool stale {};
+
+    toggle_steps_t<int, int>
+    steps(coordinator_t &coordinator) {
+      return {
+        [this]() -> std::optional<int> {
+          ++prepared;
+          return decline ? std::nullopt : std::optional<int> { 41 };
+        },
+        [this](const int &request) {
+          EXPECT_EQ(request, 41);
+          ++released;
+        },
+        [this, &coordinator](const mutation_capability_t &capability, const int &request) {
+          capability.require(operation_e::vdd_create);
+          capability.require(operation_e::vdd_destroy);
+          try {
+            capability.require(operation_e::rotate);
+          }
+          catch (const capability_error_t &) {
+            rotate_refused = true;
+          }
+          try {
+            capability.require(operation_e::write_topology);
+          }
+          catch (const capability_error_t &) {
+            topology_write_refused = true;
+          }
+          applied_on_worker = coordinator.on_worker_thread();
+          ++applied;
+          if (throw_in_apply) {
+            throw std::runtime_error { "IOCTL failed" };
+          }
+          return stale ? request : request + 1;
+        },
+        [](const int &result) { return result == 42; },
+        [this, &coordinator](const int &result) {
+          last_follow_up = result;
+          follow_up_on_worker = coordinator.on_worker_thread();
+          ++followed;
+        },
+      };
+    }
+  };
+
+  TEST(DisplayTopologyToggle, AppliesOnTheWorkerThenFollowsUpOnTheCaller) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    toggle_probe_t probe;
+
+    EXPECT_TRUE(run_toggle(coordinator, probe.steps(coordinator)));
+    EXPECT_EQ(probe.applied.load(), 1);
+    EXPECT_TRUE(probe.applied_on_worker);
+    EXPECT_TRUE(probe.rotate_refused) << "a toggle capability must not allow rotation";
+    EXPECT_TRUE(probe.topology_write_refused) << "extending the new VDD is the follow-up's job, not the toggle's";
+    EXPECT_EQ(probe.last_follow_up.load(), 42);
+    EXPECT_EQ(probe.followed.load(), 1);
+    EXPECT_FALSE(probe.follow_up_on_worker);
+    EXPECT_EQ(probe.released.load(), 0);
+  }
+
+  TEST(DisplayTopologyToggle, ADeclinedPromptSubmitsNothing) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    toggle_probe_t probe;
+    probe.decline = true;
+    const auto submitted = coordinator.status().submitted_commands;
+
+    EXPECT_FALSE(run_toggle(coordinator, probe.steps(coordinator)));
+    EXPECT_EQ(probe.applied.load(), 0);
+    EXPECT_EQ(probe.followed.load(), 0);
+    EXPECT_EQ(probe.released.load(), 0);
+    EXPECT_EQ(coordinator.status().submitted_commands, submitted);
+  }
+
+  TEST(DisplayTopologyToggle, ARefusedToggleReleasesItsReservationAndNeverApplies) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    toggle_probe_t probe;
+
+    EXPECT_FALSE(run_toggle(coordinator, probe.steps(coordinator)));
+    EXPECT_EQ(probe.prepared.load(), 1);
+    EXPECT_EQ(probe.applied.load(), 0);
+    EXPECT_EQ(probe.released.load(), 1);
+    EXPECT_EQ(probe.followed.load(), 0);
+  }
+
+  TEST(DisplayTopologyToggle, AFailedApplyPropagatesAndKeepsTheReservation) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    toggle_probe_t probe;
+    probe.throw_in_apply = true;
+
+    EXPECT_THROW(run_toggle(coordinator, probe.steps(coordinator)), std::runtime_error);
+    EXPECT_EQ(probe.applied.load(), 1);
+    EXPECT_EQ(probe.released.load(), 0);
+    EXPECT_EQ(probe.followed.load(), 0);
+  }
+
+  TEST(DisplayTopologyToggle, AStaleApplyRanButReportsNotApplied) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    toggle_probe_t probe;
+    probe.stale = true;
+
+    EXPECT_FALSE(run_toggle(coordinator, probe.steps(coordinator)));
+    EXPECT_EQ(probe.applied.load(), 1);
+    EXPECT_EQ(probe.released.load(), 0) << "the command ran, so its reservation stays";
+    EXPECT_EQ(probe.last_follow_up.load(), 41) << "the follow-up decides for itself what a stale result needs";
   }
 }  // namespace

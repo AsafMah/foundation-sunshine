@@ -46,6 +46,7 @@
   // local includes
   #include "src/confighttp.h"
   #include "src/display_device/session.h"
+#include "src/display_device/topology_runtime.h"
   #include "src/display_device/vdd_utils.h"
   #include "src/file_handler.h"
   #include "src/logging.h"
@@ -268,6 +269,27 @@ namespace system_tray {
     }).detach();
   }
 
+  // 拓扑协调器的阻塞调用不能在托盘线程上执行：工作线程会通过 tray_update 同步 SendMessage 到托盘窗口
+  template <class F>
+  static void run_off_tray_thread(const char *action, F &&work) {
+    try {
+      std::thread([action, work = std::forward<F>(work)]() mutable {
+        try {
+          work();
+        }
+        catch (const std::exception &e) {
+          BOOST_LOG(error) << action << " failed: "sv << e.what();
+        }
+        catch (...) {
+          BOOST_LOG(error) << action << " failed with an unknown exception"sv;
+        }
+      }).detach();
+    }
+    catch (const std::exception &e) {
+      BOOST_LOG(error) << action << " could not start: "sv << e.what();
+    }
+  }
+
   // 创建虚拟显示器回调
   auto tray_vdd_create_cb = [](struct tray_menu *item) {
     if (!tray_initialized) return;
@@ -275,9 +297,11 @@ namespace system_tray {
     if (!ensure_vdd_prerequisite()) return;
 
     BOOST_LOG(info) << "Creating VDD from system tray (Separate Item)"sv;
-    if (display_device::session_t::get().toggle_display_power()) {
-      start_vdd_cooldown();
-    }
+    run_off_tray_thread("Tray VDD create", [] {
+      if (display_device::coordinated::toggle_display_power()) {
+        start_vdd_cooldown();
+      }
+    });
   };
 
   // 关闭虚拟显示器回调
@@ -286,8 +310,13 @@ namespace system_tray {
     if (s_vdd_in_cooldown || !is_vdd_active() || config::video.vdd_keep_enabled) return;
 
     BOOST_LOG(info) << "Closing VDD from system tray (Separate Item)"sv;
-    display_device::session_t::get().destroy_vdd_monitor();
-    start_vdd_cooldown();
+    run_off_tray_thread("Tray VDD close", [] {
+      if (const auto done = display_device::coordinated::destroy_vdd_monitor(); !done) {
+        BOOST_LOG(warning) << "VDD was not closed from system tray: "sv << done.error();
+        return;
+      }
+      start_vdd_cooldown();
+    });
   };
 
   // 保持启用回调
@@ -371,6 +400,12 @@ namespace system_tray {
   #endif
   };
 
+  static void reset_display_config_now() {
+    if (const auto refused = display_device::coordinated::reset_persistence()) {
+      BOOST_LOG(warning) << "Display device config was not reset from system tray: "sv << *refused;
+    }
+  }
+
   auto tray_reset_display_device_config_cb = [](struct tray_menu *item) {
     if (!tray_initialized) return;
 
@@ -386,7 +421,7 @@ namespace system_tray {
 
     if (msgboxID == IDYES) {
       BOOST_LOG(info) << "Resetting display device config from system tray"sv;
-      display_device::session_t::get().reset_persistence();
+      run_off_tray_thread("Tray display config reset", reset_display_config_now);
     }
     else {
       BOOST_LOG(info) << "User cancelled resetting display device config"sv;
@@ -394,7 +429,7 @@ namespace system_tray {
   #else
     // 非 Windows 平台，直接重置
     BOOST_LOG(info) << "Resetting display device config from system tray"sv;
-    display_device::session_t::get().reset_persistence();
+    run_off_tray_thread("Tray display config reset", reset_display_config_now);
   #endif
   };
 
