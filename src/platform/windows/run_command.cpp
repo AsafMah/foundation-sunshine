@@ -2,6 +2,7 @@
 #include "run_command_helpers.h"
 
 #include <boost/algorithm/string.hpp>
+#include <mutex>
 
 #include "src/logging.h"
 #include "src/utility.h"
@@ -11,6 +12,8 @@ using namespace std::literals;
 
 namespace platf {
   namespace {
+    std::mutex launch_path_mutex;
+
     std::error_code process_error(DWORD value) noexcept {
       return value ? std::error_code(static_cast<int>(value), std::system_category()) :
                      std::make_error_code(std::errc::io_error);
@@ -110,6 +113,9 @@ namespace platf {
 
     // Create a new console for interactive processes and use no console for non-interactive processes
     creation_flags |= interactive ? CREATE_NEW_CONSOLE : CREATE_NO_WINDOW;
+
+    // Both launch APIs temporarily change the same process-global PATH.
+    std::lock_guard path_lock { launch_path_mutex };
 
     // Find the PATH variable in our environment block using a case-insensitive search
     auto sunshine_wenv = boost::this_process::wenvironment();

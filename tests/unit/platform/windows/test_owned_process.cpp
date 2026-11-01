@@ -1,8 +1,11 @@
 // Actual launch policy and handle observation; process/token/kernel edges are fake.
 #define WIN32_LEAN_AND_MEAN
 #include <algorithm>
+#include <atomic>
 #include <functional>
+#include <future>
 #include <gtest/gtest.h>
+#include <mutex>
 
 #include "src/platform/windows/owned_process.h"
 #include "src/platform/windows/run_command_helpers.h"
@@ -45,7 +48,7 @@ namespace fake_process {
 boost::log::sources::severity_logger<int> verbose, debug, info, warning, error, fatal;
 
 namespace {
-  char process_tag, thread_tag, token_tag, current_tag, attributes_tag;
+  char process_tag, thread_tag, second_process_tag, second_thread_tag, token_tag, current_tag, attributes_tag;
   const HANDLE process_handle = &process_tag;
   const HANDLE thread_handle = &thread_tag;
   const HANDLE token_handle = &token_tag;
@@ -56,15 +59,28 @@ namespace {
     bool system {}, startup_fails {}, token_fails {}, merge_fails {}, impersonation_fails {};
     bool post_error {}, post_throw {}, creation_succeeds { true }, query_succeeds { true };
     bool elevated { true }, interactive { true };
-    unsigned created {}, legacy_bridges {}, queries {}, waited {}, freed_attributes {};
+    unsigned created {}, created_as_user {}, legacy_bridges {}, queries {}, waited {}, freed_attributes {};
     DWORD wait_result { WAIT_TIMEOUT }, code {}, native_error { ERROR_ACCESS_DENIED }, timeout {};
     std::vector<HANDLE> closed;
     std::function<void()> after_create;
+    std::function<void(unsigned)> during_create;
   } host;
+  std::mutex observation_mutex;
+  thread_local unsigned creation_number;
 
   unsigned closed(HANDLE handle) {
+    std::lock_guard lock { observation_mutex };
     return static_cast<unsigned>(std::count(host.closed.begin(), host.closed.end(), handle));
   }
+
+  struct process_gate_t {
+    std::promise<void> entered, released;
+    std::future<void> entry { entered.get_future() }, exit { released.get_future() };
+    std::atomic_bool open {};
+
+    void arrive() { entered.set_value(); exit.wait(); }
+    void unblock() { if (!open.exchange(true)) released.set_value(); }
+  };
 
   std::error_code launch(platf::owned_process_t &owner) {
     bp::environment env;
@@ -95,11 +111,15 @@ namespace fake_process {
     return TRUE;
   }
   BOOL WINAPI close(HANDLE handle) {
+    std::lock_guard lock { observation_mutex };
     host.closed.push_back(handle);
     host.native_error = ERROR_SUCCESS;
     return TRUE;
   }
-  DWORD WINAPI last_error() { return host.native_error; }
+  DWORD WINAPI last_error() {
+    std::lock_guard lock { observation_mutex };
+    return host.native_error;
+  }
   DWORD WINAPI wait(HANDLE handle, DWORD timeout) {
     EXPECT_EQ(handle, process_handle);
     ++host.waited;
@@ -126,9 +146,17 @@ namespace fake_process {
     EXPECT_EQ(std::wstring(static_cast<const wchar_t *>(env)), L"fake environment");
     EXPECT_EQ(std::wstring(directory), L"C:\\fake");
     EXPECT_EQ(startup->cb, sizeof(STARTUPINFOEXW));
-    ++host.created;
+    {
+      std::lock_guard lock { observation_mutex };
+      creation_number = ++host.created;
+    }
     if (!host.creation_succeeds) return FALSE;
-    *result = { process_handle, thread_handle, pid, 43 };
+    *result = {
+      creation_number == 1 ? process_handle : &second_process_tag,
+      creation_number == 1 ? thread_handle : &second_thread_tag,
+      pid, 43
+    };
+    if (host.during_create) host.during_create(creation_number);
     return TRUE;
   }
   BOOL WINAPI create_as_user(HANDLE token, LPCWSTR application, LPWSTR command,
@@ -136,6 +164,10 @@ namespace fake_process {
     DWORD flags, LPVOID env, LPCWSTR directory, LPSTARTUPINFOW startup, LPPROCESS_INFORMATION result) {
     EXPECT_EQ(token, token_handle);
     EXPECT_TRUE(host.system);
+    {
+      std::lock_guard lock { observation_mutex };
+      ++host.created_as_user;
+    }
     return create(application, command, process_attributes, thread_attributes, inherit, flags, env, directory, startup, result);
   }
 }
@@ -165,6 +197,7 @@ namespace platf {
   }
   void free_proc_thread_attr_list(LPPROC_THREAD_ATTRIBUTE_LIST list) {
     EXPECT_EQ(list, reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(&attributes_tag));
+    std::lock_guard lock { observation_mutex };
     ++host.freed_attributes;
   }
   std::error_code impersonate_current_user(HANDLE token, std::function<void()> callback) {
@@ -218,6 +251,7 @@ TEST_F(OwnedProcess, BothCreationBranchesRetainOriginalHandlesWithoutTheBoostBri
         EXPECT_TRUE(owner.started());
         EXPECT_EQ(owner.id(), pid);
         EXPECT_EQ(host.created, 1u);
+        EXPECT_EQ(host.created_as_user, system ? 1u : 0u);
         EXPECT_EQ(host.legacy_bridges, 0u);
         EXPECT_EQ(host.freed_attributes, 1u);
         EXPECT_EQ(closed(token_handle), 1u);
@@ -357,8 +391,69 @@ TEST_F(OwnedProcess, LegacyCallStillDelegatesToItsExistingBoostBridge) {
     EXPECT_FALSE(ec);
     EXPECT_EQ(host.created, 1u);
     EXPECT_EQ(host.legacy_bridges, 1u);
+    EXPECT_EQ(host.created_as_user, system ? 1u : 0u);
     EXPECT_EQ(closed(process_handle), 1u);
     EXPECT_EQ(closed(thread_handle), 1u);
     EXPECT_EQ(env["OWNED_LAUNCH_TEST"].to_string(), "original");
+  }
+}
+
+TEST_F(OwnedProcess, ConcurrentLegacyAndOwnedLaunchesSerializeAndRestorePath) {
+  auto environment = boost::this_process::wenvironment();
+  const auto path = std::find_if(environment.cbegin(), environment.cend(), [](const auto &entry) {
+    return boost::iequals(entry.get_name(), L"PATH");
+  });
+  const std::wstring name = path == environment.cend() ? L"PATH" : path->get_name();
+  const auto original = environment[name].to_string();
+  const auto restore_environment = util::fail_guard([&]() {
+    if (original.empty()) environment[name].clear();
+    else environment[name].assign(original);
+  });
+
+  for (const bool first_owned : { false, true }) {
+    for (const bool throw_first : { false, true }) {
+      SCOPED_TRACE(::testing::Message() << "owned first: " << first_owned << ", exception: " << throw_first);
+      host = {};
+      host.system = true;
+      environment[name].assign(original);
+      process_gate_t first_gate, second_gate;
+      host.during_create = [&](unsigned number) {
+        ASSERT_LE(number, 2u);
+        (number == 1 ? first_gate : second_gate).arrive();
+      };
+      host.after_create = [&]() {
+        if (creation_number == 1 && throw_first) throw std::runtime_error("first launch failed after creation");
+      };
+      const auto run = [&](bool owned, bool throws) {
+        const auto invoke = [&]() {
+          if (owned) {
+            platf::owned_process_t owner;
+            EXPECT_FALSE(launch(owner));
+          }
+          else {
+            bp::environment env;
+            env["OWNED_LAUNCH_TEST"] = "original";
+            boost::filesystem::path directory { L"C:\\fake" };
+            std::error_code ec;
+            auto child = platf::run_command(true, true, "original command", directory, env, nullptr, ec, nullptr);
+            EXPECT_FALSE(ec);
+          }
+        };
+        if (throws) EXPECT_THROW(invoke(), std::runtime_error);
+        else EXPECT_NO_THROW(invoke());
+      };
+      auto first = std::async(std::launch::async, [&]() { run(first_owned, throw_first); });
+      std::future<void> second;
+      const auto release = util::fail_guard([&]() { first_gate.unblock(); second_gate.unblock(); });
+      ASSERT_EQ(first_gate.entry.wait_for(5s), std::future_status::ready);
+      second = std::async(std::launch::async, [&]() { run(!first_owned, false); });
+      EXPECT_EQ(second_gate.entry.wait_for(150ms), std::future_status::timeout);
+      first_gate.unblock();
+      first.get();
+      ASSERT_EQ(second_gate.entry.wait_for(5s), std::future_status::ready);
+      second_gate.unblock();
+      second.get();
+      EXPECT_TRUE(boost::this_process::wenvironment()[name].to_string() == original);
+    }
   }
 }

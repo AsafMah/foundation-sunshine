@@ -477,11 +477,16 @@ It shares the existing token, environment and command-resolution policy while
 retaining both creation handles before post-create scopes can fail. The legacy
 API still delegates to its existing Boost result bridge. Native observations
 preserve handles on timeout/error and distinguish a process signal from exit
-code availability; 259 is a valid exit code after a signal. Eight actual-policy
-cases with fake process/token/kernel edges pass, and OP1-OP20 assertion-kill
-their intended faults. Both production launcher objects compile. No adapter
-caller uses this API yet: it neither bounds synchronous launch nor supplies
-crash recovery, cleanup retention or a topology fence by itself.
+code availability; 259 is a valid exit code after a signal. Nine actual-policy
+cases with fake process/token/kernel edges pass, and OP1-OP28 assertion-kill
+their intended faults. A shared mutex spans the process-global PATH snapshot,
+temporary prepend and restoration for both APIs, including exceptional exits.
+Concurrent owned/legacy calls in both orders reproduce PATH corruption without
+it; fresh environment reads verify restoration, not a cached Boost snapshot.
+Both production launcher objects compile, and all four concurrency scenarios
+pass twenty repeats. No adapter caller uses this API yet: it neither bounds
+synchronous launch nor supplies crash recovery, cleanup retention or a
+topology fence by itself.
 
 The neutral probe supervisor now runs a separately owned probe thread under the
 recorded absolute setup deadline. An independent watchdog covers construction
