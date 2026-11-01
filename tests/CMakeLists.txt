@@ -269,6 +269,23 @@ endif ()
 add_test(NAME nvhttp_stream_start_unit_tests COMMAND nvhttp_stream_start_unit_tests)
 set_tests_properties(nvhttp_stream_start_unit_tests PROPERTIES TIMEOUT 30)
 
+if (WIN32)
+    add_executable(display_settings_policy_unit_tests
+            ${CMAKE_SOURCE_DIR}/src/display_device/settings.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/to_string.cpp
+            ${CMAKE_SOURCE_DIR}/src/platform/windows/display_device/settings.cpp
+            ${CMAKE_SOURCE_DIR}/src/platform/windows/display_device/settings_topology.cpp
+            ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_display_settings.cpp)
+    target_include_directories(display_settings_policy_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(display_settings_policy_unit_tests PRIVATE gtest_main sunshine::host_headers
+            Boost::log OpenSSL::Crypto sunshine_project_options sunshine_coverage)
+    target_compile_definitions(display_settings_policy_unit_tests PRIVATE ${SUNSHINE_DEFINITIONS})
+    target_compile_options(display_settings_policy_unit_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>)
+    set_target_properties(display_settings_policy_unit_tests PROPERTIES CXX_STANDARD 23 LINK_SEARCH_START_STATIC 1)
+    add_test(NAME display_settings_policy_unit_tests COMMAND display_settings_policy_unit_tests)
+    set_tests_properties(display_settings_policy_unit_tests PROPERTIES TIMEOUT 15)
+endif ()
+
 add_executable(frame_contract_unit_tests
         ${CMAKE_SOURCE_DIR}/src/platform/frame_contract.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_frame_contract.cpp)
@@ -724,6 +741,7 @@ list(REMOVE_ITEM TEST_SOURCES
         ${CMAKE_SOURCE_DIR}/tests/unit/test_tray_state.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_video_probe.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_vdd_commands.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_display_settings.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_virtual_touchscreen_device.cpp)
 
 set(ABR_TEST_STUB_SOURCE ${CMAKE_SOURCE_DIR}/tests/unit/abr_test_stubs.cpp)

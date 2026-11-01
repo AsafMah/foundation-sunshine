@@ -468,6 +468,18 @@ closes the arbitrary-string API, not topology ownership: capability propagation
 through VDD helpers/transport, cursor persistence and every other raw setter is
 still pending. No new driver protocol or hardware operation was introduced.
 
+The standalone Windows settings-policy target compiles the actual settings and
+topology policy against fake display, session, audio and color-profile edges.
+Five fixtures cover nested topology rollback, explicit VDD-destroy suppression,
+failed restoration retaining its baseline for retry, final restoration before
+legacy persistence reset, and no-modification configuration cleanup. Eight
+deliberate faults fail the intended assertions. Failure evidence checks the
+requested topology and failed write as well as retained persistence; destruction
+of a fake head alone must not masquerade as successful restoration. These are
+legacy compatibility fixtures, not proof that nested suppression is propagated
+from the future runtime, that raw setters are capability-gated, or that hardware
+recovery works.
+
 The ticket manager also supports a short binding check before publication or
 replacement, under its mutex and after capacity checks. A refused or throwing
 bind leaves the existing ticket untouched; concurrent claim/liveness readers
