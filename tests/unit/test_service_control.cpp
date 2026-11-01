@@ -1,3 +1,4 @@
+#include "service_control_test_identity.h"
 #include "src/streaming/restart_intent.h"
 #include "tools/service_control.h"
 
@@ -163,44 +164,51 @@ TEST(ServiceControl, AlreadySignaledStopWinsOverRestart) {
 }
 
 TEST(ServiceControl, RealFakeCoreInheritsOnlyTheWhitelistedGenerationEvents) {
-  sc::handle stop(CreateEventW(nullptr, TRUE, TRUE, nullptr));
-  sc::generation_events generation;
-  ASSERT_EQ(generation.create(stop.get()), ERROR_SUCCESS);
-  ASSERT_TRUE(SetEvent(generation.restart()));
-  SECURITY_ATTRIBUTES security { sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
-  sc::handle excluded(CreateEventW(&security, TRUE, FALSE, nullptr));
-  wchar_t module[MAX_PATH] {};
-  ASSERT_NE(GetModuleFileNameW(nullptr, module, MAX_PATH), 0u);
-  const auto child = std::filesystem::path(module).parent_path() / L"service_control_test_child.exe";
-  auto command = L"\"" + child.wstring() + L"\"" + generation.command().substr(std::wstring_view(L"Sunshine.exe").size()) +
-                 L" --excluded-handle=" + std::to_wstring(reinterpret_cast<std::uintptr_t>(excluded.get()));
-  SIZE_T size = 0;
-  InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
-  std::vector<std::byte> storage(size);
-  STARTUPINFOEXW startup {};
-  startup.StartupInfo.cb = sizeof(startup);
-  startup.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
-  ASSERT_TRUE(InitializeProcThreadAttributeList(startup.lpAttributeList, 1, 0, &size));
-  const HANDLE whitelist[] = { generation.child_restart(), generation.child_stop() };
-  ASSERT_EQ(sc::set_handle_list(startup, whitelist), ERROR_SUCCESS);
-  PROCESS_INFORMATION process {};
-  const bool created = CreateProcessW(child.c_str(), command.data(), nullptr, nullptr, TRUE,
-    EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, nullptr, nullptr,
-    &startup.StartupInfo, &process);
-  const auto create_error = GetLastError();
-  DeleteProcThreadAttributeList(startup.lpAttributeList);
-  ASSERT_TRUE(created) << create_error;
-  sc::handle thread(process.hThread), child_process(process.hProcess);
-  const auto waited = WaitForSingleObject(child_process.get(), 5000);
-  if (waited != WAIT_OBJECT_0) {
-    // Only the fake child created by this test may be terminated.
-    TerminateProcess(child_process.get(), 100);
-    WaitForSingleObject(child_process.get(), 1000);
+  for (const bool deliberately_leak : { false, true }) {
+    SCOPED_TRACE(deliberately_leak ? "Deliberately leaked sentinel" : "Excluded sentinel");
+    sc::handle stop(CreateEventW(nullptr, TRUE, TRUE, nullptr));
+    sc::generation_events generation;
+    ASSERT_EQ(generation.create(stop.get()), ERROR_SUCCESS);
+    ASSERT_TRUE(SetEvent(generation.restart()));
+    SECURITY_ATTRIBUTES security { sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
+    const auto sentinel_name = excluded_event_name();
+    sc::handle excluded(CreateEventA(&security, TRUE, FALSE, sentinel_name.c_str()));
+    ASSERT_NE(excluded.get(), nullptr);
+    wchar_t module[MAX_PATH] {};
+    ASSERT_NE(GetModuleFileNameW(nullptr, module, MAX_PATH), 0u);
+    const auto child = std::filesystem::path(module).parent_path() / L"service_control_test_child.exe";
+    auto command = L"\"" + child.wstring() + L"\"" + generation.command().substr(std::wstring_view(L"Sunshine.exe").size()) +
+                   L" --excluded-handle=" + std::to_wstring(reinterpret_cast<std::uintptr_t>(excluded.get())) +
+                   L" --excluded-event-name=" + std::wstring(sentinel_name.begin(), sentinel_name.end());
+    SIZE_T size = 0;
+    InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
+    std::vector<std::byte> storage(size);
+    STARTUPINFOEXW startup {};
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.lpAttributeList = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage.data());
+    ASSERT_TRUE(InitializeProcThreadAttributeList(startup.lpAttributeList, 1, 0, &size));
+    const HANDLE whitelist[] = { generation.child_restart(), generation.child_stop(), excluded.get() };
+    ASSERT_EQ(sc::set_handle_list(startup, std::span(whitelist).first(deliberately_leak ? 3 : 2)), ERROR_SUCCESS);
+    PROCESS_INFORMATION process {};
+    const bool created = CreateProcessW(child.c_str(), command.data(), nullptr, nullptr, TRUE,
+      EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, nullptr, nullptr,
+      &startup.StartupInfo, &process);
+    const auto create_error = GetLastError();
+    DeleteProcThreadAttributeList(startup.lpAttributeList);
+    ASSERT_TRUE(created) << create_error;
+    sc::handle thread(process.hThread), child_process(process.hProcess);
+    const auto waited = WaitForSingleObject(child_process.get(), 5000);
+    if (waited != WAIT_OBJECT_0) {
+      // Only the fake child created by this test may be terminated.
+      TerminateProcess(child_process.get(), 100);
+      WaitForSingleObject(child_process.get(), 1000);
+    }
+
+    ASSERT_EQ(waited, WAIT_OBJECT_0);
+    DWORD exit_code = 0;
+    ASSERT_TRUE(GetExitCodeProcess(child_process.get(), &exit_code));
+    EXPECT_EQ(exit_code, deliberately_leak ? 5u : 0u);
   }
-  ASSERT_EQ(waited, WAIT_OBJECT_0);
-  DWORD exit_code = 0;
-  ASSERT_TRUE(GetExitCodeProcess(child_process.get(), &exit_code));
-  EXPECT_EQ(exit_code, 0u);
 }
 
 TEST(ServiceControl, ThreeCoreGenerationsRefreshBothProcessAttributes) {
@@ -220,12 +228,15 @@ TEST(ServiceControl, ThreeCoreGenerationsRefreshBothProcessAttributes) {
       limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
       ASSERT_TRUE(SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits)));
       SECURITY_ATTRIBUTES security { sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
-      sc::handle excluded(CreateEventW(&security, TRUE, FALSE, nullptr));
+      const auto sentinel_name = excluded_event_name();
+      sc::handle excluded(CreateEventA(&security, TRUE, FALSE, sentinel_name.c_str()));
+      ASSERT_NE(excluded.get(), nullptr);
       wchar_t module[MAX_PATH] {};
       ASSERT_NE(GetModuleFileNameW(nullptr, module, MAX_PATH), 0u);
       const auto child = std::filesystem::path(module).parent_path() / L"service_control_test_child.exe";
       auto command = L"\"" + child.wstring() + L"\"" + generation.command().substr(std::wstring_view(L"Sunshine.exe").size()) +
-                     L" --excluded-handle=" + std::to_wstring(reinterpret_cast<std::uintptr_t>(excluded.get()));
+                     L" --excluded-handle=" + std::to_wstring(reinterpret_cast<std::uintptr_t>(excluded.get())) +
+                     L" --excluded-event-name=" + std::wstring(sentinel_name.begin(), sentinel_name.end());
       STARTUPINFOEXW startup {};
       startup.StartupInfo.cb = sizeof(startup);
       const HANDLE whitelist[] = { generation.child_restart(), generation.child_stop() };
@@ -252,4 +263,16 @@ TEST(ServiceControl, ThreeCoreGenerationsRefreshBothProcessAttributes) {
       EXPECT_EQ(exit_code, 0u);
     }
   }
+}
+TEST(ServiceControl, ExcludedObjectCheckDistinguishesValidUnrelatedHandles) {
+  sc::handle excluded(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+  sc::handle unrelated(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+  ASSERT_NE(excluded.get(), nullptr);
+  ASSERT_NE(unrelated.get(), nullptr);
+  EXPECT_FALSE(excluded_object_is_present(unrelated.get(), excluded.get()));
+  EXPECT_TRUE(excluded_object_is_present(excluded.get(), excluded.get()));
+  HANDLE alias = nullptr;
+  ASSERT_TRUE(DuplicateHandle(GetCurrentProcess(), excluded.get(), GetCurrentProcess(), &alias, 0, FALSE, DUPLICATE_SAME_ACCESS));
+  sc::handle duplicate(alias);
+  EXPECT_TRUE(excluded_object_is_present(duplicate.get(), excluded.get()));
 }
