@@ -153,6 +153,7 @@ namespace display_device::topology {
 
     std::atomic<stage_e> stage { stage_e::pending };
     std::atomic<reject_reason_e> reason { reject_reason_e::none };
+    std::promise<command_result_t> posted_completion;
   };
 
   struct coordinator_t::startup_signal_t {
@@ -295,8 +296,8 @@ namespace display_device::topology {
 
   topology_command_queue_t::task_t
   coordinator_t::make_task(command_kind_e kind, std::shared_ptr<command_state_t> state, command_body_t body,
-    std::optional<std::uint64_t> transaction, bool posted) {
-    return [this, kind, state = std::move(state), body = std::move(body), transaction, posted](const command_context_t &context) {
+    std::optional<std::uint64_t> transaction) {
+    return [this, kind, state = std::move(state), body = std::move(body), transaction](const command_context_t &context) {
       using stage_e = command_state_t::stage_e;
       const running_scope_t scope { this };
 
@@ -327,14 +328,11 @@ namespace display_device::topology {
           // Only a stop() racing the worker can reject startup recovery.
           complete_startup(outcome(outcome_e::stopped));
         }
-        else if (posted) {
-          notify_posted(kind, rejected(reason));
-        }
         return;
       }
 
       const mutation_capability_t capability { kind, options_.managed_mode, std::this_thread::get_id() };
-      if (!posted && kind != command_kind_e::startup_recovery) {
+      if (kind != command_kind_e::startup_recovery) {
         if (body) {
           body(capability, context);
         }
@@ -352,12 +350,8 @@ namespace display_device::topology {
         result.outcome = outcome_e::failed;
         result.exception = std::current_exception();
       }
-      if (kind == command_kind_e::startup_recovery) {
-        finish_recovery(result.outcome != outcome_e::failed);
-        complete_startup(std::move(result));
-        return;
-      }
-      notify_posted(kind, result);
+      finish_recovery(result.outcome != outcome_e::failed);
+      complete_startup(std::move(result));
     };
   }
 
@@ -393,11 +387,7 @@ namespace display_device::topology {
     if (!options_.posted_observer) {
       return;
     }
-    try {
-      options_.posted_observer(kind, result);
-    }
-    catch (...) {
-    }
+    options_.posted_observer(kind, result);
   }
 
   command_result_t
@@ -493,30 +483,56 @@ namespace display_device::topology {
 
   reject_reason_e
   coordinator_t::post(command_kind_e kind, command_body_t body) {
+    return post_tracked(kind, std::move(body)).reason;
+  }
+
+  posted_command_t
+  coordinator_t::post_tracked(command_kind_e kind, command_body_t body) {
     require_routable(kind);
     std::lock_guard lock { mutex_ };
     if (const auto reason = evaluate_locked(kind, std::nullopt, false); reason != reject_reason_e::none) {
-      return reason;
+      std::promise<command_result_t> signal;
+      auto future = signal.get_future().share();
+      signal.set_value(rejected(reason));
+      return { {}, reason, std::move(future) };
     }
-    submit_posted_locked(kind, std::move(body));
-    return reject_reason_e::none;
+    return submit_posted_locked(kind, std::move(body));
   }
 
   coordinator_t::submission_t
   coordinator_t::submit_locked(command_kind_e kind, const std::shared_ptr<command_state_t> &state, command_body_t body,
     std::optional<std::uint64_t> transaction, monotonic_time_t deadline, bool posted) {
     ++submitted_commands_;
-    return queue_->submit(queue_generation_, deadline, make_task(kind, state, std::move(body), transaction, posted));
+    topology_command_queue_t::completion_function_t completed;
+    if (posted) {
+      // Posted commands use the current queue generation and no deadline, so the queue
+      // always invokes this on the worker, never synchronously under our submit lock.
+      completed = [this, kind, state](const command_completion_t &completion) {
+        const running_scope_t scope { this };
+        bool stopping;
+        {
+          std::lock_guard lock { mutex_ };
+          stopping = stopping_;
+        }
+        auto result = map_completion(completion, *state, stopping);
+        try {
+          notify_posted(kind, result);
+        }
+        catch (...) {
+          result = { outcome_e::failed, reject_reason_e::none, std::current_exception() };
+        }
+        state->posted_completion.set_value(std::move(result));
+      };
+    }
+    return queue_->submit(queue_generation_, deadline, make_task(kind, state, std::move(body), transaction), std::move(completed));
   }
 
-  void
+  posted_command_t
   coordinator_t::submit_posted_locked(command_kind_e kind, command_body_t body) {
-    if (!queue_) {
-      return;
-    }
-    // Posted commands have no waiter; the completion future is intentionally dropped.
-    auto submission = submit_locked(kind, std::make_shared<command_state_t>(), std::move(body), std::nullopt, no_deadline, true);
-    static_cast<void>(submission);
+    auto state = std::make_shared<command_state_t>();
+    auto completion = state->posted_completion.get_future().share();
+    auto submission = submit_locked(kind, state, std::move(body), std::nullopt, no_deadline, true);
+    return { submission.handle, reject_reason_e::none, std::move(completion) };
   }
 
   void

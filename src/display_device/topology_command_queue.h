@@ -77,6 +77,7 @@ namespace display_device::topology {
   public:
     using clock_function_t = std::function<monotonic_time_t()>;
     using task_t = std::function<void(const command_context_t &)>;
+    using completion_function_t = std::function<void(const command_completion_t &)>;
 
     explicit topology_command_queue_t(clock_function_t now = {});
     ~topology_command_queue_t();
@@ -97,8 +98,14 @@ namespace display_device::topology {
     bool
     cancel(command_handle_t handle);
 
+    /**
+     * The optional completion callback runs exactly once, outside the queue lock, before
+     * the future becomes ready, even if the task never starts. Eager rejection calls it
+     * on the submitter; otherwise it runs on the worker. A throwing callback is reported
+     * as a failed completion through the future.
+     */
     command_submission_t
-    submit(std::uint64_t generation, monotonic_time_t deadline, task_t task);
+    submit(std::uint64_t generation, monotonic_time_t deadline, task_t task, completion_function_t completed = {});
 
   private:
     struct command_t {
@@ -106,6 +113,7 @@ namespace display_device::topology {
       std::uint64_t generation {};
       monotonic_time_t deadline {};
       task_t task;
+      completion_function_t completed;
       std::shared_ptr<std::atomic_bool> cancelled;
       std::promise<command_completion_t> completion;
     };
@@ -115,6 +123,9 @@ namespace display_device::topology {
 
     void
     run();
+
+    static void
+    complete(const std::shared_ptr<command_t> &command, command_completion_t completion);
 
     clock_function_t now_;
     mutable std::mutex mutex_;

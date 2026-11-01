@@ -325,14 +325,29 @@ limits. Those remain explicit later-gate obligations, not silent fallbacks.
 
 ## P1 implementation status
 
-The standalone `display_topology_coordinator_unit_tests` target exercises single-
-worker FIFO execution, generation invalidation, cancellation during an in-flight
-command, per-command launch cancellation without affecting an unrelated command
-in the same generation, queued deadline expiry, stale submissions and exception
-reporting. The queue has not yet been integrated with `session_t`, launch-ticket
-lifecycle, Windows topology mutation paths, durable journal recovery, or the
-administrator profile/status surface. No production display behavior has
-changed, and this status is not evidence for G1.
+The standalone coordinator and native-executor targets exercise single-worker
+FIFO execution, worker-only operation capabilities, admission and lease policy,
+per-command cancellation, setup deadlines, durable file journal storage,
+strict one-monitor profile parsing and ownership-aware recovery using fake
+platform operations. Native replay preserves unmanaged fields and fails closed
+on unknown ownership. These implementations are still unwired.
+
+Posted commands now offer individual completion receipts, including eager
+rejection, worker-side rejection, failure and shutdown cancellation before a
+body starts. Retry timers can associate receipts with their own generations;
+restore callers can keep a watchdog armed until completion without putting a
+waiter thread on every command. Accepted commands notify the observer exactly
+once, including commands whose body never ran. Observer failures are exposed
+through the receipt. A launch-ticket presence query and an active-only managed
+lease release are also implemented and tested.
+
+Production `session_t`, launch/RTSP lifecycle, Windows mutation paths and the
+administrator profile/status surface do not yet call the coordinator.
+No production display behavior has changed. G1 software evidence remains
+incomplete, and its manual N=1 hardware check remains blocked on GH consent.
+The user has authorized continuing safe software work after recording G1
+evidence without waiting for synchronous review; this does not waive GH, GD,
+GW or the requirement to report hardware-unverified milestones honestly.
 
 User-confirmed P1 decisions:
 

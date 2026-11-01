@@ -110,35 +110,54 @@ namespace display_device::topology {
   }
 
   command_submission_t
-  topology_command_queue_t::submit(std::uint64_t generation, monotonic_time_t deadline, task_t task) {
+  topology_command_queue_t::submit(std::uint64_t generation, monotonic_time_t deadline, task_t task, completion_function_t completed) {
     auto command = std::make_shared<command_t>();
     command->generation = generation;
     command->deadline = deadline;
     command->task = std::move(task);
+    command->completed = std::move(completed);
     command->cancelled = std::make_shared<std::atomic_bool>(false);
     auto future = command->completion.get_future();
     command_submission_t submission { { command->id, generation }, std::move(future) };
 
+    command_status_e status { command_status_e::completed };
     {
       std::lock_guard lock { mutex_ };
       command->id = next_id_++;
       submission.handle.id = command->id;
       if (stopping_) {
-        command->completion.set_value({ command->id, generation, command_status_e::queue_stopped, false, {} });
-        return submission;
+        status = command_status_e::queue_stopped;
       }
-      if (generation != generation_) {
-        command->completion.set_value({ command->id, generation, command_status_e::stale_generation, false, {} });
-        return submission;
+      else if (generation != generation_) {
+        status = command_status_e::stale_generation;
       }
-      if (now_() >= deadline) {
-        command->completion.set_value({ command->id, generation, command_status_e::expired_before_start, false, {} });
-        return submission;
+      else if (now_() >= deadline) {
+        status = command_status_e::expired_before_start;
       }
-      pending_.push_back(command);
+      else {
+        pending_.push_back(command);
+      }
+    }
+    if (status != command_status_e::completed) {
+      complete(command, { command->id, generation, status, false, {} });
+      return submission;
     }
     wake_.notify_one();
     return submission;
+  }
+
+  void
+  topology_command_queue_t::complete(const std::shared_ptr<command_t> &command, command_completion_t completion) {
+    if (command->completed) {
+      try {
+        command->completed(completion);
+      }
+      catch (...) {
+        completion.status = command_status_e::failed;
+        completion.exception = std::current_exception();
+      }
+    }
+    command->completion.set_value(std::move(completion));
   }
 
   monotonic_time_t
@@ -204,7 +223,7 @@ namespace display_device::topology {
         std::lock_guard lock { mutex_ };
         if (active_ == command) active_.reset();
       }
-      command->completion.set_value(std::move(completion));
+      complete(command, std::move(completion));
       wake_.notify_one();
     }
   }

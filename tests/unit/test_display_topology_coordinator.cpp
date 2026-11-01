@@ -214,4 +214,43 @@ namespace {
     EXPECT_FALSE(cancelled_task_ran.load());
     EXPECT_TRUE(unrelated_task_ran.load());
   }
+  TEST(DisplayTopologyCommandQueue, CompletionCallbacksCoverEagerAndExecutedOutcomesOutsideTheQueueLock) {
+    fake_clock_t clock;
+    topology_command_queue_t queue { [&clock]() { return clock.now(); } };
+    std::vector<command_completion_t> records;
+    const auto completed = [&](const command_completion_t &result) {
+      EXPECT_EQ(queue.generation(), 1u);
+      records.push_back(result);
+    };
+    auto expired = queue.submit(1, 0ms, [](const auto &) { FAIL() << "expired body ran"; }, completed);
+    ASSERT_EQ(records.size(), 1u);
+    EXPECT_EQ(records[0].status, command_status_e::expired_before_start);
+    EXPECT_FALSE(records[0].started);
+    EXPECT_EQ(records[0].id, expired.handle.id);
+    auto stale = queue.submit(0, 100ms, [](const auto &) { FAIL() << "stale body ran"; }, completed);
+    ASSERT_EQ(records.size(), 2u);
+    EXPECT_EQ(records[1].status, command_status_e::stale_generation);
+    EXPECT_EQ(records[1].generation, 0u);
+    auto normal = queue.submit(1, 100ms, [](const auto &) {}, completed);
+    ASSERT_EQ(normal.completion.wait_for(5s), std::future_status::ready);
+    EXPECT_EQ(normal.completion.get().status, command_status_e::completed);
+    ASSERT_EQ(records.size(), 3u);
+    EXPECT_EQ(records[2].id, normal.handle.id);
+    EXPECT_EQ(records[2].status, command_status_e::completed);
+    EXPECT_TRUE(records[2].started);
+  }
+
+  TEST(DisplayTopologyCommandQueue, CompletionCallbackExceptionsAreReturnedThroughTheFuture) {
+    fake_clock_t clock;
+    topology_command_queue_t queue { [&clock]() { return clock.now(); } };
+    for (const auto deadline : { 0ms, 100ms }) {
+      auto submitted = queue.submit(1, deadline, [](const auto &) {}, [](const auto &) { throw std::runtime_error { "completion failed" }; });
+      ASSERT_EQ(submitted.completion.wait_for(5s), std::future_status::ready);
+      const auto result = submitted.completion.get();
+      EXPECT_EQ(result.status, command_status_e::failed);
+      ASSERT_TRUE(result.exception);
+      EXPECT_THROW(std::rethrow_exception(result.exception), std::runtime_error);
+    }
+    EXPECT_EQ(queue.submit(1, 100ms, [](const auto &) {}).completion.get().status, command_status_e::completed);
+  }
 }  // namespace

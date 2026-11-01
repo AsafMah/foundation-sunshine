@@ -111,6 +111,12 @@ namespace display_device::topology {
     }
   };
 
+  struct posted_command_t {
+    command_handle_t handle;
+    reject_reason_e reason { reject_reason_e::none };
+    std::shared_future<command_result_t> completion;
+  };
+
   struct launch_request_t {
     std::uint32_t launch_session_id {};
     /** Stable client identity; empty means "never the same client". */
@@ -188,7 +194,7 @@ namespace display_device::topology {
      * If it throws, native health becomes In conflict before any later command runs.
      */
     command_body_t native_restore;
-    /** Observer for posted (fire-and-forget) commands whose body ran or failed. */
+    /** Observer for every accepted posted command, including cancellation before start. */
     std::function<void(command_kind_e, const command_result_t &)> posted_observer;
   };
 
@@ -229,6 +235,16 @@ namespace display_device::topology {
      */
     reject_reason_e
     post(command_kind_e kind, command_body_t body);
+
+    /**
+     * @brief Post with a per-command receipt, for restore watchdogs and retry generations.
+     * @details The future completes on every terminal path, including eager rejection,
+     *          worker rejection and shutdown cancellation. No waiter thread is created.
+     *          Never wait on it from the worker. Observer exceptions are reported as
+     *          failed results rather than leaving the receipt unresolved.
+     */
+    posted_command_t
+    post_tracked(command_kind_e kind, command_body_t body);
 
     launch_admission_t
     admit_launch(const launch_request_t &request);
@@ -351,7 +367,7 @@ namespace display_device::topology {
 
     topology_command_queue_t::task_t
     make_task(command_kind_e kind, std::shared_ptr<command_state_t> state, command_body_t body,
-      std::optional<std::uint64_t> transaction, bool posted);
+      std::optional<std::uint64_t> transaction);
 
     command_result_t
     wait(submission_t &submission, const std::shared_ptr<command_state_t> &state, monotonic_time_t deadline);
@@ -367,7 +383,7 @@ namespace display_device::topology {
     submit_locked(command_kind_e kind, const std::shared_ptr<command_state_t> &state, command_body_t body,
       std::optional<std::uint64_t> transaction, monotonic_time_t deadline, bool posted);
 
-    void
+    posted_command_t
     submit_posted_locked(command_kind_e kind, command_body_t body);
 
     void

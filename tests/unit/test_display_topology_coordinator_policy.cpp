@@ -1911,6 +1911,142 @@ namespace {
     EXPECT_EQ(scales.load(), 1);
   }
 
+  TEST(DisplayTopologyCoordinator, PostedShutdownCancellationIsObservedWithoutRunningTheBody) {
+    fake_clock_t clock;
+    posted_log_t posted;
+    auto options = make_options(clock);
+    options.posted_observer = posted.observer();
+    coordinator_t coordinator { options };
+    ASSERT_TRUE(coordinator.start({}).get().completed());
+    gate_t worker;
+    ASSERT_EQ(coordinator.post(command_kind_e::rotate, worker.body()), reject_reason_e::none);
+    ASSERT_TRUE(worker.wait_started());
+    std::atomic_int calls {};
+    const auto retry = coordinator.post_tracked(command_kind_e::legacy_retry_tick, counting(calls));
+    ASSERT_EQ(retry.reason, reject_reason_e::none);
+    auto stopping = std::async(std::launch::async, [&]() { coordinator.stop(); });
+    EXPECT_TRUE(wait_until([&]() { return coordinator.status().phase == coordinator_phase_e::stopped; }));
+    worker.release();
+    stopping.get();
+    EXPECT_EQ(calls, 0);
+    ASSERT_EQ(retry.completion.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_EQ(retry.completion.get().outcome, outcome_e::stopped);
+    const auto records = posted.records();
+    ASSERT_EQ(records.size(), 2u);
+    EXPECT_EQ(records[1].kind, command_kind_e::legacy_retry_tick);
+    EXPECT_EQ(records[1].outcome, outcome_e::stopped);
+    EXPECT_FALSE(records[1].has_exception);
+  }
+
+  TEST(DisplayTopologyCoordinator, TrackedPostsReportEagerRejectionWithoutAnObserverOrBodyCall) {
+    fake_clock_t clock;
+    posted_log_t posted;
+    std::atomic_int calls {};
+    auto options = make_options(clock);
+    options.posted_observer = posted.observer();
+    coordinator_t coordinator { options };
+    const auto check = [&](reject_reason_e reason) {
+      const auto receipt = coordinator.post_tracked(command_kind_e::legacy_retry_tick, counting(calls));
+      EXPECT_EQ(receipt.reason, reason);
+      EXPECT_EQ(receipt.handle.id, 0u);
+      ASSERT_EQ(receipt.completion.wait_for(0ms), std::future_status::ready);
+      EXPECT_EQ(receipt.completion.get().outcome, outcome_e::rejected);
+      EXPECT_EQ(receipt.completion.get().reason, reason);
+    };
+    check(reject_reason_e::not_started);
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    coordinator.install_fence([]() { return false; });
+    check(reject_reason_e::fence_active);
+    coordinator.begin_draining();
+    check(reject_reason_e::draining);
+    coordinator.stop();
+    check(reject_reason_e::stopped);
+    EXPECT_EQ(calls, 0);
+    EXPECT_TRUE(posted.records().empty());
+  }
+
+  TEST(DisplayTopologyCoordinator, TrackedPostsKeepDistinctReceiptsThroughWorkerRejection) {
+    fake_clock_t clock;
+    std::atomic_int calls {};
+    posted_log_t posted;
+    auto options = make_options(clock);
+    options.posted_observer = posted.observer();
+    coordinator_t coordinator { options };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    gate_t worker;
+    const auto blocking = coordinator.post_tracked(command_kind_e::rotate, worker.body());
+    ASSERT_TRUE(worker.wait_started());
+    const auto first = coordinator.post_tracked(command_kind_e::legacy_retry_tick, counting(calls));
+    const auto second = coordinator.post_tracked(command_kind_e::legacy_retry_tick, counting(calls));
+    ASSERT_EQ(first.reason, reject_reason_e::none);
+    ASSERT_EQ(second.reason, reject_reason_e::none);
+    EXPECT_NE(first.handle.id, second.handle.id);
+    EXPECT_EQ(first.handle.generation, second.handle.generation);
+    EXPECT_EQ(first.completion.wait_for(0ms), std::future_status::timeout);
+    coordinator.install_fence([]() { return false; });
+    worker.release();
+    for (const auto &receipt : { first, second }) {
+      ASSERT_EQ(receipt.completion.wait_for(real_timeout), std::future_status::ready);
+      EXPECT_EQ(receipt.completion.get().outcome, outcome_e::rejected);
+      EXPECT_EQ(receipt.completion.get().reason, reject_reason_e::fence_active);
+    }
+    EXPECT_TRUE(blocking.completion.get().completed());
+    EXPECT_EQ(calls, 0);
+    EXPECT_EQ(posted.records().size(), 3u);
+  }
+
+  TEST(DisplayTopologyCoordinator, TrackedRestoreWaitsForBodyAndObserverWithoutHoldingTheStateLock) {
+    fake_clock_t clock;
+    gate_t observer;
+    coordinator_t *owner {};
+    std::atomic<outcome_e> nested { outcome_e::completed };
+    auto options = make_options(clock);
+    options.posted_observer = [&](command_kind_e, const command_result_t &) {
+      EXPECT_EQ(owner->status().phase, coordinator_phase_e::running);
+      nested = owner->run(command_kind_e::rotate, {}).outcome;
+      observer.hook()();
+    };
+    coordinator_t coordinator { options };
+    owner = &coordinator;
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    gate_t worker;
+    const auto release_observer = finally_t { [&]() { observer.release(); } };
+    const auto receipt = coordinator.post_tracked(command_kind_e::stream_restore, worker.body());
+    ASSERT_TRUE(worker.wait_started());
+    EXPECT_EQ(receipt.completion.wait_for(0ms), std::future_status::timeout);
+    worker.release();
+    ASSERT_TRUE(observer.wait_started());
+    EXPECT_EQ(receipt.completion.wait_for(0ms), std::future_status::timeout);
+    observer.release();
+    ASSERT_EQ(receipt.completion.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_TRUE(receipt.completion.get().completed());
+    EXPECT_EQ(nested.load(), outcome_e::reentrant);
+  }
+
+  TEST(DisplayTopologyCoordinator, TrackedPostsSurfaceBodyAndObserverFailuresAndKeepProcessing) {
+    fake_clock_t clock;
+    auto options = make_options(clock);
+    options.posted_observer = [](command_kind_e kind, const command_result_t &) {
+      if (kind == command_kind_e::scale) {
+        throw std::logic_error { "observer failed" };
+      }
+    };
+    coordinator_t coordinator { options };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto body = coordinator.post_tracked(command_kind_e::rotate, [](const auto &, const auto &) {
+      throw std::runtime_error { "body failed" };
+    });
+    const auto observer = coordinator.post_tracked(command_kind_e::scale, {});
+    for (const auto &receipt : { body, observer }) {
+      ASSERT_EQ(receipt.completion.wait_for(real_timeout), std::future_status::ready);
+      EXPECT_EQ(receipt.completion.get().outcome, outcome_e::failed);
+      ASSERT_TRUE(receipt.completion.get().exception);
+    }
+    EXPECT_THROW(std::rethrow_exception(body.completion.get().exception), std::runtime_error);
+    EXPECT_THROW(std::rethrow_exception(observer.completion.get().exception), std::logic_error);
+    EXPECT_TRUE(coordinator.post_tracked(command_kind_e::stream_restore, {}).completion.get().completed());
+  }
+
   TEST(DisplayTopologyCoordinator, PostedFailuresAreReportedAndTheWorkerContinues) {
     fake_clock_t clock;
     posted_log_t posted;
