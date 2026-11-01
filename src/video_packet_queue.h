@@ -27,11 +27,11 @@ namespace video {
    * at most once per second with the count accumulated since the last report.
    */
   inline void
-  raise_packet(safe::mail_raw_t::queue_t<packet_t> &packets, packet_t &&packet) {
+  raise_packet(safe::mail_raw_t::queue_t<packet_t> &packets, packet_t &&packet, std::size_t max_depth = max_queued_packets) {
     static std::atomic<std::uint64_t> pending_drops { 0 };
     static std::atomic<std::int64_t> last_report_ms { std::numeric_limits<std::int64_t>::min() };
 
-    const auto dropped = packets->raise_superseding(max_queued_packets, std::move(packet));
+    const auto dropped = packets->raise_superseding(max_depth, std::move(packet));
     if (dropped == 0) {
       return;
     }
@@ -51,4 +51,20 @@ namespace video {
                        << " superseded encoded frame(s) since last report; broadcast is behind the encoder"
                        << " and the client will see the gap as frame loss";
   }
+
+  /**
+   * @brief Outputs drained from the encoder in one pass (e.g. an AMF
+   * pre-analysis/multi-HW batch). The cap applies only to frames queued before
+   * the batch, so a batch never supersedes its own outputs.
+   */
+  class packet_batch_t {
+  public:
+    void
+    raise(safe::mail_raw_t::queue_t<packet_t> &packets, packet_t &&packet) {
+      raise_packet(packets, std::move(packet), max_queued_packets + emitted_++);
+    }
+
+  private:
+    std::size_t emitted_ = 0;
+  };
 }  // namespace video

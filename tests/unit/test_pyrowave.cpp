@@ -1052,6 +1052,28 @@ TEST(PyrowaveTransportTest, QueueOverflowKeepsOnlyNewestFramesAndWarns) {
   EXPECT_NE(text.find("Video packet queue full: dropped "), std::string::npos) << text;
 }
 
+TEST(PyrowaveTransportTest, PacketBatchSupersedesOnlyFramesQueuedBeforeIt) {
+  auto mail = std::make_shared<safe::mail_raw_t>();
+  auto packets = mail->queue<video::packet_t>("pyrowave-test-video");
+  auto frame = [](std::int64_t index) {
+    return std::make_unique<video::packet_raw_generic>(std::vector<std::uint8_t>(16, 0x11), index, false);
+  };
+  // The broadcast thread is behind with a full backlog before the batch.
+  for (std::int64_t index = 1; index <= static_cast<std::int64_t>(video::max_queued_packets); ++index) {
+    video::raise_packet(packets, frame(index));
+  }
+  // One AMF collection pass emits a pre-analysis/multi-HW batch of outputs.
+  video::packet_batch_t batch;
+  for (std::int64_t index = 10; index < 16; ++index) {
+    batch.raise(packets, frame(index));
+  }
+  std::vector<std::int64_t> queued;
+  while (packets->peek()) {
+    queued.push_back(packets->pop(std::chrono::milliseconds(0))->frame_index());
+  }
+  EXPECT_EQ(queued, (std::vector<std::int64_t> { 10, 11, 12, 13, 14, 15 }));
+}
+
 TEST(PyrowaveTransportTest, DoesNotQueueFailedPacketization) {
   auto mail = std::make_shared<safe::mail_raw_t>();
   auto packets = mail->queue<video::packet_t>("pyrowave-test-video");

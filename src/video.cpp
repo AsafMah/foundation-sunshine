@@ -2593,7 +2593,8 @@ namespace video {
     amf::amf_encoded_frame encoded_frame,
     amf_encode_session_t &session,
     safe::mail_raw_t::queue_t<packet_t> &packets,
-    void *channel_data) {
+    void *channel_data,
+    packet_batch_t &batch) {
     if (encoded_frame.fatal) {
       // Encoder is in unrecoverable state (device lost or repeated failures);
       // propagate fatal so the session reinitializes instead of silently
@@ -2622,13 +2623,13 @@ namespace video {
       packet->pipeline_trace = std::move(encoded_trace);
     }
     perf::record_encoded_frame(session.perf_session_id);
-    raise_packet(packets, std::move(packet));
+    batch.raise(packets, std::move(packet));
 
     return 0;
   }
 
   int
-  collect_amf_outputs(encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data) {
+  collect_amf_outputs(encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, packet_batch_t &batch) {
     auto amf_session = dynamic_cast<amf_encode_session_t *>(&session);
     if (!amf_session) return 0;
 
@@ -2637,11 +2638,17 @@ namespace video {
     constexpr int max_outputs_per_pass = 32;
     for (int output = 0; output < max_outputs_per_pass && amf_session->has_pending_output(); ++output) {
       auto frame = amf_session->receive_frame();
-      if (frame.fatal) return emit_amf_output(std::move(frame), *amf_session, packets, channel_data);
+      if (frame.fatal) return emit_amf_output(std::move(frame), *amf_session, packets, channel_data, batch);
       if (frame.data.empty()) break;
-      if (emit_amf_output(std::move(frame), *amf_session, packets, channel_data)) return -1;
+      if (emit_amf_output(std::move(frame), *amf_session, packets, channel_data, batch)) return -1;
     }
     return 0;
+  }
+
+  int
+  collect_amf_outputs(encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data) {
+    packet_batch_t batch;
+    return collect_amf_outputs(session, packets, channel_data, batch);
   }
 
   int
@@ -2659,7 +2666,8 @@ namespace video {
     session.track_frame_timestamp(submitted_frame_index, frame_timestamp, std::move(pipeline_trace));
 
     auto encoded_frame = session.encode_frame(frame_nr);
-    if (encoded_frame.fatal) return emit_amf_output(std::move(encoded_frame), session, packets, channel_data);
+    packet_batch_t batch;
+    if (encoded_frame.fatal) return emit_amf_output(std::move(encoded_frame), session, packets, channel_data, batch);
     if (encoded_frame.data.empty()) {
       if (encoded_frame.frame_index != submitted_frame_index) return -1;
       BOOST_LOG(debug) << "AMF: frame " << frame_nr << " buffered, waiting for more input";
@@ -2671,9 +2679,9 @@ namespace video {
       else if (encoded_frame.frame_index < submitted_frame_index) {
         BOOST_LOG(debug) << "AMF pipeline lag: submitted " << frame_nr << ", got " << encoded_frame.frame_index;
       }
-      if (emit_amf_output(std::move(encoded_frame), session, packets, channel_data)) return -1;
+      if (emit_amf_output(std::move(encoded_frame), session, packets, channel_data, batch)) return -1;
     }
-    return collect_amf_outputs(session, packets, channel_data);
+    return collect_amf_outputs(session, packets, channel_data, batch);
   }
 
   struct encoder_rebuild_context_t {

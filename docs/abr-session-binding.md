@@ -132,7 +132,9 @@ Encoded video frames are handed to the broadcast thread with at most 2 frames
 waiting. If the broadcast thread is behind when a new frame arrives, every
 waiting frame is dropped and only the newest is queued, so no standing latency
 backlog can form (previously up to 32 frames could queue, then were cleared
-silently). A WARNING `Video packet queue full: dropped N superseded encoded
+silently). Outputs drained from AMF in one encode/collection pass (pre-analysis
+or multi-HW batches) are a batch: the cap applies only to frames queued before
+the batch, so a batch never supersedes its own outputs. A WARNING `Video packet queue full: dropped N superseded encoded
 frame(s)...` is logged at most once per second. The client sees dropped frames
 as frame loss, which can feed ABR loss reports.
 
