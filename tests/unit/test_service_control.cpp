@@ -202,3 +202,54 @@ TEST(ServiceControl, RealFakeCoreInheritsOnlyTheWhitelistedGenerationEvents) {
   ASSERT_TRUE(GetExitCodeProcess(child_process.get(), &exit_code));
   EXPECT_EQ(exit_code, 0u);
 }
+
+TEST(ServiceControl, ThreeCoreGenerationsRefreshBothProcessAttributes) {
+  sc::process_attributes attributes;
+  for (const bool reuse_helper : { true, false }) {
+    SCOPED_TRACE(reuse_helper ? "Reuse setup helper" : "Fresh per-generation helper");
+    for (int number = 1; number <= 3; ++number) {
+      sc::process_attributes fresh_attributes;
+      SCOPED_TRACE("Core generation " + std::to_string(number));
+      sc::handle stop(CreateEventW(nullptr, TRUE, TRUE, nullptr));
+      sc::generation_events generation;
+      ASSERT_EQ(generation.create(stop.get()), ERROR_SUCCESS);
+      ASSERT_TRUE(SetEvent(generation.restart()));
+      sc::handle job(CreateJobObjectW(nullptr, nullptr));
+      ASSERT_NE(job.get(), nullptr);
+      JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits {};
+      limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+      ASSERT_TRUE(SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation, &limits, sizeof(limits)));
+      SECURITY_ATTRIBUTES security { sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
+      sc::handle excluded(CreateEventW(&security, TRUE, FALSE, nullptr));
+      wchar_t module[MAX_PATH] {};
+      ASSERT_NE(GetModuleFileNameW(nullptr, module, MAX_PATH), 0u);
+      const auto child = std::filesystem::path(module).parent_path() / L"service_control_test_child.exe";
+      auto command = L"\"" + child.wstring() + L"\"" + generation.command().substr(std::wstring_view(L"Sunshine.exe").size()) +
+                     L" --excluded-handle=" + std::to_wstring(reinterpret_cast<std::uintptr_t>(excluded.get()));
+      STARTUPINFOEXW startup {};
+      startup.StartupInfo.cb = sizeof(startup);
+      const HANDLE whitelist[] = { generation.child_restart(), generation.child_stop() };
+      const auto error = (reuse_helper ? attributes : fresh_attributes).prepare(startup, whitelist, job.get());
+      ASSERT_EQ(error, ERROR_SUCCESS) << "process attribute setup failed with Win32 error " << error;
+      PROCESS_INFORMATION process {};
+      ASSERT_TRUE(CreateProcessW(child.c_str(), command.data(), nullptr, nullptr, TRUE,
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW | CREATE_SUSPENDED,
+        nullptr, nullptr, &startup.StartupInfo, &process))
+        << GetLastError();
+      sc::handle thread(process.hThread), child_process(process.hProcess);
+      BOOL in_job = FALSE;
+      EXPECT_TRUE(IsProcessInJob(child_process.get(), job.get(), &in_job));
+      EXPECT_TRUE(in_job);
+      ASSERT_NE(ResumeThread(thread.get()), static_cast<DWORD>(-1));
+      const auto waited = WaitForSingleObject(child_process.get(), 5000);
+      if (waited != WAIT_OBJECT_0) {
+        TerminateProcess(child_process.get(), 100);
+        WaitForSingleObject(child_process.get(), 1000);
+      }
+      ASSERT_EQ(waited, WAIT_OBJECT_0);
+      DWORD exit_code = 0;
+      ASSERT_TRUE(GetExitCodeProcess(child_process.get(), &exit_code));
+      EXPECT_EQ(exit_code, 0u);
+    }
+  }
+}

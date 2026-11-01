@@ -89,24 +89,6 @@ CreateJobObjectForChildProcess() {
   return job_handle;
 }
 
-LPPROC_THREAD_ATTRIBUTE_LIST
-AllocateProcThreadAttributeList(DWORD attribute_count) {
-  SIZE_T size;
-  InitializeProcThreadAttributeList(NULL, attribute_count, 0, &size);
-
-  auto list = (LPPROC_THREAD_ATTRIBUTE_LIST) HeapAlloc(GetProcessHeap(), 0, size);
-  if (list == NULL) {
-    return NULL;
-  }
-
-  if (!InitializeProcThreadAttributeList(list, attribute_count, 0, &size)) {
-    HeapFree(GetProcessHeap(), 0, list);
-    return NULL;
-  }
-
-  return list;
-}
-
 HANDLE
 DuplicateTokenForSession(DWORD console_session_id) {
   HANDLE current_token;
@@ -443,7 +425,7 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
     return;
   }
 
-  // We can use a single STARTUPINFOEXW for all the processes that we launch
+  // Common startup fields; process attributes are initialized per generation.
   STARTUPINFOEXW startup_info = {};
   startup_info.StartupInfo.cb = sizeof(startup_info);
   startup_info.StartupInfo.lpDesktop = (LPWSTR) L"winsta0\\default";
@@ -451,16 +433,6 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
   startup_info.StartupInfo.hStdInput = NULL;
   startup_info.StartupInfo.hStdOutput = log_file_handle;
   startup_info.StartupInfo.hStdError = log_file_handle;
-
-  // Allocate an attribute list with space for 2 entries
-  startup_info.lpAttributeList = AllocateProcThreadAttributeList(2);
-  if (startup_info.lpAttributeList == NULL) {
-    // Tell SCM we failed to start
-    service_status.dwWin32ExitCode = GetLastError();
-    service_status.dwCurrentState = SERVICE_STOPPED;
-    SetServiceStatus(service_status_handle, &service_status);
-    return;
-  }
 
   // Tell SCM we're running (and stoppable now)
   service_status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PRESHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE;
@@ -601,12 +573,6 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
       continue;
     }
     const HANDLE inherited_handles[] = { log_file_handle, control_events.child_restart(), control_events.child_stop() };
-    const auto whitelist_error = sunshinesvc::service_control::set_handle_list(startup_info, inherited_handles);
-    if (whitelist_error != ERROR_SUCCESS) {
-      WriteServiceLog(log_file_handle, "Core event handle whitelist failed (Win32 error " + std::to_string(whitelist_error) + ")");
-      CloseHandle(console_token);
-      continue;
-    }
     auto core_command = control_events.command();
 
     // Job objects cannot span sessions, so we must create one for each process
@@ -616,15 +582,16 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
       continue;
     }
 
-    // Start Sunshine.exe inside our job object
-    UpdateProcThreadAttribute(startup_info.lpAttributeList,
-      0,
-      PROC_THREAD_ATTRIBUTE_JOB_LIST,
-      &job_handle,
-      sizeof(job_handle),
-      NULL,
-      NULL);
+    sunshinesvc::service_control::process_attributes attributes;
+    const auto attribute_error = attributes.prepare(startup_info, inherited_handles, job_handle);
+    if (attribute_error != ERROR_SUCCESS) {
+      WriteServiceLog(log_file_handle, "Core process attribute setup failed (Win32 error " + std::to_string(attribute_error) + ")");
+      CloseHandle(job_handle);
+      CloseHandle(console_token);
+      continue;
+    }
 
+    // Both attribute values and the job remain alive throughout this generation.
     PROCESS_INFORMATION process_info;
     if (!CreateProcessAsUserW(console_token,
           L"Sunshine.exe",
