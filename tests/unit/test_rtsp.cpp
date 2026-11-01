@@ -4,6 +4,9 @@
  */
 
 #include <array>
+#include <atomic>
+#include <future>
+#include <stdexcept>
 
 #include "src/launch_session_manager.h"
 #include "src/rtsp.h"
@@ -67,6 +70,102 @@ TEST(LaunchSessionManager, ClientRevocationRemovesItsPendingAndClaimedTicketsOnl
   EXPECT_EQ(manager.erase_client(""), 0U);
   EXPECT_FALSE(manager.claim_plaintext("192.0.2.10"));
   EXPECT_TRUE(manager.claim_plaintext("192.0.2.20"));
+}
+
+TEST(LaunchSessionManager, RejectedBindingNeverPublishesOrReplacesATicket) {
+  rtsp_stream::launch_session_manager_t manager;
+  const auto now = rtsp_stream::launch_session_manager_t::clock_t::now();
+  std::size_t checks {};
+  const auto reject = [&]() { ++checks; return false; };
+  EXPECT_EQ(manager.register_session(make_session(101, "cert", "192.0.2.1"), 10s, now, reject),
+            rtsp_stream::launch_ticket_register_e::binding_rejected);
+  EXPECT_FALSE(manager.claim_plaintext("192.0.2.1", now));
+  EXPECT_EQ(manager.size(now), 0u);
+  manager.clear();
+  ASSERT_EQ(manager.register_session(make_session(102, "cert", "192.0.2.1"), 10s, now),
+            rtsp_stream::launch_ticket_register_e::accepted);
+  EXPECT_EQ(manager.register_session(make_session(103, "cert", "192.0.2.2"), 20s, now, reject),
+            rtsp_stream::launch_ticket_register_e::binding_rejected);
+  EXPECT_TRUE(manager.contains(102, now));
+  EXPECT_FALSE(manager.contains(103, now));
+  EXPECT_EQ(checks, 2u);
+  EXPECT_EQ(manager.prune(now + 10s), 1u) << "a failed replacement must not extend the old ticket's expiry";
+}
+
+TEST(LaunchSessionManager, BindingExceptionsLeaveTheOriginalTicketUntouched) {
+  rtsp_stream::launch_session_manager_t manager;
+  const auto now = rtsp_stream::launch_session_manager_t::clock_t::now();
+  const auto fail = []() -> bool { throw std::runtime_error { "bind failed" }; };
+  EXPECT_THROW(manager.register_session(make_session(104, "cert", "192.0.2.4"), 10s, now, fail), std::runtime_error);
+  EXPECT_EQ(manager.size(now), 0u);
+  manager.clear();
+  ASSERT_EQ(manager.register_session(make_session(105, "cert", "192.0.2.5"), 10s, now),
+            rtsp_stream::launch_ticket_register_e::accepted);
+  EXPECT_THROW(manager.register_session(make_session(106, "cert", "192.0.2.6"), 10s, now, fail), std::runtime_error);
+  auto original = manager.claim_plaintext("192.0.2.5", now);
+  ASSERT_TRUE(original);
+  EXPECT_EQ(original->id, 105u);
+}
+
+TEST(LaunchSessionManager, BindingRunsOnlyAfterTicketAdmissionChecks) {
+  rtsp_stream::launch_session_manager_t manager { 1, 1 };
+  const auto now = rtsp_stream::launch_session_manager_t::clock_t::now();
+  std::size_t checks {};
+  const auto bind = [&]() { ++checks; return true; };
+  ASSERT_EQ(manager.register_session(make_session(107, "cert", "192.0.2.7"), 10s, now, bind),
+            rtsp_stream::launch_ticket_register_e::accepted);
+  EXPECT_EQ(checks, 1u);
+  ASSERT_EQ(manager.register_session(make_session(108, "cert", "192.0.2.8"), 10s, now, bind),
+            rtsp_stream::launch_ticket_register_e::replaced);
+  EXPECT_EQ(checks, 2u);
+  ASSERT_TRUE(manager.claim_plaintext("192.0.2.8", now));
+  EXPECT_EQ(manager.register_session(make_session(109, "cert", "192.0.2.9"), 10s, now, bind),
+            rtsp_stream::launch_ticket_register_e::client_busy);
+  EXPECT_EQ(manager.register_session(make_session(110, "different", "192.0.2.10"), 10s, now, bind),
+            rtsp_stream::launch_ticket_register_e::global_limit);
+  EXPECT_EQ(checks, 2u);
+  rtsp_stream::launch_session_manager_t legacy { 2, 1 };
+  ASSERT_EQ(legacy.register_session(make_session(111, {}, "192.0.2.11"), 10s, now),
+            rtsp_stream::launch_ticket_register_e::accepted);
+  EXPECT_EQ(legacy.register_session(make_session(112, {}, "192.0.2.11"), 10s, now, bind),
+            rtsp_stream::launch_ticket_register_e::client_limit);
+  EXPECT_EQ(checks, 2u);
+}
+
+TEST(LaunchSessionManager, ConcurrentClaimCannotObserveATicketBeforeBindingFinishes) {
+  rtsp_stream::launch_session_manager_t manager;
+  const auto now = rtsp_stream::launch_session_manager_t::clock_t::now();
+  std::promise<void> entered, release, claiming;
+  auto entered_future = entered.get_future();
+  auto release_future = release.get_future().share();
+  auto claiming_future = claiming.get_future();
+  std::atomic_bool bound {};
+  auto publishing = std::async(std::launch::async, [&]() {
+    return manager.register_session(make_session(113, "cert", "192.0.2.13"), 10s, now, [&]() {
+      entered.set_value();
+      release_future.wait();
+      bound = true;
+      return true;
+    });
+  });
+  const bool binding_started = entered_future.wait_for(2s) == std::future_status::ready;
+  if (!binding_started) {
+    release.set_value();
+    FAIL() << "registration never ran the binding check";
+  }
+  auto claim = std::async(std::launch::async, [&]() {
+    claiming.set_value();
+    const auto ticket = manager.claim_plaintext("192.0.2.13", now);
+    EXPECT_TRUE(bound) << "a ticket was claimable before binding completed";
+    return ticket;
+  });
+  EXPECT_EQ(claiming_future.wait_for(2s), std::future_status::ready);
+  EXPECT_EQ(claim.wait_for(20ms), std::future_status::timeout);
+  release.set_value();
+  EXPECT_EQ(publishing.get(), rtsp_stream::launch_ticket_register_e::accepted);
+  const auto ticket = claim.get();
+  ASSERT_TRUE(ticket);
+  EXPECT_EQ(ticket->id, 113u);
 }
 
 TEST(LaunchSessionManager, ReplacesPendingRetryButDoesNotReplaceClaimedHandshake) {

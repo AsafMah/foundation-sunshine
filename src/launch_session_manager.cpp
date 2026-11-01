@@ -69,7 +69,8 @@ namespace rtsp_stream {
   launch_ticket_register_e
   launch_session_manager_t::register_session(std::shared_ptr<launch_session_t> session,
                                              std::chrono::milliseconds timeout,
-                                             clock_t::time_point now) {
+                                             clock_t::time_point now,
+                                             std::function<bool()> before_publish) {
     if (!session) {
       return launch_ticket_register_e::global_limit;
     }
@@ -86,6 +87,9 @@ namespace rtsp_stream {
           return launch_ticket_register_e::client_busy;
         }
 
+        if (before_publish && !before_publish()) {
+          return launch_ticket_register_e::binding_rejected;
+        }
         same_client->session = std::move(session);
         same_client->state = launch_ticket_state_e::pending;
         same_client->claim_count = 0;
@@ -108,6 +112,11 @@ namespace rtsp_stream {
       return launch_ticket_register_e::global_limit;
     }
 
+    // Allocate before binding; publication after a successful bind must not allocate.
+    _impl->tickets.reserve(_impl->tickets.size() + 1);
+    if (before_publish && !before_publish()) {
+      return launch_ticket_register_e::binding_rejected;
+    }
     _impl->tickets.push_back({
       .session = std::move(session),
       .state = launch_ticket_state_e::pending,

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -32,6 +33,7 @@ namespace rtsp_stream {
     client_limit,
     client_busy,
     denied,
+    binding_rejected,
   };
 
   struct encrypted_launch_claim_t {
@@ -56,10 +58,18 @@ namespace rtsp_stream {
     launch_session_manager_t &
     operator=(const launch_session_manager_t &) = delete;
 
+    /**
+     * @brief Publish a ticket only after its optional binding check succeeds.
+     * @details before_publish runs once, under the ticket lock, after capacity checks
+     *          and before publication/replacement. It must be a short leaf operation:
+     *          no ticket-manager reentry, blocking work or platform calls. Exceptions
+     *          propagate without changing the ticket being replaced.
+     */
     launch_ticket_register_e
     register_session(std::shared_ptr<launch_session_t> session,
                      std::chrono::milliseconds timeout,
-                     clock_t::time_point now = clock_t::now());
+                     clock_t::time_point now = clock_t::now(),
+                     std::function<bool()> before_publish = {});
 
     std::shared_ptr<launch_session_t>
     claim_plaintext(std::string_view remote_address,

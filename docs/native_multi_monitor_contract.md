@@ -358,6 +358,14 @@ does not release another holder's fence. Cleanup commands remain admissible;
 new prepares follow submitted cleanup in queue order. The neutral interleaving
 fixtures cover this contract; RTSP has not yet been wired to use it.
 
+The ticket manager also supports a short binding check before publication or
+replacement, under its mutex and after capacity checks. A refused or throwing
+bind leaves the existing ticket untouched; concurrent claim/liveness readers
+cannot observe the interval between binding and publication. Legacy calls omit
+the hook and keep their existing behavior. Launch/resume wiring still needs to
+pass the coordinator bind operation and roll back any request-owned application
+on failure.
+
 Production `session_t`, launch/RTSP lifecycle, Windows mutation paths and the
 administrator profile/status surface do not yet call the coordinator.
 No production display behavior has changed. G1 software evidence remains
