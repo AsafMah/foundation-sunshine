@@ -327,10 +327,12 @@ namespace display_device {
 
   boost::optional<handled_topology_result_t>
   handle_device_topology_configuration(
+    const topology::mutation_capability_t &capability,
     const parsed_config_t &config,
     const boost::optional<topology_pair_t> &previously_configured_topology,
     const std::function<bool()> &revert_settings,
     const boost::optional<active_topology_t> &pre_saved_initial_topology) {
+    capability.require(topology::operation_e::configure_display);
     const bool primary_device_requested { config.device_id.empty() };
     const std::string requested_device_id { find_one_of_the_available_devices(config.device_id) };
     if (requested_device_id.empty()) {
@@ -415,7 +417,7 @@ namespace display_device {
     BOOST_LOG(debug) << "Current display topology: " << to_string(current_topology);
     if (!is_topology_the_same(current_topology, final_topology)) {
       BOOST_LOG(info) << "Changing display topology to: " << to_string(final_topology);
-      if (!set_topology(final_topology)) {
+      if (!set_topology(capability, final_topology)) {
         // Error already logged.
         return boost::none;
       }

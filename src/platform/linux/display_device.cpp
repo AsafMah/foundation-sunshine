@@ -22,7 +22,8 @@ namespace display_device {
   }
 
   bool
-  set_display_modes(const device_display_mode_map_t &) {
+  set_display_modes(const topology::mutation_capability_t &capability, const device_display_mode_map_t &) {
+    capability.require(topology::operation_e::write_display_modes);
     // Not implemented
     return false;
   }
@@ -34,7 +35,8 @@ namespace display_device {
   }
 
   bool
-  set_as_primary_device(const std::string &) {
+  set_as_primary_device(const topology::mutation_capability_t &capability, const std::string &) {
+    capability.require(topology::operation_e::write_primary);
     // Not implemented
     return false;
   }
@@ -46,7 +48,8 @@ namespace display_device {
   }
 
   bool
-  set_hdr_states(const hdr_state_map_t &) {
+  set_hdr_states(const topology::mutation_capability_t &capability, const hdr_state_map_t &) {
+    capability.require(topology::operation_e::write_hdr);
     // Not implemented
     return false;
   }
@@ -70,7 +73,8 @@ namespace display_device {
   }
 
   bool
-  set_topology(const active_topology_t &) {
+  set_topology(const topology::mutation_capability_t &capability, const active_topology_t &) {
+    capability.require(topology::operation_e::write_topology);
     // Not implemented
     return false;
   }
@@ -98,14 +102,16 @@ namespace display_device {
   }
 
   settings_t::apply_result_t
-  settings_t::apply_config(const parsed_config_t &, const rtsp_stream::launch_session_t &,
+  settings_t::apply_config(const topology::mutation_capability_t &capability, const parsed_config_t &, const rtsp_stream::launch_session_t &,
     automatic_vdd_policy_e, const boost::optional<active_topology_t> &) {
+    capability.require(topology::operation_e::configure_display);
     // Not implemented
     return { apply_result_t::result_e::success };
   }
 
   bool
-  settings_t::revert_settings(revert_reason_e reason, automatic_vdd_policy_e vdd_policy) {
+  settings_t::revert_settings(const topology::mutation_capability_t &capability, revert_reason_e reason, automatic_vdd_policy_e vdd_policy) {
+    capability.require(topology::operation_e::restore_state);
     // Not implemented
     (void)reason;  // Unused parameter
     (void)vdd_policy;  // Unused parameter
@@ -113,7 +119,13 @@ namespace display_device {
   }
 
   void
-  settings_t::reset_persistence(automatic_vdd_policy_e) {
+  settings_t::load_persistence(const topology::mutation_capability_t &capability) {
+    capability.require(topology::operation_e::restore_state);
+  }
+
+  void
+  settings_t::reset_persistence(const topology::mutation_capability_t &capability, automatic_vdd_policy_e) {
+    capability.require(topology::operation_e::reset_persistence);
     // Not implemented
   }
 

@@ -122,7 +122,8 @@ namespace display_device {
      * @see set_display_modes for a description as this was split off to reduce cognitive complexity.
      */
     bool
-    do_set_modes(const device_display_mode_map_t &modes, bool allow_changes) {
+    do_set_modes(const topology::mutation_capability_t &capability, const device_display_mode_map_t &modes, bool allow_changes) {
+      capability.require(topology::operation_e::write_display_modes);
       auto display_data { w_utils::query_display_config(w_utils::ACTIVE_ONLY_DEVICES) };
       if (!display_data) {
         // Error already logged
@@ -244,7 +245,8 @@ namespace display_device {
   }
 
   bool
-  set_display_modes(const device_display_mode_map_t &modes) {
+  set_display_modes(const topology::mutation_capability_t &capability, const device_display_mode_map_t &modes) {
+    capability.require(topology::operation_e::write_display_modes);
     if (modes.empty()) {
       BOOST_LOG(error) << "Modes map is empty!";
       return false;
@@ -290,7 +292,7 @@ namespace display_device {
     }
 
     constexpr bool allow_changes { true };
-    const bool first_attempt_ok { do_set_modes(modes, allow_changes) };
+    const bool first_attempt_ok { do_set_modes(capability, modes, allow_changes) };
 
     const auto all_modes_match = [&modes](const device_display_mode_map_t &current_modes) {
       for (const auto &[device_id, requested_mode] : modes) {
@@ -324,14 +326,14 @@ namespace display_device {
     // resolution to be selected, we actually need to omit SDC_ALLOW_CHANGES
     // flag.
     BOOST_LOG(info) << "Failed to change display modes using Windows recommended modes, trying to set modes more strictly!";
-    if (do_set_modes(modes, !allow_changes)) {
+    if (do_set_modes(capability, modes, !allow_changes)) {
       current_modes = get_current_display_modes(device_ids);
       if (!current_modes.empty() && all_modes_match(current_modes)) {
         return true;
       }
     }
 
-    do_set_modes(original_modes, allow_changes);  // Return value does not matter as we are trying out best to undo
+    do_set_modes(capability, original_modes, allow_changes);  // Return value does not matter as we are trying out best to undo
     BOOST_LOG(error) << "Failed to set display mode(-s) completely!";
     return false;
   }

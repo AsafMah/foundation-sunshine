@@ -6,7 +6,10 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
+#include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -16,6 +19,11 @@
 #include <boost/optional.hpp>
 
 #include "parsed_config.h"
+
+namespace display_device::topology {
+  struct actor_launch_retry_t;
+  struct adapter_restart_plan_t;
+}  // namespace display_device::topology
 
 namespace display_device::vdd_utils {
 
@@ -214,7 +222,7 @@ namespace display_device::vdd_utils {
    * @return True when cursor export was already enabled or was updated successfully.
    */
   bool
-  ensure_hardware_cursor_enabled_for_capture(bool *changed = nullptr);
+  ensure_hardware_cursor_enabled_for_capture(const topology::mutation_capability_t &capability, bool *changed = nullptr);
 
   /**
    * @brief Outcome of attempting a live SETMODES update.
@@ -238,7 +246,7 @@ namespace display_device::vdd_utils {
    * @return Typed outcome describing whether the complete live update was accepted.
    */
   set_vdd_result
-  set_vdd_session_mode(const parsed_config_t &config, const VddSettings &settings);
+  set_vdd_session_mode(const topology::mutation_capability_t &capability, const parsed_config_t &config, const VddSettings &settings);
 
   /**
    * @brief 从客户端标识符生成GUID字符串（用于驱动识别）
@@ -264,39 +272,97 @@ namespace display_device::vdd_utils {
    * @return 创建是否成功
    */
   bool
-  create_vdd_monitor(const std::string &client_identifier = "", const hdr_brightness_t &hdr_brightness = {}, const physical_size_t &physical_size = {});
+  create_vdd_monitor(const topology::mutation_capability_t &capability, const std::string &client_identifier = "", const hdr_brightness_t &hdr_brightness = {}, const physical_size_t &physical_size = {});
 
   /**
    * Create a VDD for a user-session provider without displaying Core UI.
    * The provider owns confirmation; Core performs bounded topology setup.
    */
   bool
-  create_vdd_monitor_noninteractive();
+  create_vdd_monitor_noninteractive(const topology::mutation_capability_t &capability);
 
   bool
-  destroy_vdd_monitor();
+  destroy_vdd_monitor(const topology::mutation_capability_t &capability);
 
   /**
    * @brief Shutdown-safe VDD destroy. Uses raw Win32 pipe API without BOOST_LOG.
    * Safe to call from destructors where boost::log may already be destroyed.
    */
   void
-  destroy_vdd_monitor_nolog();
+  destroy_vdd_monitor_nolog(const topology::mutation_capability_t &capability);
 
   void
-  disable_enable_vdd();
+  disable_enable_vdd(const topology::mutation_capability_t &capability);
 
-  bool
-  toggle_display_power();
+  /** Where the adapter restart's durable actor record lives; startup recovery must read the same file. */
+  std::filesystem::path
+  adapter_restart_record_path();
+
+  /**
+   * The legacy bound: up to `kMaxRetryCount` creation attempts, with exponential
+   * backoff between them. Only definite creation failures are retried.
+   */
+  topology::actor_launch_retry_t
+  adapter_restart_retry();
+
+  /**
+   * One DevManView `/disable_enable` of the Zako adapter (elevated, interactive)
+   * through original process handles, with creation retried by
+   * `adapter_restart_retry`. Boot identity is unknown.
+   */
+  topology::adapter_restart_plan_t
+  make_adapter_restart_plan();
+
+  std::uint64_t
+  vdd_generation();
+
+  struct toggle_debounce_t;
+  struct toggle_request_t {
+    bool create {};
+    std::uint64_t generation {};
+    std::shared_ptr<const toggle_debounce_t> reservation;
+    std::shared_ptr<const toggle_debounce_t> previous;
+  };
+
+  enum class toggle_outcome_e { created, destroyed, stale, failed };
+
+  struct toggle_result_t {
+    toggle_outcome_e outcome { toggle_outcome_e::failed };
+    std::uint64_t generation {};
+    std::vector<std::string> physical_devices;
+  };
+
+  /** Caller-side prompt only; rejected queue receipts must release this reservation. */
+  std::optional<toggle_request_t>
+  prepare_display_toggle();
+
+  void
+  reject_display_toggle(const toggle_request_t &request);
+
+  /** Worker-side mutation only. The returned generation belongs to this attempt. */
+  toggle_result_t
+  apply_display_toggle(const topology::mutation_capability_t &capability, const toggle_request_t &request);
+
+  struct toggle_callbacks_t {
+    bool (*extend)(std::uint64_t, const std::string &, const std::vector<std::string> &) noexcept {};
+    void (*destroy)(std::uint64_t) noexcept {};
+  };
+
+  /**
+   * Run on a dedicated UI thread after successful creation. Process-lifetime callbacks dispatch
+   * generation-checked commands; extend waits for its receipt before the dialog.
+   */
+  void
+  confirm_display_toggle(const toggle_result_t &created, toggle_callbacks_t callbacks);
 
   bool
   is_display_on();
 
   bool
-  set_hdr_state(bool enable_hdr);
+  set_hdr_state(const topology::mutation_capability_t &capability, bool enable_hdr);
 
   bool
-  ensure_vdd_extended_mode(const std::string &device_id, const std::vector<std::string> &physical_devices_to_preserve = {});
+  ensure_vdd_extended_mode(const topology::mutation_capability_t &capability, const std::string &device_id, const std::vector<std::string> &physical_devices_to_preserve = {});
 
   /**
    * @brief Apply VDD prep settings to handle physical displays.
@@ -310,7 +376,7 @@ namespace display_device::vdd_utils {
    *       as Windows automatically handles topology memory when displays change.
    */
   bool
-  apply_vdd_prep(const std::string &vdd_device_id, parsed_config_t::vdd_prep_e vdd_prep,
+  apply_vdd_prep(const topology::mutation_capability_t &capability, const std::string &vdd_device_id, parsed_config_t::vdd_prep_e vdd_prep,
     const boost::optional<device_info_map_t> &pre_vdd_devices);
 
   VddSettings

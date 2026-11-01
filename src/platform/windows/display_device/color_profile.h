@@ -11,6 +11,7 @@
 
 // lib includes
 #include <nlohmann/json_fwd.hpp>
+#include "src/display_device/topology_capability.h"
 
 namespace display_device::win_color_profile {
 
@@ -75,13 +76,13 @@ namespace display_device::win_color_profile {
    * @returns true only when the Windows Color System operation succeeded.
    */
   [[nodiscard]] bool
-  apply(const state_t &state);
+  apply(const topology::mutation_capability_t &capability, const state_t &state);
 
   /**
    * @brief Restore the default and association state captured by snapshot().
    * @returns true only when the complete restoration succeeded.
    */
   [[nodiscard]] bool
-  restore(const state_t &state);
+  restore(const topology::mutation_capability_t &capability, const state_t &state);
 
 }  // namespace display_device::win_color_profile

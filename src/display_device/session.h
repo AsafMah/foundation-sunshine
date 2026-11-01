@@ -2,6 +2,7 @@
 
 // standard includes
 #include <mutex>
+#include <atomic>
 #include <optional>
 #include <string>
 // lib includes
@@ -116,7 +117,8 @@ namespace display_device {
      * ```
      */
     configure_result_t
-    configure_display(const config::video_t &config, const rtsp_stream::launch_session_t &session, bool is_reconfigure = false);
+    configure_display(const topology::mutation_capability_t &capability, const config::video_t &config,
+      const rtsp_stream::launch_session_t &session, automatic_vdd_policy_e vdd_policy, bool is_reconfigure = false);
 
     /**
      * @brief Revert the display configuration and restore the previous state.
@@ -137,7 +139,9 @@ namespace display_device {
      * ```
      */
     void
-    restore_state();
+    restore_state(const topology::mutation_capability_t &capability, automatic_vdd_policy_e vdd_policy);
+
+    bool restore_pending() const noexcept { return pending_restore_.load(); }
 
     /**
      * @brief Reset the persistence and currently held initial display state.
@@ -169,32 +173,26 @@ namespace display_device {
      * ```
      */
     void
-    reset_persistence();
+    reset_persistence(const topology::mutation_capability_t &capability, automatic_vdd_policy_e vdd_policy);
 
     /**
      * @brief Create VDD monitor
      * @param client_name 客户端名称，用于驱动识别客户端并启动对应的显示器
      */
     bool
-    create_vdd_monitor(const std::string &client_name = "");
+    create_vdd_monitor(const topology::mutation_capability_t &capability, const std::string &client_name = "");
 
     /**
      * Create a VDD without displaying Core UI. Intended for tray providers.
      */
     bool
-    create_vdd_monitor_noninteractive();
+    create_vdd_monitor_noninteractive(const topology::mutation_capability_t &capability);
 
     /**
      * @brief Destroy VDD monitor
      */
     bool
-    destroy_vdd_monitor();
-
-    /**
-     * @brief Toggle display power
-     */
-    bool
-    toggle_display_power();
+    destroy_vdd_monitor(const topology::mutation_capability_t &capability);
 
     /**
      * @brief Check if display is on
@@ -216,15 +214,18 @@ namespace display_device {
     operator=(session_t const &) = delete;
 
   private:
+#ifdef SUNSHINE_TEST_DISPLAY_SESSION
+    friend struct session_test_access_t;
+#endif
     /**
      * @brief A class for retrying to set/reset state.
      *
      * This timer class spins a thread which is mostly sleeping all the time, but can be
      * configured to wake up every X seconds.
      *
-     * It is tightly synchronized with the session_t class via a shared mutex to ensure
-     * that stupid race conditions do not happen where we successfully apply settings
-     * for them to be reset by the timer thread immediately.
+     * The timer posts generation-checked commands; only the topology worker touches
+     * settings under the session mutex. Listener notifications carry request identity,
+     * never a capability or an untracked mutation callback.
      */
     class StateRetryTimer;
 
@@ -237,6 +238,8 @@ namespace display_device {
     enum class vdd_stage_result_e {
       ready,
       create_failed,
+      /** Creation failed and the driver's control channel is dead: only an adapter restart can recover it. */
+      adapter_restart_required,
       topology_failed,
       modes_failed,
     };
@@ -264,7 +267,17 @@ namespace display_device {
      * @see restore_state for the description.
      */
     void
-    restore_state_impl(revert_reason_e reason = revert_reason_e::stream_ended);
+    restore_state_impl(const topology::mutation_capability_t &capability, automatic_vdd_policy_e vdd_policy,
+      revert_reason_e reason = revert_reason_e::stream_ended);
+
+    /**
+     * @brief Undo a failed VDD preparation. When the adapter must be restarted,
+     * the restart runs as a supervised actor and the restoration is deferred to
+     * the coordinator until it settles; otherwise restore now. The mutex must be held.
+     */
+    void
+    restore_after_failed_vdd(const topology::mutation_capability_t &capability, automatic_vdd_policy_e vdd_policy,
+      vdd_stage_result_e result);
 
     /**
      * @brief Start polling mechanism as fallback when CCD API is temporarily unavailable.
@@ -273,11 +286,15 @@ namespace display_device {
     void
     start_polling_restore(revert_reason_e reason);
 
+    void restore_settings_or_defer(const topology::mutation_capability_t &capability, revert_reason_e reason);
+    void schedule_startup_restore_retry();
+
     /**
      * @brief 执行依赖可访问交互式 Windows 会话的 VDD 显示操作。
      */
     static vdd_stage_result_e
-    apply_vdd_display_stage(const parsed_config_t &config, const boost::optional<device_info_map_t> &pre_vdd_devices);
+    apply_vdd_display_stage(const topology::mutation_capability_t &capability, const parsed_config_t &config,
+      const boost::optional<device_info_map_t> &pre_vdd_devices);
 
     settings_t settings; /**< A class for managing display device settings. */
     std::mutex mutex; /**< A mutex for ensuring thread-safety. */
@@ -288,8 +305,9 @@ namespace display_device {
     boost::optional<parsed_config_t::vdd_prep_e> current_vdd_prep; /**< Current VDD preparation mode for VDD mode sessions. */
     boost::optional<bool> current_use_vdd; /**< Whether current session is using VDD mode. */
     pending_vdd_context_t pending_vdd_; /**< 在显示配置成功或清理前保留的 VDD 创建基线。 */
-    bool pending_restore_ = false; /**< Flag indicating if there is a pending restore settings operation waiting for unlock. */
+    std::atomic_bool pending_restore_ { false }; /**< Read-only admission probe never takes the session mutex. */
     boost::atomic<int> polling_retry_count_ {0}; /**< Retry counter for polling restore mechanism. */
+    std::atomic_bool awaiting_unlock_ { false }; /**< A deferred restore neither polls nor counts until unlock, as in base 204a968. */
 
     /**
      * @brief An instance of StateRetryTimer.
@@ -305,12 +323,12 @@ namespace display_device {
      *        有值但为空表示主机确实无头。
      */
     vdd_stage_result_e
-    prepare_vdd(parsed_config_t &config,
+    prepare_vdd(const topology::mutation_capability_t &capability, parsed_config_t &config,
       const rtsp_stream::launch_session_t &session,
       boost::optional<device_info_map_t> &pre_vdd_devices);
 
     vdd_mode_update_e
-    update_vdd_resolution(const parsed_config_t &config,
+    update_vdd_resolution(const topology::mutation_capability_t &capability, const parsed_config_t &config,
       const vdd_utils::VddSettings &vdd_settings,
       const std::string &vdd_device_id);
 

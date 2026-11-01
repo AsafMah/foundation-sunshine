@@ -12,12 +12,14 @@
 #include "src/platform/windows/display_device/settings_topology.h"
 #include "src/platform/windows/display_device/windows_utils.h"
 #include "src/rtsp.h"
+#include "tests/unit/topology_test_worker.h"
 
 #include <algorithm>
 #include <gtest/gtest.h>
 #include <stdexcept>
 
 namespace dd = display_device;
+namespace topology = dd::topology;
 using vdd_policy = dd::automatic_vdd_policy_e;
 
 namespace {
@@ -28,7 +30,54 @@ namespace {
     dd::display_mode_t physical_mode { { 1920, 1080 }, { 60, 1 } };
     std::vector<std::string> writes;
     std::vector<std::pair<dd::active_topology_t, bool>> topology_writes;
+    int reads {};
+    const topology::mutation_capability_t *authority {};
   } host;
+
+  class worker_settings_t: public dd::settings_t {
+  public:
+    using dd::settings_t::apply_config;
+    using dd::settings_t::reset_persistence;
+    using dd::settings_t::revert_settings;
+
+    apply_result_t
+    apply_config(const dd::parsed_config_t &config, const rtsp_stream::launch_session_t &launch,
+      vdd_policy policy, const boost::optional<dd::active_topology_t> &initial = boost::none) {
+      auto result = apply_result_t { apply_result_t::result_e::topology_fail };
+      topology_test::with_capability(topology::command_kind_e::launch_prepare, false, [&](const auto &capability) {
+        host.authority = &capability;
+        result = dd::settings_t::apply_config(capability, config, launch, policy, initial);
+        host.authority = nullptr;
+      });
+      return result;
+    }
+
+    bool
+    revert_settings(dd::revert_reason_e reason, vdd_policy policy) {
+      bool result {};
+      topology_test::with_capability(topology::command_kind_e::stream_restore, false, [&](const auto &capability) {
+        host.authority = &capability;
+        result = dd::settings_t::revert_settings(capability, reason, policy);
+        host.authority = nullptr;
+      });
+      return result;
+    }
+
+    void
+    reset_persistence(vdd_policy policy) {
+      topology_test::with_capability(topology::command_kind_e::reset_persistence, false, [&](const auto &capability) {
+        host.authority = &capability;
+        dd::settings_t::reset_persistence(capability, policy);
+        host.authority = nullptr;
+      });
+    }
+  };
+
+  void
+  expect_authority(const topology::mutation_capability_t &capability, topology::operation_e operation) {
+    capability.require(operation);
+    EXPECT_EQ(&capability, host.authority);
+  }
 
   dd::parsed_config_t
   configuration(bool vdd) {
@@ -55,9 +104,10 @@ namespace {
       ASSERT_TRUE(settings.has_persistent_data());
       host.writes.clear();
       host.topology_writes.clear();
+      host.reads = 0;
     }
 
-    dd::settings_t settings;
+    worker_settings_t settings;
     rtsp_stream::launch_session_t launch {};
   };
 }  // namespace
@@ -68,7 +118,10 @@ const std::string ZAKO_NAME { "test-vdd" };
 namespace config {
   video_t video {};
   std::string
-  get_clients_config() { return "[]"; }
+  get_clients_config() {
+    ++host.reads;
+    return "[]";
+  }
 }  // namespace config
 
 namespace audio {
@@ -91,9 +144,9 @@ namespace display_device::win_color_profile {
   std::optional<state_t>
   snapshot(const std::string &, const std::string &) { throw std::logic_error { "unexpected color profile snapshot" }; }
   bool
-  apply(const state_t &) { throw std::logic_error { "unexpected color profile apply" }; }
+  apply(const topology::mutation_capability_t &, const state_t &) { throw std::logic_error { "unexpected color profile apply" }; }
   bool
-  restore(const state_t &) { throw std::logic_error { "unexpected color profile restore" }; }
+  restore(const topology::mutation_capability_t &, const state_t &) { throw std::logic_error { "unexpected color profile restore" }; }
 }  // namespace display_device::win_color_profile
 
 namespace display_device::w_utils {
@@ -106,6 +159,7 @@ namespace display_device::w_utils {
 namespace display_device {
   device_info_map_t
   enum_available_devices() {
+    ++host.reads;
     device_info_map_t devices {
       { "physical", { "physical", "Physical", device_state_e::primary, hdr_state_e::disabled } }
     };
@@ -138,7 +192,8 @@ namespace display_device {
   is_topology_the_same(const active_topology_t &a, const active_topology_t &b) { return a == b; }
 
   bool
-  set_topology(const active_topology_t &topology) {
+  set_topology(const topology::mutation_capability_t &capability, const active_topology_t &topology) {
+    expect_authority(capability, topology::operation_e::write_topology);
     host.writes.push_back("topology");
     host.topology_writes.emplace_back(topology, !host.fail_topology);
     if (host.fail_topology) return false;
@@ -150,7 +205,8 @@ namespace display_device {
   is_primary_device(const std::string &device_id) { return device_id == "physical"; }
 
   bool
-  set_as_primary_device(const std::string &) {
+  set_as_primary_device(const topology::mutation_capability_t &capability, const std::string &) {
+    expect_authority(capability, topology::operation_e::write_primary);
     host.writes.push_back("primary");
     return true;
   }
@@ -163,7 +219,8 @@ namespace display_device {
   }
 
   bool
-  set_display_modes(const device_display_mode_map_t &modes) {
+  set_display_modes(const topology::mutation_capability_t &capability, const device_display_mode_map_t &modes) {
+    expect_authority(capability, topology::operation_e::write_display_modes);
     host.writes.push_back("modes");
     if (const auto found = modes.find("physical"); found != modes.end()) host.physical_mode = found->second;
     return true;
@@ -177,7 +234,8 @@ namespace display_device {
   }
 
   bool
-  set_hdr_states(const hdr_state_map_t &) {
+  set_hdr_states(const topology::mutation_capability_t &capability, const hdr_state_map_t &) {
+    expect_authority(capability, topology::operation_e::write_hdr);
     host.writes.push_back("hdr");
     return true;
   }
@@ -191,7 +249,8 @@ namespace display_device {
   }
 
   bool
-  session_t::destroy_vdd_monitor() {
+  session_t::destroy_vdd_monitor(const topology::mutation_capability_t &capability) {
+    expect_authority(capability, topology::operation_e::vdd_destroy);
     host.writes.push_back("destroy");
     host.vdd_present = false;
     for (auto &group : host.topology) std::erase(group, "vdd");
@@ -201,15 +260,159 @@ namespace display_device {
 }  // namespace display_device
 
 namespace {
+  enum class settings_action_e { apply,
+    restore,
+    reset };
+
+  void
+  mutate_settings(dd::settings_t &settings, const topology::mutation_capability_t &capability,
+    settings_action_e action, const dd::parsed_config_t &config, const rtsp_stream::launch_session_t &launch) {
+    switch (action) {
+      case settings_action_e::apply:
+        (void) settings.apply_config(capability, config, launch, vdd_policy::suppress);
+        break;
+      case settings_action_e::restore:
+        (void) settings.revert_settings(capability, dd::revert_reason_e::stream_ended, vdd_policy::suppress);
+        break;
+      case settings_action_e::reset:
+        settings.reset_persistence(capability, vdd_policy::suppress);
+        break;
+    }
+  }
+
+  template <class Settings>
+  void
+  expect_required_capability() {
+    using cap = topology::mutation_capability_t;
+    constexpr bool ungated_apply = requires(Settings &s, const dd::parsed_config_t &c, const rtsp_stream::launch_session_t &l) { s.apply_config(c, l, vdd_policy::allow); };
+    constexpr bool ungated_restore = requires(Settings &s) { s.revert_settings(dd::revert_reason_e::stream_ended, vdd_policy::allow); };
+    constexpr bool ungated_reset = requires(Settings &s) { s.reset_persistence(vdd_policy::allow); };
+    constexpr bool gated_apply = requires(Settings &s, const cap &authority, const dd::parsed_config_t &c, const rtsp_stream::launch_session_t &l) { s.apply_config(authority, c, l, vdd_policy::allow); };
+    constexpr bool gated_restore = requires(Settings &s, const cap &authority) { s.revert_settings(authority, dd::revert_reason_e::stream_ended, vdd_policy::allow); };
+    constexpr bool gated_reset = requires(Settings &s, const cap &authority) { s.reset_persistence(authority, vdd_policy::allow); };
+    EXPECT_FALSE(ungated_apply);
+    EXPECT_FALSE(ungated_restore);
+    EXPECT_FALSE(ungated_reset);
+    EXPECT_TRUE(gated_apply);
+    EXPECT_TRUE(gated_restore);
+    EXPECT_TRUE(gated_reset);
+  }
+
+  TEST_F(DisplaySettingsPolicy, ManagedResetForgetsWithoutLegacyRestoration) {
+    prepare_virtual();
+    topology_test::with_capability(topology::command_kind_e::reset_persistence, true, [&](const auto &capability) {
+      EXPECT_NO_THROW(settings.reset_persistence(capability, vdd_policy::suppress));
+    });
+    EXPECT_FALSE(settings.has_persistent_data());
+    EXPECT_TRUE(host.writes.empty());
+    EXPECT_EQ(host.reads, 0);
+    EXPECT_TRUE(host.vdd_present);
+  }
+
+  TEST_F(DisplaySettingsPolicy, DeferredBaselineLoadingRequiresRestoreAuthority) {
+    topology_test::with_capability(topology::command_kind_e::rotate, false, [&](const auto &capability) {
+      EXPECT_THROW(settings.load_persistence(capability), topology::capability_error_t);
+    });
+    topology_test::with_capability(topology::command_kind_e::startup_recovery, false, [&](const auto &capability) {
+      auto elsewhere = std::async(std::launch::async, [&] { settings.load_persistence(capability); });
+      EXPECT_THROW(elsewhere.get(), topology::capability_error_t);
+    });
+    EXPECT_EQ(host.reads, 0);
+    EXPECT_TRUE(host.writes.empty());
+  }
+
+  TEST_F(DisplaySettingsPolicy, LoadedColdBaselineSurvivesLaterLegacyApply) {
+    struct file_t {
+      std::filesystem::path path {
+        std::filesystem::temp_directory_path() /
+        ("sunshine-display-baseline-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json")
+      };
+      ~file_t() {
+        std::error_code error;
+        std::filesystem::remove(path, error);
+        EXPECT_FALSE(error) << error.message();
+      }
+    } file;
+    settings.set_filepath(file.path);
+    prepare_virtual();
+    ASSERT_TRUE(std::filesystem::exists(file.path));
+    worker_settings_t restarted;
+    restarted.set_filepath(file.path);
+    EXPECT_FALSE(restarted.has_persistent_data());
+    topology_test::with_capability(topology::command_kind_e::startup_recovery, false, [&](const auto &capability) {
+      restarted.load_persistence(capability);
+    });
+    ASSERT_TRUE(restarted.has_persistent_data());
+    EXPECT_EQ(host.reads, 0);
+    EXPECT_TRUE(host.writes.empty());
+
+    host.topology = { { "vdd" } };
+    ASSERT_TRUE(restarted.apply_config(configuration(true), launch, vdd_policy::suppress,
+      dd::active_topology_t { { "vdd" } }));
+    ASSERT_TRUE(restarted.revert_settings(dd::revert_reason_e::stream_ended, vdd_policy::suppress));
+    EXPECT_EQ(host.topology, (dd::active_topology_t { { "physical" } }));
+    EXPECT_TRUE(host.vdd_present);
+  }
+
+  TEST_F(DisplaySettingsPolicy, MutationEntryPointsRequireAWorkerCapability) {
+    expect_required_capability<dd::settings_t>();
+  }
+
+  TEST_F(DisplaySettingsPolicy, WrongCommandCannotChangeCachedSettings) {
+    for (const auto action : { settings_action_e::apply, settings_action_e::restore, settings_action_e::reset }) {
+      host = {};
+      ASSERT_NO_FATAL_FAILURE(prepare_virtual());
+      topology_test::with_capability(topology::command_kind_e::rotate, false, [&](const auto &capability) {
+        SCOPED_TRACE(static_cast<int>(action));
+        EXPECT_THROW(mutate_settings(settings, capability, action, configuration(false), launch), topology::capability_error_t);
+        EXPECT_TRUE(settings.has_persistent_data());
+        EXPECT_TRUE(host.writes.empty());
+        EXPECT_EQ(host.reads, 0);
+      });
+    }
+  }
+
+  TEST_F(DisplaySettingsPolicy, OffWorkerCannotChangeCachedSettings) {
+    for (const auto action : { settings_action_e::apply, settings_action_e::restore, settings_action_e::reset }) {
+      host = {};
+      ASSERT_NO_FATAL_FAILURE(prepare_virtual());
+      const auto kind = action == settings_action_e::apply   ? topology::command_kind_e::launch_prepare :
+                        action == settings_action_e::restore ? topology::command_kind_e::stream_restore :
+                                                               topology::command_kind_e::reset_persistence;
+      topology_test::with_capability(kind, false, [&](const auto &capability) {
+        SCOPED_TRACE(static_cast<int>(action));
+        auto elsewhere = std::async(std::launch::async, [&] {
+          mutate_settings(settings, capability, action, configuration(false), launch);
+        });
+        EXPECT_THROW(elsewhere.get(), topology::capability_error_t);
+        EXPECT_TRUE(settings.has_persistent_data());
+        EXPECT_TRUE(host.writes.empty());
+        EXPECT_EQ(host.reads, 0);
+      });
+    }
+  }
+
+  TEST_F(DisplaySettingsPolicy, EmptyOrInvalidWorkStillRequiresAuthority) {
+    dd::settings_t empty;
+    topology_test::with_capability(topology::command_kind_e::rotate, false, [&](const auto &capability) {
+      for (const auto action : { settings_action_e::apply, settings_action_e::restore, settings_action_e::reset }) {
+        SCOPED_TRACE(static_cast<int>(action));
+        EXPECT_THROW(mutate_settings(empty, capability, action, {}, launch), topology::capability_error_t);
+        EXPECT_EQ(host.reads, 0);
+        EXPECT_TRUE(host.writes.empty());
+      }
+    });
+  }
+
   template <class Settings>
   void
   expect_explicit_policy() {
-    constexpr bool implicit_apply = requires(Settings &settings, const dd::parsed_config_t &config, const rtsp_stream::launch_session_t &launch) {
-      settings.apply_config(config, launch);
+    constexpr bool implicit_apply = requires(Settings &settings, const topology::mutation_capability_t &capability, const dd::parsed_config_t &config, const rtsp_stream::launch_session_t &launch) {
+      settings.apply_config(capability, config, launch);
     };
-    constexpr bool implicit_revert = requires(Settings &settings) { settings.revert_settings(); };
-    constexpr bool implicit_reset = requires(Settings &settings) { settings.reset_persistence(); };
-    constexpr bool boolean_revert = requires(Settings &settings) { settings.revert_settings(dd::revert_reason_e::stream_ended, true); };
+    constexpr bool implicit_revert = requires(Settings &settings, const topology::mutation_capability_t &capability) { settings.revert_settings(capability, dd::revert_reason_e::stream_ended); };
+    constexpr bool implicit_reset = requires(Settings &settings, const topology::mutation_capability_t &capability) { settings.reset_persistence(capability); };
+    constexpr bool boolean_revert = requires(Settings &settings, const topology::mutation_capability_t &capability) { settings.revert_settings(capability, dd::revert_reason_e::stream_ended, true); };
     EXPECT_FALSE(implicit_apply);
     EXPECT_FALSE(implicit_revert);
     EXPECT_FALSE(implicit_reset);

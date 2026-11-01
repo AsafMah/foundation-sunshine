@@ -11,7 +11,8 @@ namespace display_device {
      * @see set_hdr_states for a description as this was split off to reduce cognitive complexity.
      */
     bool
-    do_set_states(const hdr_state_map_t &states) {
+    do_set_states(const topology::mutation_capability_t &capability, const hdr_state_map_t &states) {
+      capability.require(topology::operation_e::write_hdr);
       const auto display_data { w_utils::query_display_config(w_utils::ACTIVE_ONLY_DEVICES) };
       if (!display_data) {
         return false;
@@ -41,7 +42,7 @@ namespace display_device {
           continue;
         }
 
-        if (!w_utils::set_hdr_state(*path, state == hdr_state_e::enabled)) {
+        if (!w_utils::set_hdr_state(capability, *path, state == hdr_state_e::enabled)) {
           return false;
         }
       }
@@ -79,7 +80,8 @@ namespace display_device {
   }
 
   bool
-  set_hdr_states(const hdr_state_map_t &states) {
+  set_hdr_states(const topology::mutation_capability_t &capability, const hdr_state_map_t &states) {
+    capability.require(topology::operation_e::write_hdr);
     if (states.empty()) {
       BOOST_LOG(error) << "States map is empty!";
       return false;
@@ -100,8 +102,8 @@ namespace display_device {
       return false;
     }
 
-    if (!do_set_states(states)) {
-      do_set_states(original_states);  // return value does not matter
+    if (!do_set_states(capability, states)) {
+      do_set_states(capability, original_states);  // return value does not matter
       return false;
     }
 

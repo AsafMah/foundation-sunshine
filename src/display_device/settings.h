@@ -177,6 +177,7 @@ namespace display_device {
      */
     apply_result_t
     apply_config(
+      const topology::mutation_capability_t &capability,
       const parsed_config_t &config,
       const rtsp_stream::launch_session_t &session,
       automatic_vdd_policy_e vdd_policy,
@@ -203,7 +204,7 @@ namespace display_device {
      * ```
      */
     bool
-    revert_settings(revert_reason_e reason, automatic_vdd_policy_e vdd_policy);
+    revert_settings(const topology::mutation_capability_t &capability, revert_reason_e reason, automatic_vdd_policy_e vdd_policy);
 
     /**
      * @brief Reset the persistence and currently held initial display state.
@@ -231,7 +232,10 @@ namespace display_device {
      * ```
      */
     void
-    reset_persistence(automatic_vdd_policy_e vdd_policy);
+    reset_persistence(const topology::mutation_capability_t &capability, automatic_vdd_policy_e vdd_policy);
+
+    /** Load the first legacy baseline before a locked-desktop launch can inherit it. */
+    void load_persistence(const topology::mutation_capability_t &capability);
 
     /**
      * @brief Check if there is saved persistent data.

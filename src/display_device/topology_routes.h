@@ -105,6 +105,10 @@ namespace display_device::topology {
     std::optional<monotonic_time_t>
     next_wake() const;
 
+    /** Move a pending attempt forward, without duplicating an in-flight attempt. */
+    bool
+    expedite(monotonic_time_t now);
+
   private:
     void
     advance_generation();
@@ -113,5 +117,42 @@ namespace display_device::topology {
     std::uint64_t generation_ {};
     std::optional<monotonic_time_t> due_;
     std::optional<retry_token_t> in_flight_;
+  };
+
+  struct retry_request_t {
+    std::uint64_t serial {};
+    bool
+    operator==(const retry_request_t &) const = default;
+  };
+
+  /**
+   * Owns posted retry receipts through completion, including shutdown. setup() is
+   * called with owner_mutex held; request_now() is safe on a listener thread.
+   * Destruction must be off both worker threads and without owner_mutex held.
+   * The coordinator, owner state and mutex must outlive this object; external
+   * producers such as the unlock listener must be joined before its destruction.
+   */
+  class retry_timer_t {
+  public:
+    using body_t = std::function<bool(const mutation_capability_t &, const command_context_t &)>;
+    using observer_t = void (*)(retry_request_t, const command_result_t &) noexcept;
+
+    retry_timer_t(coordinator_t &coordinator, std::mutex &owner_mutex, observer_t observer,
+      monotonic_time_t delay = std::chrono::seconds { 5 });
+    ~retry_timer_t();
+    retry_timer_t(const retry_timer_t &) = delete;
+    retry_timer_t &
+    operator=(const retry_timer_t &) = delete;
+
+    retry_request_t
+    setup(body_t body);
+
+    /** Accelerate/coalesce only this request, with unlock's narrower authority. */
+    bool
+    request_now(retry_request_t request);
+
+  private:
+    struct impl_t;
+    std::unique_ptr<impl_t> impl_;
   };
 }  // namespace display_device::topology

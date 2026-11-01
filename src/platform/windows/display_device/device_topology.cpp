@@ -245,7 +245,8 @@ namespace display_device {
      * @see set_topology for a description as this was split off to reduce cognitive complexity.
      */
     bool
-    do_set_topology(const active_topology_t &new_topology) {
+    do_set_topology(const topology::mutation_capability_t &capability, const active_topology_t &new_topology) {
+      capability.require(topology::operation_e::write_topology);
       auto display_data { w_utils::query_display_config(w_utils::ALL_DEVICES) };
       if (!display_data) {
         // Error already logged
@@ -450,7 +451,8 @@ namespace display_device {
   }
 
   bool
-  set_topology(const active_topology_t &new_topology) {
+  set_topology(const topology::mutation_capability_t &capability, const active_topology_t &new_topology) {
+    capability.require(topology::operation_e::write_topology);
     if (!is_topology_valid(new_topology)) {
       BOOST_LOG(error) << "Topology input is invalid!";
       return false;
@@ -467,7 +469,7 @@ namespace display_device {
       return true;
     }
 
-    if (do_set_topology(new_topology)) {
+    if (do_set_topology(capability, new_topology)) {
       const auto updated_topology { get_current_topology() };
       if (!updated_topology.empty()) {
         if (is_topology_the_same(new_topology, updated_topology)) {
@@ -506,7 +508,7 @@ namespace display_device {
       }
 
       // Revert back to the original topology
-      do_set_topology(current_topology);  // Return value does not matter
+      do_set_topology(capability, current_topology);  // Return value does not matter
     }
 
     return false;

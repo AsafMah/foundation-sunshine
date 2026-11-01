@@ -582,7 +582,8 @@ namespace display_device::w_utils {
   }
 
   bool
-  set_hdr_state(const DISPLAYCONFIG_PATH_INFO &path, bool enable) {
+  set_hdr_state(const topology::mutation_capability_t &capability, const DISPLAYCONFIG_PATH_INFO &path, bool enable) {
+    capability.require(topology::operation_e::write_hdr);
     const LONG result = hdr_state_api::set(path.targetInfo, enable, DisplayConfigGetDeviceInfo, DisplayConfigSetDeviceInfo);
     if (result != ERROR_SUCCESS) {
       BOOST_LOG(error) << get_error_string(result) << " failed to set HDR state!";
@@ -843,7 +844,8 @@ namespace display_device::w_utils {
   }
 
   set_display_scale_result_t
-  set_display_scale(const std::string &display_name, const std::string &device_id, int scale_percent) {
+  set_display_scale(const topology::mutation_capability_t &capability, const std::string &display_name, const std::string &device_id, int scale_percent) {
+    capability.require(topology::operation_e::scale);
     set_display_scale_result_t result;
 
     auto display_data { query_display_config(w_utils::ACTIVE_ONLY_DEVICES) };
@@ -1001,52 +1003,6 @@ namespace display_device::w_utils {
     return result == ERROR_ACCESS_DENIED;
   }
 
-  bool
-  togglePnpDeviceByFriendlyName(const std::string &friendlyName, const bool &stat) {
-    HDEVINFO deviceInfoSet = SetupDiGetClassDevs(NULL, NULL, NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES);
-    if (deviceInfoSet == INVALID_HANDLE_VALUE) {
-      std::cerr << "Failed to get device information set." << std::endl;
-      return false;
-    }
-
-    SP_DEVINFO_DATA deviceInfoData;
-    deviceInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
-
-    bool deviceFound = false;
-    for (DWORD i = 0; SetupDiEnumDeviceInfo(deviceInfoSet, i, &deviceInfoData); ++i) {
-      TCHAR deviceFriendlyName[256];
-      if (SetupDiGetDeviceRegistryProperty(deviceInfoSet, &deviceInfoData, SPDRP_FRIENDLYNAME, NULL, (PBYTE) deviceFriendlyName, sizeof(deviceFriendlyName), NULL)) {
-        if (friendlyName == deviceFriendlyName) {
-          deviceFound = true;
-          break;
-        }
-      }
-    }
-
-    if (!deviceFound) {
-      std::cerr << "Device not found." << std::endl;
-      SetupDiDestroyDeviceInfoList(deviceInfoSet);
-      return false;
-    }
-
-    SP_PROPCHANGE_PARAMS propChangeParams;
-    propChangeParams.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
-    propChangeParams.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
-    propChangeParams.StateChange = stat ? DICS_ENABLE : DICS_DISABLE;
-    propChangeParams.Scope = DICS_FLAG_GLOBAL;
-    propChangeParams.HwProfile = 0;
-
-    if (!SetupDiSetClassInstallParams(deviceInfoSet, &deviceInfoData, &propChangeParams.ClassInstallHeader, sizeof(propChangeParams)) ||
-        !SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, deviceInfoSet, &deviceInfoData)) {
-      std::cerr << "Failed to toggle device." << std::endl;
-      SetupDiDestroyDeviceInfoList(deviceInfoSet);
-      return false;
-    }
-
-    SetupDiDestroyDeviceInfoList(deviceInfoSet);
-    return true;
-  }
-  
   // 检测RDP会话
   bool is_any_rdp_session_active() {
     PWTS_SESSION_INFO pSessionInfo = nullptr;
@@ -1094,7 +1050,8 @@ namespace display_device::w_utils {
   }
 
   bool
-  rotate_display(int angle, const std::string &display_name) {
+  rotate_display(const topology::mutation_capability_t &capability, int angle, const std::string &display_name) {
+    capability.require(topology::operation_e::rotate);
     // Validate angle: 0, 90, 180, 270
     if (angle != 0 && angle != 90 && angle != 180 && angle != 270) {
       BOOST_LOG(error) << "Invalid rotation angle: " << angle << ". Must be 0, 90, 180, or 270";

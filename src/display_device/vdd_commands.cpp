@@ -1,4 +1,4 @@
-#include "vdd_ioctl.h"
+#include "vdd_command_buffer.h"
 
 #include <cmath>
 #include <locale>
@@ -9,12 +9,25 @@
 #include "src/logging_severity.h"
 
 namespace display_device::vdd_ioctl {
-  namespace detail {
-    result
-    send_command_buffer(const std::wstring &command);
-  }
-
   namespace {
+    topology::operation_e
+    operation_for(const command_t &request) {
+      return std::visit([](const auto &value) -> topology::operation_e {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<T, create_monitor_t>)
+          return topology::operation_e::vdd_create;
+        else if constexpr (std::is_same_v<T, destroy_monitors_t>)
+          return topology::operation_e::vdd_destroy;
+        else if constexpr (std::is_same_v<T, set_modes_t>)
+          return topology::operation_e::vdd_set_modes;
+        else if constexpr (std::is_same_v<T, hardware_cursor_t>)
+          return topology::operation_e::vdd_cursor;
+        else
+          throw std::invalid_argument { "Missing VDD mutation request" };
+      },
+        request);
+    }
+
     bool
     valid_guid(const std::string &guid) {
       if (guid.size() != 38 || guid.front() != '{' || guid.back() != '}') return false;
@@ -84,15 +97,19 @@ namespace display_device::vdd_ioctl {
   }  // namespace
 
   result
-  send_command(const command_t &request) {
+  send_command(const topology::mutation_capability_t &capability, const command_t &request) {
     std::wstring command;
+    topology::operation_e operation;
     try {
+      operation = operation_for(request);
+      capability.require(operation);
       command = encode(request);
     }
     catch (const std::invalid_argument &error) {
       BOOST_LOG(warning) << "vdd_ioctl: rejecting mutation request: " << error.what();
       return result::failed;
     }
-    return detail::send_command_buffer(command);
+    const detail::encoded_command_t encoded { capability, operation, std::move(command) };
+    return detail::send_command_buffer(encoded);
   }
 }  // namespace display_device::vdd_ioctl

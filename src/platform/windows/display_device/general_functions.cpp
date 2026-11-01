@@ -124,7 +124,8 @@ namespace display_device {
   }
 
   bool
-  set_as_primary_device(const std::string &device_id) {
+  set_as_primary_device(const topology::mutation_capability_t &capability, const std::string &device_id) {
+    capability.require(topology::operation_e::write_primary);
     if (device_id.empty()) {
       BOOST_LOG(error) << "Device id is empty!";
       return false;

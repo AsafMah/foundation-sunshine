@@ -9,6 +9,7 @@
 // lib includes
 #include <boost/optional.hpp>
 #include <nlohmann/json.hpp>
+#include "topology_capability.h"
 
 namespace display_device {
 
@@ -193,7 +194,7 @@ namespace display_device {
    * ```
    */
   bool
-  set_display_modes(const device_display_mode_map_t &modes);
+  set_display_modes(const topology::mutation_capability_t &capability, const device_display_mode_map_t &modes);
 
   /**
    * @brief Check whether the specified device is primary.
@@ -223,7 +224,7 @@ namespace display_device {
    * ``
    */
   bool
-  set_as_primary_device(const std::string &device_id);
+  set_as_primary_device(const topology::mutation_capability_t &capability, const std::string &device_id);
 
   /**
    * @brief Get HDR state for the devices.
@@ -256,7 +257,7 @@ namespace display_device {
    * ```
    */
   bool
-  set_hdr_states(const hdr_state_map_t &states);
+  set_hdr_states(const topology::mutation_capability_t &capability, const hdr_state_map_t &states);
 
   /**
    * @brief Get the active (current) topology.
@@ -320,6 +321,6 @@ namespace display_device {
    * ```
    */
   bool
-  set_topology(const active_topology_t &new_topology);
+  set_topology(const topology::mutation_capability_t &capability, const active_topology_t &new_topology);
 
 }  // namespace display_device

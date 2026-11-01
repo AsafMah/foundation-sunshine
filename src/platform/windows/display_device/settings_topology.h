@@ -93,6 +93,7 @@ namespace display_device {
    */
   boost::optional<handled_topology_result_t>
   handle_device_topology_configuration(
+    const topology::mutation_capability_t &capability,
     const parsed_config_t &config,
     const boost::optional<topology_pair_t> &previously_configured_topology,
     const std::function<bool()> &revert_settings,

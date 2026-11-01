@@ -10,6 +10,7 @@
 #include <Windows.h>
 
 #include "vdd_ioctl.h"
+#include "vdd_command_buffer.h"
 #include "vdd_control_ioctl.h"
 
 extern "C" const GUID GUID_DEVINTERFACE_ZAKO_VDD_CONTROL = ZAKO_VDD_CONTROL_GUID_INIT;
@@ -313,7 +314,8 @@ namespace display_device::vdd_ioctl {
 
   namespace detail {
     result
-    send_command_buffer(const std::wstring &command) {
+    send_command_buffer(const encoded_command_t &request) {
+      const auto &command = request.authorized_bytes();
       device_handle dev;
       switch (dev.open()) {
         case device_handle::open_result::success:

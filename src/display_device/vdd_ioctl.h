@@ -14,6 +14,10 @@
 
 #include "vdd_mode_list.h"
 
+namespace display_device::topology {
+  class mutation_capability_t;
+}
+
 namespace display_device::vdd_ioctl {
 
   /**
@@ -139,18 +143,20 @@ namespace display_device::vdd_ioctl {
   using command_t = std::variant<std::monostate, create_monitor_t, destroy_monitors_t, set_modes_t, hardware_cursor_t>;
 
   /**
-   * @brief Validate and encode a closed mutation request before opening the driver.
+   * @brief Authorize, validate and encode a closed mutation request before opening the driver.
    *
    * Performs `SetupDiGetClassDevsW` on `GUID_DEVINTERFACE_ZAKO_VDD_CONTROL`,
    * opens the first interface instance with `CreateFileW`, and issues
    * `IOCTL_VDD_COMMAND`.
    *
+   * @param capability The original coordinator-issued worker authority.
    * @param command A supported typed request. Arbitrary command strings are not accepted.
+   * Authority failures throw before payload validation or device access.
    * Invalid payloads are logged and fail without opening or writing the device.
    * @return tri-state result; see `enum class result`.
    */
   result
-  send_command(const command_t &command);
+  send_command(const topology::mutation_capability_t &capability, const command_t &command);
 
   /**
    * @brief Cheap liveness probe used to decide whether the IOCTL transport

@@ -94,6 +94,9 @@ set_target_properties(vdd_mode_list_unit_tests PROPERTIES CXX_STANDARD 23)
 add_test(NAME vdd_mode_list_unit_tests COMMAND vdd_mode_list_unit_tests)
 
 add_executable(vdd_commands_unit_tests
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_command_queue.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_capability.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_coordinator.cpp
         ${CMAKE_SOURCE_DIR}/src/display_device/vdd_commands.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_vdd_commands.cpp)
 target_include_directories(vdd_commands_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
@@ -103,6 +106,7 @@ target_compile_definitions(vdd_commands_unit_tests PRIVATE ${SUNSHINE_DEFINITION
 set_target_properties(vdd_commands_unit_tests PROPERTIES CXX_STANDARD 23)
 if (WIN32)
     set_target_properties(vdd_commands_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
+    target_sources(vdd_commands_unit_tests PRIVATE unit/platform/windows/vdd_transport_shim.cpp)
 endif ()
 add_test(NAME vdd_commands_unit_tests COMMAND vdd_commands_unit_tests)
 set_tests_properties(vdd_commands_unit_tests PROPERTIES TIMEOUT 10)
@@ -294,7 +298,74 @@ add_test(NAME nvhttp_stream_start_unit_tests COMMAND nvhttp_stream_start_unit_te
 set_tests_properties(nvhttp_stream_start_unit_tests PROPERTIES TIMEOUT 30)
 
 if (WIN32)
+    add_executable(vdd_utils_policy_unit_tests
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_command_queue.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_capability.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_coordinator.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/to_string.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_durable_file.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_actor_record.cpp
+            ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_vdd_utils.cpp)
+    target_include_directories(vdd_utils_policy_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(vdd_utils_policy_unit_tests PRIVATE gtest_main sunshine::host_headers
+            Boost::log Boost::filesystem nlohmann_json::nlohmann_json sunshine_project_options sunshine_coverage)
+    target_compile_definitions(vdd_utils_policy_unit_tests PRIVATE ${SUNSHINE_DEFINITIONS})
+    set_target_properties(vdd_utils_policy_unit_tests PROPERTIES CXX_STANDARD 23 LINK_SEARCH_START_STATIC 1)
+    add_test(NAME vdd_utils_policy_unit_tests COMMAND vdd_utils_policy_unit_tests)
+    set_tests_properties(vdd_utils_policy_unit_tests PROPERTIES TIMEOUT 30)
+
+    add_executable(display_session_policy_unit_tests
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_command_queue.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_capability.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_coordinator.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_routes.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/settings.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/to_string.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_durable_file.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_actor_record.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_actor_supervisor.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_actor_body.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_actor_cleanup.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_adapter_restart.cpp
+            ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_display_session.cpp)
+    target_include_directories(display_session_policy_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(display_session_policy_unit_tests PRIVATE gtest_main sunshine::host_headers
+            Boost::log OpenSSL::Crypto nlohmann_json::nlohmann_json sunshine_project_options sunshine_coverage)
+    target_compile_definitions(display_session_policy_unit_tests PRIVATE ${SUNSHINE_DEFINITIONS} SUNSHINE_TEST_DISPLAY_SESSION)
+    set_target_properties(display_session_policy_unit_tests PROPERTIES CXX_STANDARD 23 LINK_SEARCH_START_STATIC 1)
+    add_test(NAME display_session_policy_unit_tests COMMAND display_session_policy_unit_tests)
+    set_tests_properties(display_session_policy_unit_tests PROPERTIES TIMEOUT 20)
+
+    add_executable(color_profile_authority_unit_tests
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_command_queue.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_capability.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_coordinator.cpp
+            ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_color_profile_authority.cpp)
+    target_include_directories(color_profile_authority_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(color_profile_authority_unit_tests PRIVATE gtest_main sunshine::host_headers
+            Boost::log sunshine_project_options sunshine_coverage)
+    target_compile_definitions(color_profile_authority_unit_tests PRIVATE ${SUNSHINE_DEFINITIONS})
+    set_target_properties(color_profile_authority_unit_tests PROPERTIES CXX_STANDARD 23 LINK_SEARCH_START_STATIC 1)
+    add_test(NAME color_profile_authority_unit_tests COMMAND color_profile_authority_unit_tests)
+    set_tests_properties(color_profile_authority_unit_tests PROPERTIES TIMEOUT 15)
+
+    add_executable(display_mutation_authority_unit_tests
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_command_queue.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_capability.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_coordinator.cpp
+            ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_display_mutation_authority.cpp)
+    target_include_directories(display_mutation_authority_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(display_mutation_authority_unit_tests PRIVATE gtest_main sunshine::host_headers
+            Boost::log sunshine_project_options sunshine_coverage)
+    target_compile_definitions(display_mutation_authority_unit_tests PRIVATE ${SUNSHINE_DEFINITIONS})
+    set_target_properties(display_mutation_authority_unit_tests PROPERTIES CXX_STANDARD 23 LINK_SEARCH_START_STATIC 1)
+    add_test(NAME display_mutation_authority_unit_tests COMMAND display_mutation_authority_unit_tests)
+    set_tests_properties(display_mutation_authority_unit_tests PROPERTIES TIMEOUT 15)
+
     add_executable(display_settings_policy_unit_tests
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_command_queue.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_capability.cpp
+            ${CMAKE_SOURCE_DIR}/src/display_device/topology_coordinator.cpp
             ${CMAKE_SOURCE_DIR}/src/display_device/settings.cpp
             ${CMAKE_SOURCE_DIR}/src/display_device/to_string.cpp
             ${CMAKE_SOURCE_DIR}/src/platform/windows/display_device/settings.cpp
@@ -486,6 +557,7 @@ add_executable(display_topology_routes_unit_tests
         ${CMAKE_SOURCE_DIR}/src/display_device/topology_command_queue.cpp
         ${CMAKE_SOURCE_DIR}/src/display_device/topology_coordinator.cpp
         ${CMAKE_SOURCE_DIR}/src/display_device/topology_routes.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_topology_retry_timer.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology_routes.cpp)
 target_include_directories(display_topology_routes_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(display_topology_routes_unit_tests PRIVATE gtest_main
@@ -870,6 +942,7 @@ list(REMOVE_ITEM TEST_SOURCES
         ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology_coordinator.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology_coordinator_policy.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology_routes.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_topology_retry_timer.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology_native.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_topology_actor_record.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_topology_actor_supervisor.cpp
@@ -892,7 +965,12 @@ list(REMOVE_ITEM TEST_SOURCES
         ${CMAKE_SOURCE_DIR}/tests/unit/test_tray_state.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_video_probe.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_vdd_commands.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/vdd_transport_shim.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_display_settings.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_display_mutation_authority.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_color_profile_authority.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_display_session.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_vdd_utils.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_virtual_touchscreen_device.cpp)
 
 set(ABR_TEST_STUB_SOURCE ${CMAKE_SOURCE_DIR}/tests/unit/abr_test_stubs.cpp)

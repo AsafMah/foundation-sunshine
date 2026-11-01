@@ -1,5 +1,6 @@
 #include "topology_routes.h"
 
+#include <algorithm>
 #include <condition_variable>
 #include <limits>
 #include <stdexcept>
@@ -184,4 +185,146 @@ namespace display_device::topology {
   retry_schedule_t::next_wake() const {
     return due_;
   }
+
+  bool
+  retry_schedule_t::expedite(monotonic_time_t now) {
+    if (!due_) return false;
+    due_ = std::min(*due_, now);
+    return true;
+  }
+
+  struct retry_timer_t::impl_t {
+    struct attempt_t {
+      retry_request_t request;
+      retry_token_t token;
+      command_kind_e kind;
+      std::shared_ptr<const body_t> body;
+    };
+
+    coordinator_t &coordinator;
+    std::mutex &owner_mutex;
+    observer_t observer;
+    std::mutex mutex;
+    std::condition_variable wake;
+    retry_schedule_t schedule;
+    retry_request_t request;
+    std::shared_ptr<const body_t> body;
+    command_kind_e next_kind { command_kind_e::legacy_retry_tick };
+    bool stopping {};
+    std::thread thread;
+
+    static monotonic_time_t
+    now() {
+      return std::chrono::duration_cast<monotonic_time_t>(std::chrono::steady_clock::now().time_since_epoch());
+    }
+
+    impl_t(coordinator_t &coordinator, std::mutex &owner_mutex, observer_t observer, monotonic_time_t delay):
+        coordinator { coordinator }, owner_mutex { owner_mutex }, observer { observer }, schedule { delay } {
+      if (!observer) throw std::invalid_argument { "A topology retry timer requires a completion observer" };
+      thread = std::thread { [this] { run(); } };
+    }
+
+    ~impl_t() {
+      if (coordinator.on_worker_thread() || thread.get_id() == std::this_thread::get_id()) std::terminate();
+      {
+        std::lock_guard lock { mutex };
+        stopping = true;
+      }
+      wake.notify_one();
+      thread.join();
+    }
+
+    retry_request_t
+    setup(body_t replacement) {
+      auto next = replacement ? std::make_shared<const body_t>(std::move(replacement)) : nullptr;
+      retry_request_t result;
+      {
+        std::lock_guard lock { mutex };
+        if (stopping) throw std::logic_error { "Cannot configure a stopping topology retry timer" };
+        if (request.serial == std::numeric_limits<std::uint64_t>::max()) {
+          throw std::overflow_error { "Topology retry request identity exhausted" };
+        }
+        schedule.setup(static_cast<bool>(next), now());
+        result = { ++request.serial };
+        body.swap(next);
+        next_kind = command_kind_e::legacy_retry_tick;
+      }
+      wake.notify_one();
+      return result;
+    }
+
+    bool
+    request_now(retry_request_t expected) {
+      std::lock_guard lock { mutex };
+      if (stopping || expected != request || !body) return false;
+      if (schedule.expedite(now())) next_kind = command_kind_e::legacy_unlock_restore;
+      wake.notify_one();
+      return true;
+    }
+
+    std::optional<attempt_t>
+    wait_for_attempt() {
+      std::unique_lock lock { mutex };
+      while (!stopping) {
+        if (const auto token = schedule.take_due(now())) {
+          return attempt_t { request, *token, std::exchange(next_kind, command_kind_e::legacy_retry_tick), body };
+        }
+        if (const auto due = schedule.next_wake()) {
+          wake.wait_until(lock, std::chrono::steady_clock::time_point {
+                                  std::chrono::duration_cast<std::chrono::steady_clock::duration>(*due) });
+        }
+        else {
+          wake.wait(lock);
+        }
+      }
+      return std::nullopt;
+    }
+
+    void
+    run() noexcept {
+      retry_request_t reporting {};
+      try {
+        while (const auto attempt = wait_for_attempt()) {
+          reporting = attempt->request;
+          auto finished = std::make_shared<bool>(false);
+          command_result_t result;
+          try {
+            const auto posted = coordinator.post_tracked(attempt->kind, [this, attempt = *attempt, finished](const auto &capability, const auto &context) {
+              std::lock_guard owner_lock { owner_mutex };
+              {
+                std::lock_guard timer_lock { mutex };
+                if (stopping || !schedule.is_current(attempt.token)) return;
+              }
+              *finished = (*attempt.body)(capability, context);
+            });
+            result = posted.completion.get();
+          }
+          catch (...) {
+            result = { outcome_e::failed, reject_reason_e::none, std::current_exception() };
+          }
+          std::shared_ptr<const body_t> retired;
+          {
+            std::lock_guard lock { mutex };
+            const auto completion = schedule.complete(attempt->token, result, *finished, now());
+            if (completion == retry_completion_e::disarmed && request == attempt->request) retired.swap(body);
+          }
+          observer(reporting, result);
+        }
+      }
+      catch (...) {
+        observer(reporting, { outcome_e::failed, reject_reason_e::none, std::current_exception() });
+        std::lock_guard lock { mutex };
+        stopping = true;
+      }
+    }
+  };
+
+  retry_timer_t::retry_timer_t(coordinator_t &coordinator, std::mutex &owner_mutex, observer_t observer, monotonic_time_t delay):
+      impl_ { std::make_unique<impl_t>(coordinator, owner_mutex, observer, delay) } {}
+  retry_timer_t::~retry_timer_t() = default;
+
+  retry_request_t
+  retry_timer_t::setup(body_t body) { return impl_->setup(std::move(body)); }
+  bool
+  retry_timer_t::request_now(retry_request_t request) { return impl_->request_now(request); }
 }  // namespace display_device::topology

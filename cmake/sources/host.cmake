@@ -28,16 +28,23 @@ set(SUNSHINE_HOST_SOURCES
     src/display_device/parsed_config.cpp src/display_device/parsed_config.h
     src/display_device/session.cpp src/display_device/session.h
     src/display_device/settings.cpp src/display_device/settings.h
+    src/display_device/topology_actor_body.cpp src/display_device/topology_actor_body.h
+    src/display_device/topology_actor_cleanup.cpp src/display_device/topology_actor_cleanup.h
+    src/display_device/topology_actor_record.cpp src/display_device/topology_actor_record.h
     src/display_device/topology_actor_startup.cpp src/display_device/topology_actor_startup.h
+    src/display_device/topology_actor_supervisor.cpp src/display_device/topology_actor_supervisor.h
+    src/display_device/topology_adapter_restart.cpp src/display_device/topology_adapter_restart.h
     src/display_device/topology_capability.cpp src/display_device/topology_capability.h
     src/display_device/topology_command_queue.cpp src/display_device/topology_command_queue.h
     src/display_device/topology_coordinator.cpp src/display_device/topology_coordinator.h
+    src/display_device/topology_durable_file.cpp src/display_device/topology_durable_file.h
     src/display_device/topology_process_lifecycle.cpp src/display_device/topology_process_lifecycle.h
     src/display_device/topology_routes.cpp src/display_device/topology_routes.h
     src/display_device/topology_runtime.cpp src/display_device/topology_runtime.h
     src/display_device/to_string.cpp src/display_device/to_string.h
     src/display_device/vdd_capability.cpp src/display_device/vdd_capability.h
     src/display_device/vdd_utils.cpp src/display_device/vdd_utils.h
+    src/display_device/vdd_toggle.cpp
     src/display_device/vdd_ioctl.cpp src/display_device/vdd_ioctl.h
     src/display_device/vdd_commands.cpp
     src/display_device/vdd_mode_list.h

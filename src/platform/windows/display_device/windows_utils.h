@@ -294,7 +294,7 @@ namespace display_device::w_utils {
    * ```
    */
   bool
-  set_hdr_state(const DISPLAYCONFIG_PATH_INFO &path, bool enable);
+  set_hdr_state(const topology::mutation_capability_t &capability, const DISPLAYCONFIG_PATH_INFO &path, bool enable);
 
   /**
    * @brief Get the source mode index from the path.
@@ -474,7 +474,7 @@ namespace display_device::w_utils {
   get_display_scale_info(const std::string &display_name, const std::string &device_id);
 
   set_display_scale_result_t
-  set_display_scale(const std::string &display_name, const std::string &device_id, int scale_percent);
+  set_display_scale(const topology::mutation_capability_t &capability, const std::string &display_name, const std::string &device_id, int scale_percent);
 
   /**
    * @brief Get the active path matching the device id.
@@ -532,8 +532,6 @@ namespace display_device::w_utils {
   bool
   test_no_access_to_ccd_api();
 
-  bool
-  togglePnpDeviceByFriendlyName(const std::string &friendlyName, const bool &stat);
 
   /**
    * @brief Check whether any RDP session is active.
@@ -555,10 +553,10 @@ namespace display_device::w_utils {
    *
    * EXAMPLES:
    * ```cpp
-   * const bool success = rotate_display(90, "");
-   * const bool success2 = rotate_display(180, "\\\\.\\DISPLAY1");
+   * const bool success = rotate_display(capability, 90, "");
+   * const bool success2 = rotate_display(capability, 180, "\\\\.\\DISPLAY1");
    * ```
    */
   bool
-  rotate_display(int angle, const std::string &display_name);
+  rotate_display(const topology::mutation_capability_t &capability, int angle, const std::string &display_name);
 }  // namespace display_device::w_utils

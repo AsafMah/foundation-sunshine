@@ -379,9 +379,11 @@ namespace display_device::win_color_profile {
 
     HRESULT
     remove_advanced_association(
+      const topology::mutation_capability_t &capability,
       const color_profile_api_t &api,
       const display_target_t &target,
       const std::wstring &profile) {
+      capability.require(topology::operation_e::write_color_profile);
       const HRESULT status = api.remove_display_association(
         WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER,
         profile.c_str(),
@@ -393,10 +395,12 @@ namespace display_device::win_color_profile {
 
     HRESULT
     restore_association_without_default(
+      const topology::mutation_capability_t &capability,
       const color_profile_api_t &api,
       const display_target_t &target,
       const std::wstring &profile) {
-      HRESULT status = remove_advanced_association(api, target, profile);
+      capability.require(topology::operation_e::write_color_profile);
+      HRESULT status = remove_advanced_association(capability, api, target, profile);
       if (FAILED(status)) {
         return status;
       }
@@ -647,7 +651,8 @@ namespace display_device::win_color_profile {
   }
 
   bool
-  apply(const state_t &state) {
+  apply(const topology::mutation_capability_t &capability, const state_t &state) {
+    capability.require(topology::operation_e::write_color_profile);
     std::lock_guard lock { operation_mutex };
 
     HRESULT status = validate_state(state);
@@ -718,7 +723,8 @@ namespace display_device::win_color_profile {
   }
 
   bool
-  restore(const state_t &state) {
+  restore(const topology::mutation_capability_t &capability, const state_t &state) {
+    capability.require(topology::operation_e::write_color_profile);
     std::lock_guard lock { operation_mutex };
 
     HRESULT status = validate_state(state);
@@ -767,15 +773,15 @@ namespace display_device::win_color_profile {
 
         if (!state.applied_profile_was_associated &&
             !profile_names_equal(applied_profile, original_default)) {
-          operation_status = remove_advanced_association(api, target, applied_profile);
+          operation_status = remove_advanced_association(capability, api, target, applied_profile);
         }
         return operation_status;
       }
 
       if (state.applied_profile_was_associated) {
-        return restore_association_without_default(api, target, applied_profile);
+        return restore_association_without_default(capability, api, target, applied_profile);
       }
-      return remove_advanced_association(api, target, applied_profile);
+      return remove_advanced_association(capability, api, target, applied_profile);
     });
 
     if (FAILED(status)) {
