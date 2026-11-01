@@ -128,12 +128,13 @@ first feedback window after `enable`, which covers only stream-startup
 transients; the skip is logged at INFO and sustained loss is cut on the next
 window.
 
-Encoded video frames are queued for broadcast with an oldest-drop policy: if
-the broadcast thread falls 32 frames behind, only the oldest queued frames are
-evicted (previously the whole queue was cleared silently), and a WARNING
-`Video packet queue full: dropped N oldest encoded frame(s)...` is logged at
-most once per second. The client sees evicted frames as frame loss, which can
-feed ABR loss reports.
+Encoded video frames are handed to the broadcast thread with at most 2 frames
+waiting. If the broadcast thread is behind when a new frame arrives, every
+waiting frame is dropped and only the newest is queued, so no standing latency
+backlog can form (previously up to 32 frames could queue, then were cleared
+silently). A WARNING `Video packet queue full: dropped N superseded encoded
+frame(s)...` is logged at most once per second. The client sees dropped frames
+as frame loss, which can feed ABR loss reports.
 
 Selection, token validation, lifecycle projection, controller mutation and
 budget updates execute inside the streaming session-list lock. Bound requests

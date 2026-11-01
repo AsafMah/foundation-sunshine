@@ -18,6 +18,7 @@
 #include "src/platform/windows/pyrowave/color_metadata.h"
 #include "src/platform/windows/pyrowave/rate_control.h"
 #include "src/platform/windows/pyrowave/transport.h"
+#include "src/video_packet_queue.h"
 #endif
 
 extern "C" {
@@ -1019,7 +1020,7 @@ TEST(PyrowaveTransportTest, PublishesReplayWithoutMetadataFlags) {
   EXPECT_EQ(header.flags & LI_PYROWAVE_FLAG_METADATA_PRESENT, 0u);
 }
 
-TEST(PyrowaveTransportTest, QueueOverflowDropsOnlyOldestFrameAndWarns) {
+TEST(PyrowaveTransportTest, QueueOverflowKeepsOnlyNewestFramesAndWarns) {
   using sink_t = boost::log::sinks::synchronous_sink<boost::log::sinks::text_ostream_backend>;
   auto buffer = boost::make_shared<std::stringstream>();
   auto sink = boost::make_shared<sink_t>();
@@ -1029,8 +1030,8 @@ TEST(PyrowaveTransportTest, QueueOverflowDropsOnlyOldestFrameAndWarns) {
   auto mail = std::make_shared<safe::mail_raw_t>();
   auto packets = mail->queue<video::packet_t>("pyrowave-test-video");
   auto source = std::make_shared<const std::vector<std::uint8_t>>(2000, 0x6e);
-  // The broadcast consumer is stalled: one more frame than the queue holds.
-  for (std::int64_t frame = 1; frame <= 33; ++frame) {
+  // The broadcast consumer is stalled for longer than the old 32-frame queue.
+  for (std::int64_t frame = 1; frame <= 40; ++frame) {
     ASSERT_TRUE(platf::pyrowave_windows::publish_transport_frame(
       frame, source, 1312, 0, packets, nullptr, std::nullopt, std::nullopt).success);
   }
@@ -1043,11 +1044,12 @@ TEST(PyrowaveTransportTest, QueueOverflowDropsOnlyOldestFrameAndWarns) {
     ASSERT_TRUE(packet);
     queued.push_back(packet->frame_index());
   }
-  ASSERT_EQ(queued.size(), 32u);
-  EXPECT_EQ(queued.front(), 2);
-  EXPECT_EQ(queued.back(), 33);
+  // No standing backlog: the hand-off never holds more than the video cap.
+  ASSERT_FALSE(queued.empty());
+  EXPECT_LE(queued.size(), video::max_queued_packets);
+  EXPECT_EQ(queued.back(), 40);
   const auto text = buffer->str();
-  EXPECT_NE(text.find("Video packet queue full: dropped 1 oldest encoded frame"), std::string::npos) << text;
+  EXPECT_NE(text.find("Video packet queue full: dropped "), std::string::npos) << text;
 }
 
 TEST(PyrowaveTransportTest, DoesNotQueueFailedPacketization) {

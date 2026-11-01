@@ -9,13 +9,19 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 
 namespace video {
+  /// Maximum encoded frames waiting for the broadcast thread. Older frames are
+  /// superseded rather than allowed to build a standing latency backlog.
+  inline constexpr std::size_t max_queued_packets = 2;
+
   /**
-   * @brief Queue an encoded packet for broadcast, dropping only the oldest
-   * queued packets if the broadcast thread has fallen behind.
+   * @brief Queue an encoded packet for broadcast. If max_queued_packets are
+   * already waiting, the broadcast thread is behind: every waiting packet is
+   * dropped and only the newest one is queued.
    *
    * Drops look like network loss to the client, so they are always reported,
    * at most once per second with the count accumulated since the last report.
@@ -25,7 +31,7 @@ namespace video {
     static std::atomic<std::uint64_t> pending_drops { 0 };
     static std::atomic<std::int64_t> last_report_ms { std::numeric_limits<std::int64_t>::min() };
 
-    const auto dropped = packets->raise_drop_oldest(std::move(packet));
+    const auto dropped = packets->raise_superseding(max_queued_packets, std::move(packet));
     if (dropped == 0) {
       return;
     }
@@ -42,7 +48,7 @@ namespace video {
       return;
     }
     BOOST_LOG(warning) << "Video packet queue full: dropped " << pending_drops.exchange(0)
-                       << " oldest encoded frame(s) since last report; broadcast is behind the encoder"
+                       << " superseded encoded frame(s) since last report; broadcast is behind the encoder"
                        << " and the client will see the gap as frame loss";
   }
 }  // namespace video

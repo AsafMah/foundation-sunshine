@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -277,17 +278,18 @@ namespace safe {
       return true;
     }
 
-    // Overflow policy for latency-sensitive producers whose consumer may fall
-    // behind: evict only the oldest entries and return how many were evicted.
+    // Overflow policy for latency-sensitive producers: once `max_depth` items
+    // are waiting, every queued item is superseded by the new one. Returns the
+    // number of items dropped.
     template <class... Args>
     std::size_t
-    raise_drop_oldest(Args &&...args) {
+    raise_superseding(std::size_t max_depth, Args &&...args) {
       std::lock_guard ul { _lock };
       if (!_continue) return 0;
       std::size_t dropped = 0;
-      while (!_queue.empty() && _queue.size() >= _max_elements) {
-        _queue.erase(std::begin(_queue));
-        ++dropped;
+      if (_queue.size() >= std::min<std::size_t>(max_depth, _max_elements)) {
+        dropped = _queue.size();
+        _queue.clear();
       }
       _queue.emplace_back(std::forward<Args>(args)...);
       _cv.notify_all();
