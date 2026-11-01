@@ -4,6 +4,7 @@
 
 #include <bit>
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <span>
@@ -12,6 +13,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#ifndef PROC_THREAD_ATTRIBUTE_JOB_LIST
+  #define PROC_THREAD_ATTRIBUTE_JOB_LIST 0x0002000D
+#endif
 
 namespace sunshinesvc::service_control {
   enum class migration_exit { orderly,
@@ -40,6 +45,71 @@ namespace sunshinesvc::service_control {
     }
     return ERROR_SUCCESS;
   }
+
+  class process_attributes {
+  public:
+    process_attributes() = default;
+    process_attributes(const process_attributes &) = delete;
+    process_attributes &
+    operator=(const process_attributes &) = delete;
+    ~process_attributes() {
+      clear();
+    }
+
+    DWORD
+    prepare(STARTUPINFOEXW &startup, std::span<const HANDLE> handles, HANDLE job) {
+      // Windows rejects a second update of the same attribute in a list.
+      // Each Core generation needs both attributes on a fresh list.
+      startup.lpAttributeList = nullptr;
+      clear();
+      SIZE_T size = 0;
+      InitializeProcThreadAttributeList(nullptr, 2, 0, &size);
+      if (size == 0) {
+        return GetLastError();
+      }
+      storage_.resize(size);
+      if (!InitializeProcThreadAttributeList(list(), 2, 0, &size)) {
+        return GetLastError();
+      }
+      initialized_ = true;
+      handles_.assign(handles.begin(), handles.end());
+      job_ = job;
+      startup.lpAttributeList = list();
+      const auto error = set_handle_list(startup, handles_);
+      if (error != ERROR_SUCCESS) {
+        startup.lpAttributeList = nullptr;
+        clear();
+        return error;
+      }
+      if (!UpdateProcThreadAttribute(list(), 0, PROC_THREAD_ATTRIBUTE_JOB_LIST,
+            &job_, sizeof(job_), nullptr, nullptr)) {
+        const auto job_error = GetLastError();
+        startup.lpAttributeList = nullptr;
+        clear();
+        return job_error;
+      }
+      return ERROR_SUCCESS;
+    }
+
+  private:
+    void
+    clear() {
+      if (initialized_) {
+        DeleteProcThreadAttributeList(list());
+        initialized_ = false;
+      }
+    }
+    LPPROC_THREAD_ATTRIBUTE_LIST
+    list() {
+      return reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(storage_.data());
+    }
+    // Attribute values must remain at stable addresses through CreateProcess.
+    // The caller owns the job and keeps it open for the child's whole lifetime.
+    std::vector<std::byte> storage_;
+    std::vector<HANDLE> handles_;
+    HANDLE job_ = nullptr;
+    bool initialized_ = false;
+  };
 
   class handle {
   public:
