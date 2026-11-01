@@ -42,6 +42,7 @@ extern "C" {
 #include "pyrowave/capture_policy.h"
 #include "sync.h"
 #include "video.h"
+#include "video_packet_queue.h"
 #include "video_dolby_vision.h"
 #include "video_hdr_metadata.h"
 #include "video_probe.h"
@@ -2530,7 +2531,7 @@ namespace video {
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
       perf::record_encoded_frame(session.perf_session_id);
-      packets->raise(std::move(packet));
+      raise_packet(packets, std::move(packet));
     }
 
     return 0;
@@ -2582,7 +2583,7 @@ namespace video {
       packet->pipeline_trace = std::move(encoded_trace);
     }
     perf::record_encoded_frame(session.perf_session_id);
-    packets->raise(std::move(packet));
+    raise_packet(packets, std::move(packet));
 
     return 0;
   }
@@ -2621,7 +2622,7 @@ namespace video {
       packet->pipeline_trace = std::move(encoded_trace);
     }
     perf::record_encoded_frame(session.perf_session_id);
-    packets->raise(std::move(packet));
+    raise_packet(packets, std::move(packet));
 
     return 0;
   }

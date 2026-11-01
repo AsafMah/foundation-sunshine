@@ -719,6 +719,14 @@ namespace abr {
 
     // Emergency: high packet loss — immediate, no rate limit
     if (feedback.packet_loss > 5.0) {
+      // recent_feedback is reset by enable(), so a single entry is the first
+      // window after enable/stream start, which only measures startup transients.
+      if (state.recent_feedback.size() == 1) {
+        BOOST_LOG(info) << "ABR: ignoring " << feedback.packet_loss
+                        << "% loss in first feedback window after enable token_prefix="
+                        << token_log_prefix(session_token);
+        return { .reason = "startup window: emergency drop skipped" };
+      }
       auto action = fallback_decision(state, feedback);
       if (action.new_bitrate_kbps > 0) {
         state.current_bitrate_kbps = action.new_bitrate_kbps;
@@ -951,6 +959,7 @@ TEST(AbrConfigTests, PreservesExplicitMaxBitrateWhenMinIsOmitted) {
 
   const std::string client_name = "abr-max-cap-test";
   abr::enable(client_name, cfg, 50000, "Test Game");
+  abr::process_feedback(client_name, { .packet_loss = 0.0 });
 
   auto action = abr::process_feedback(client_name, {
     .packet_loss = 6.0,

@@ -123,6 +123,18 @@ changes the encoder share under an unchanged total (from client loss reports
 on control message `0x5510`, or the host `fec_percentage` fallback when reports
 are stale), so FEC changes alone do not produce ABR-applied lines.
 
+The immediate x0.70 emergency drop for packet loss above 5% is skipped for the
+first feedback window after `enable`, which covers only stream-startup
+transients; the skip is logged at INFO and sustained loss is cut on the next
+window.
+
+Encoded video frames are queued for broadcast with an oldest-drop policy: if
+the broadcast thread falls 32 frames behind, only the oldest queued frames are
+evicted (previously the whole queue was cleared silently), and a WARNING
+`Video packet queue full: dropped N oldest encoded frame(s)...` is logged at
+most once per second. The client sees evicted frames as frame loss, which can
+feed ABR loss reports.
+
 Selection, token validation, lifecycle projection, controller mutation and
 budget updates execute inside the streaming session-list lock. Bound requests
 match the exact authenticated UUID/token pair before considering sibling

@@ -193,11 +193,25 @@ TEST(AbrRequestContract, SuccessAndRetryContractIsTypedAndBound) {
   EXPECT_EQ(nvhttp::abr_api::error_contract(abr::session_error_e::missing_client_identity, true).status, 403);
 }
 
+TEST(AbrEmergencyDrop, FirstFeedbackWindowAfterEnableCannotCutBitrate) {
+  abr::config_t config { true, 2000, 50000, abr::mode_e::BALANCED };
+  abr::enable("startup-allocation", config, 20000, "app");
+  abr::network_feedback_t feedback { 6.0, 0, 0, 0, 20000 };
+  // The first window covers stream startup transients only.
+  EXPECT_EQ(abr::process_feedback("startup-allocation", feedback).new_bitrate_kbps, 0);
+  // Sustained loss in the next window still gets the immediate x0.70 cut.
+  EXPECT_EQ(abr::process_feedback("startup-allocation", feedback).new_bitrate_kbps, 14000);
+  abr::cleanup("startup-allocation");
+}
+
 TEST(AbrControllerOwnership, SameNameReplacementAndOldCleanupStayIsolated) {
   abr::config_t config { true, 2000, 50000, abr::mode_e::BALANCED };
   // Both devices may have display name "asaf"; it is never a controller key.
   abr::enable("old-allocation", config, 20000, "app");
   abr::enable("new-allocation", config, 40000, "app");
+  const abr::network_feedback_t startup { 0.0, 0, 0, 0, 0 };
+  abr::process_feedback("old-allocation", startup);
+  abr::process_feedback("new-allocation", startup);
   abr::network_feedback_t feedback { 6.0, 0, 0, 0, 20000 };
   EXPECT_EQ(abr::process_feedback("old-allocation", feedback).new_bitrate_kbps, 14000);
   abr::cleanup("old-allocation");
@@ -225,6 +239,8 @@ TEST(AbrAppliedLog, OneInfoLinePerActualTotalChange) {
   abr::session_request_t feedback;
   feedback.operation = abr::operation_e::feedback;
   feedback.token = token;
+  feedback.feedback = { 0.0, 0, 0, 0, 400000 };
+  ASSERT_FALSE(abr::apply_session_request(token, "app", budget, feedback).bitrate_requested);
   feedback.feedback = { 6.0, 0, 0, 0, 400000 };
   const auto dropped = abr::apply_session_request(token, "app", budget, feedback);
   ASSERT_TRUE(dropped.bitrate_requested);

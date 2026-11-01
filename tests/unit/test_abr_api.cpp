@@ -143,6 +143,7 @@ TEST_F(AbrHttp, SharedIpAndDisplayNameCannotCrossTargetBudgetOrDisable) {
   EXPECT_EQ(sessions[0]->budget.total(), 10000);
   EXPECT_EQ(sessions[1]->budget.total(), 20000);
   ASSERT_EQ(post(R"({"enabled":true})", false, "paired-b").status, 200);
+  ASSERT_EQ(post(R"({"sessionToken":"allocation-a","packetLoss":0})", true).status, 200);
   const auto feedback = post(R"({"sessionToken":"allocation-a","packetLoss":6,"currentBitrate":10000})", true);
   ASSERT_EQ(feedback.status, 200);
   EXPECT_EQ(feedback.body.at("newBitrate"), 7000);
@@ -197,6 +198,7 @@ TEST_F(AbrHttp, BoundRequestsSelectExactAllocationDuringReconnectOverlap) {
   abr::enable("replacement", { true, 2000, 50000, abr::mode_e::BALANCED }, 40000, "app");
 
   expect_error(post(R"({"sessionToken":"allocation-a","packetLoss":6})", true), 409, "stale_session", false);
+  ASSERT_EQ(post(R"({"sessionToken":"replacement","packetLoss":0})", true).status, 200);
   const auto feedback = post(R"({"sessionToken":"replacement","packetLoss":6,"currentBitrate":40000})", true);
   ASSERT_EQ(feedback.status, 200);
   EXPECT_EQ(feedback.body.at("sessionToken"), "replacement");
@@ -252,6 +254,7 @@ TEST_F(AbrHttp, CapabilitiesAdvertiseVersionTwoAndSessionBinding) {
 TEST_F(AbrHttp, FeedbackPreservesAnUpdatedHostCapAndReportsActualQueuedBudget) {
   ASSERT_EQ(post(R"({"enabled":true,"maxBitrate":80000})").status, 200);
   config::video.max_bitrate = 5000;
+  ASSERT_EQ(post(R"({"sessionToken":"allocation-a","packetLoss":0})", true).status, 200);
   const auto reply = post(R"({"sessionToken":"allocation-a","packetLoss":6,"currentBitrate":20000})", true);
   ASSERT_EQ(reply.status, 200);
   EXPECT_EQ(reply.body.at("newBitrate"), 5000);

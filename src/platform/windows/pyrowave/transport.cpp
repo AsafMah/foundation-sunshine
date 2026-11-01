@@ -3,6 +3,7 @@
 #include "src/pyrowave/packetizer.h"
 #include "src/pyrowave/dynamic_hdr.h"
 #include "src/logging.h"
+#include "src/video_packet_queue.h"
 
 extern "C" {
 #include "third-party/moonlight-common-c/src/PyrowaveProtocol.h"
@@ -163,7 +164,7 @@ namespace platf::pyrowave_windows {
         pipeline_trace->packet_ready = std::chrono::steady_clock::now();
       }
       output->pipeline_trace = std::move(pipeline_trace);
-      packets->raise(std::move(output));
+      video::raise_packet(packets, std::move(output));
       result.success = true;
       return result;
     }

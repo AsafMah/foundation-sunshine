@@ -26,12 +26,17 @@ extern "C" {
 }
 
 #include <gtest/gtest.h>
+#include <boost/log/core.hpp>
+#include <boost/log/sinks/sync_frontend.hpp>
+#include <boost/log/sinks/text_ostream_backend.hpp>
+#include <boost/make_shared.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <sstream>
 #include <vector>
 
 namespace {
@@ -1012,6 +1017,37 @@ TEST(PyrowaveTransportTest, PublishesReplayWithoutMetadataFlags) {
   EXPECT_EQ(header.metadataLength, 0u);
   EXPECT_EQ(header.metadataFlags, 0u);
   EXPECT_EQ(header.flags & LI_PYROWAVE_FLAG_METADATA_PRESENT, 0u);
+}
+
+TEST(PyrowaveTransportTest, QueueOverflowDropsOnlyOldestFrameAndWarns) {
+  using sink_t = boost::log::sinks::synchronous_sink<boost::log::sinks::text_ostream_backend>;
+  auto buffer = boost::make_shared<std::stringstream>();
+  auto sink = boost::make_shared<sink_t>();
+  sink->locked_backend()->add_stream(buffer);
+  boost::log::core::get()->add_sink(sink);
+
+  auto mail = std::make_shared<safe::mail_raw_t>();
+  auto packets = mail->queue<video::packet_t>("pyrowave-test-video");
+  auto source = std::make_shared<const std::vector<std::uint8_t>>(2000, 0x6e);
+  // The broadcast consumer is stalled: one more frame than the queue holds.
+  for (std::int64_t frame = 1; frame <= 33; ++frame) {
+    ASSERT_TRUE(platf::pyrowave_windows::publish_transport_frame(
+      frame, source, 1312, 0, packets, nullptr, std::nullopt, std::nullopt).success);
+  }
+
+  boost::log::core::get()->remove_sink(sink);
+  sink->flush();
+  std::vector<std::int64_t> queued;
+  while (packets->peek()) {
+    auto packet = packets->pop(std::chrono::milliseconds(0));
+    ASSERT_TRUE(packet);
+    queued.push_back(packet->frame_index());
+  }
+  ASSERT_EQ(queued.size(), 32u);
+  EXPECT_EQ(queued.front(), 2);
+  EXPECT_EQ(queued.back(), 33);
+  const auto text = buffer->str();
+  EXPECT_NE(text.find("Video packet queue full: dropped 1 oldest encoded frame"), std::string::npos) << text;
 }
 
 TEST(PyrowaveTransportTest, DoesNotQueueFailedPacketization) {
