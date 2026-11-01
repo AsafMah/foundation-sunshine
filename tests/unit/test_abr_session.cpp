@@ -1,8 +1,13 @@
 #include "src/nvhttp/abr_request.h"
 #include "src/nvhttp/abr_rejection_log_limiter.h"
 #include "src/streaming/abr_session.h"
+#include <boost/log/core.hpp>
+#include <boost/log/sinks/sync_frontend.hpp>
+#include <boost/log/sinks/text_ostream_backend.hpp>
+#include <boost/make_shared.hpp>
 #include <chrono>
 #include <gtest/gtest.h>
+#include <sstream>
 #include <string>
 
 TEST(AbrSessionIdentity, MappedIpv4FixtureUsesCertificateNotAddress) {
@@ -201,6 +206,39 @@ TEST(AbrControllerOwnership, SameNameReplacementAndOldCleanupStayIsolated) {
   feedback.current_bitrate_kbps = 40000;
   EXPECT_EQ(abr::process_feedback("new-allocation", feedback).new_bitrate_kbps, 28000);
   abr::cleanup("new-allocation");
+}
+
+TEST(AbrAppliedLog, OneInfoLinePerActualTotalChange) {
+  using sink_t = boost::log::sinks::synchronous_sink<boost::log::sinks::text_ostream_backend>;
+  auto buffer = boost::make_shared<std::stringstream>();
+  auto sink = boost::make_shared<sink_t>();
+  sink->locked_backend()->add_stream(buffer);
+  boost::log::core::get()->add_sink(sink);
+
+  const std::string token = "0123456789abcdef-full-token";
+  streaming::bitrate_budget_t budget(400000, 400000, 0, 0, 0, false);
+  abr::session_request_t configure;
+  configure.operation = abr::operation_e::configure;
+  configure.config = { true, 120000, 400000, abr::mode_e::BALANCED };
+  ASSERT_EQ(abr::apply_session_request(token, "app", budget, configure).error, abr::session_error_e::none);
+
+  abr::session_request_t feedback;
+  feedback.operation = abr::operation_e::feedback;
+  feedback.token = token;
+  feedback.feedback = { 6.0, 0, 0, 0, 400000 };
+  const auto dropped = abr::apply_session_request(token, "app", budget, feedback);
+  ASSERT_TRUE(dropped.bitrate_requested);
+  const auto changed_to = dropped.requested_bitrate_kbps;
+  ASSERT_LT(changed_to, 400000);
+  abr::cleanup(token);
+
+  boost::log::core::get()->remove_sink(sink);
+  sink->flush();
+  const auto text = buffer->str();
+  const auto expected = "ABR applied: total 400000->" + std::to_string(changed_to) + " Kbps (" + dropped.action.reason + ") token_prefix=01234567";
+  EXPECT_NE(text.find(expected), std::string::npos) << text;
+  EXPECT_EQ(text.find("ABR applied:"), text.rfind("ABR applied:")) << text;
+  EXPECT_EQ(text.find("0123456789abcdef"), std::string::npos) << text;
 }
 
 TEST(AbrRequestContract, LargestAcceptedIntegerCannotOverflowModePresets) {

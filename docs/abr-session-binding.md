@@ -115,6 +115,14 @@ or disable; they must negotiate and implement session binding.
 
 ## Ownership and regression coverage
 
+Each ABR request that changes the session's total budget logs one INFO line,
+`ABR applied: total X->Y Kbps (reason) token_prefix=XXXXXXXX`. A configure that
+leaves the total unchanged does not log one. The line records the queued
+session total; `Applied video budget` reports when the encoder takes it. FEC
+changes the encoder share under an unchanged total (from client loss reports
+on control message `0x5510`, or the host `fec_percentage` fallback when reports
+are stale), so FEC changes alone do not produce ABR-applied lines.
+
 Selection, token validation, lifecycle projection, controller mutation and
 budget updates execute inside the streaming session-list lock. Bound requests
 match the exact authenticated UUID/token pair before considering sibling
@@ -126,7 +134,8 @@ controller entry. Existing asynchronous LLM generation checks also reject work
 from an earlier controller configuration.
 
 `abr_unit_tests` covers identity selection, lifecycle projection, request
-validation, bounded rejection-log churn and controller isolation.
+validation, bounded rejection-log churn, controller isolation and the
+applied-change log.
 `abr_api_unit_tests` invokes real HTTP handlers/serialization, the production
 lock-and-select helper, controller and bitrate budget with a media-free session
 shim, including concurrent removal/replacement. Neither test target starts an

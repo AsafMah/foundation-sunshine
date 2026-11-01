@@ -793,12 +793,17 @@ namespace abr {
   apply_session_request(const std::string &token, const std::string &app_name,
     streaming::bitrate_budget_t &budget, const session_request_t &request, int host_max_bitrate_kbps) {
     session_result_t result { .error = session_error_e::none, .token = token };
-    const auto request_bitrate = [&](int bitrate) {
+    const auto request_bitrate = [&](int bitrate, const std::string &reason) {
       if (host_max_bitrate_kbps > 0) {
         bitrate = std::min(bitrate, host_max_bitrate_kbps);
       }
+      const int previous = budget.total();
       result.requested_bitrate_kbps = budget.request(bitrate);
       result.bitrate_requested = true;
+      if (result.requested_bitrate_kbps != previous) {
+        BOOST_LOG(info) << "ABR applied: total " << previous << "->" << result.requested_bitrate_kbps
+                        << " Kbps (" << reason << ") token_prefix=" << token_log_prefix(token);
+      }
     };
     switch (request.operation) {
       case operation_e::configure: {
@@ -814,7 +819,7 @@ namespace abr {
         result.config = enable(token, request.config, initial, app_name);
         result.initial_bitrate_kbps = std::clamp(initial, result.config.min_bitrate_kbps, result.config.max_bitrate_kbps);
         if (current > result.config.max_bitrate_kbps) {
-          request_bitrate(result.config.max_bitrate_kbps);
+          request_bitrate(result.config.max_bitrate_kbps, "configure: clamp to ABR maximum");
         }
         break;
       }
@@ -827,7 +832,7 @@ namespace abr {
         }
         result.action = process_feedback(token, request.feedback);
         if (result.action.new_bitrate_kbps > 0) {
-          request_bitrate(result.action.new_bitrate_kbps);
+          request_bitrate(result.action.new_bitrate_kbps, result.action.reason);
           result.action.new_bitrate_kbps = result.requested_bitrate_kbps;
         }
         break;
