@@ -10,9 +10,9 @@
  * Launch ownership ("the lease") is tracked per launch transaction:
  *   preparing -> bound (ticket registered) -> active (managed only, stream connected).
  * While any launch is preparing every other launch is rejected. A legacy lease ends
- * when its ticket is activated or disappears; a managed lease ends at stream end,
- * on abandonment (ticket gone without activation) or after the idle grace period,
- * and each end posts exactly one native restore.
+ * when its ticket is activated or disappears. A managed lease retains independent
+ * owner/join references until terminal teardown or ticket abandonment; restoration
+ * waits for all references and video work, or the all-active idle grace period.
  */
 #pragma once
 
@@ -130,6 +130,8 @@ namespace display_device::topology {
     launch_flavor_e flavor { launch_flavor_e::legacy };
     /** Informational: the coordinator enforces the deadline it recorded at admission. */
     monotonic_time_t setup_deadline {};
+    /** Zero identifies the topology owner; nonzero identifies a managed join reference. */
+    std::uint64_t attachment_serial {};
   };
 
   struct launch_admission_t {
@@ -147,6 +149,8 @@ namespace display_device::topology {
     std::uint32_t launch_session_id {};
     launch_flavor_e flavor { launch_flavor_e::legacy };
     lease_stage_e stage { lease_stage_e::preparing };
+    std::size_t attachments {};
+    bool retiring {};
   };
 
   struct native_health_t {
@@ -188,7 +192,7 @@ namespace display_device::topology {
   struct coordinator_probes_t {
     /** Whether launch ticket `id` is still registered (pending or claimed). */
     std::function<bool(std::uint32_t)> ticket_present;
-    /** Number of live stream sessions. */
+    /** Number of live video sessions; required in managed mode. */
     std::function<std::size_t()> active_streams;
     /** Whether a legacy restore is still deferred (for example until unlock). */
     std::function<bool()> legacy_restore_pending;
@@ -200,6 +204,7 @@ namespace display_device::topology {
     std::chrono::milliseconds poll_interval { 50 };
     std::chrono::milliseconds setup_timeout { 60000 };
     std::chrono::milliseconds native_idle_grace { 10000 };
+    std::size_t max_managed_attachments { 16 };
     /** Interval of the internal tick thread; zero disables it (tests call `tick()`). */
     std::chrono::milliseconds tick_interval { 0 };
     coordinator_probes_t probes;
@@ -215,7 +220,8 @@ namespace display_device::topology {
   class coordinator_t {
   public:
     /**
-     * @throws std::invalid_argument in managed mode without a `native_restore` body.
+     * @throws std::invalid_argument in managed mode without a `native_restore` body,
+     *         a video-quiescence probe, or capacity for the owner reference.
      */
     explicit coordinator_t(coordinator_options_t options = {});
     ~coordinator_t();
@@ -263,6 +269,23 @@ namespace display_device::topology {
     launch_admission_t
     admit_launch(const launch_request_t &request);
 
+    /** Reserve a reference to an existing managed topology without preparing it again. */
+    launch_admission_t
+    admit_managed_join(const launch_request_t &request);
+
+    /** Consume a bound reference, under the ticket lock before removing its ticket. */
+    bool
+    launch_activated(const launch_token_t &token);
+
+    /**
+     * End a bound/active managed reference after ticket revocation and quiescence of
+     * its claimants, startup and streaming work. Preparing references use abort_launch.
+     * Returns whether the reference ended, not whether restoration has completed.
+     * The restore obligation survives remaining references and live-video probes.
+     */
+    bool
+    end_managed_launch(const launch_token_t &token, command_kind_e kind = command_kind_e::stream_restore);
+
     /**
      * @brief Run the launch's prepare body with the setup deadline recorded at admission.
      * @details On deadline the route stops waiting: a command that has not started is
@@ -279,8 +302,9 @@ namespace display_device::topology {
 
     /**
      * @brief Mark the launch's ticket as registered. Called once the handler succeeded.
-     * @return false unless `token` is the current preparing launch, its prepare completed,
-     *         its recorded deadline has not expired, and the coordinator is running.
+     * @return false unless `token` identifies a preparing reference, its recorded deadline
+     *         has not expired, and the coordinator is running. An owner also needs a
+     *         completed prepare; joiners share the already-prepared topology.
      */
     bool
     bind_launch(const launch_token_t &token);
@@ -295,25 +319,6 @@ namespace display_device::topology {
      */
     bool
     abort_launch(const launch_token_t &token, command_body_t legacy_cleanup);
-
-    /**
-     * @brief The stream for launch `launch_session_id` connected (ticket consumed).
-     */
-    void
-    launch_activated(std::uint32_t launch_session_id);
-
-    /**
-     * @brief End the active managed lease and post the native restore as `kind`.
-     * @details Only an active lease (its stream connected) ends here. A bound lease belongs
-     *          to a launch whose stream has not connected yet, possibly a newer launch than
-     *          the stream that ended; it ends through ticket abandonment or the idle grace.
-     * @param launch_session_id When set, only the lease of that launch is ended, so a late
-     *        end event for an earlier launch cannot end a newer one.
-     * @return true when this call ended the lease.
-     * @throws std::invalid_argument when `kind` may not perform a native restore.
-     */
-    bool
-    end_managed_lease(command_kind_e kind, std::optional<std::uint32_t> launch_session_id = std::nullopt);
 
     /**
      * @brief Re-check lease liveness (setup deadline, abandoned tickets, idle managed streams).
@@ -369,6 +374,13 @@ namespace display_device::topology {
     struct command_state_t;
     struct startup_signal_t;
 
+    struct attachment_t {
+      std::uint64_t serial {};
+      std::uint32_t launch_session_id {};
+      lease_stage_e stage { lease_stage_e::preparing };
+      monotonic_time_t setup_deadline {};
+    };
+
     struct lease_t {
       std::uint64_t transaction {};
       std::uint32_t launch_session_id {};
@@ -381,8 +393,11 @@ namespace display_device::topology {
       std::shared_ptr<command_state_t> prepare_state;
       command_body_t legacy_expiry_cleanup;
       bool prepared {};
-      bool activated_before_bind {};
       std::optional<monotonic_time_t> idle_since;
+      std::vector<attachment_t> attachments;
+      std::uint64_t next_attachment_serial { 1 };
+      std::uint64_t activity_generation {};
+      std::optional<command_kind_e> restore_kind;
     };
 
     using submission_t = command_submission_t;
@@ -423,6 +438,21 @@ namespace display_device::topology {
     /** Cancel and reap an expired preparing lease, enqueuing cleanup before admission. */
     bool
     expire_preparing_locked();
+
+    attachment_t *
+    find_attachment_locked(const launch_token_t &token);
+
+    bool
+    matches_owner_locked(const launch_token_t &token) const;
+
+    void
+    touch_managed_locked();
+
+    void
+    remove_attachment_locked(std::uint64_t serial, command_kind_e restore_kind);
+
+    void
+    expire_joins_locked();
 
     /** `options_.native_restore`, marking native health In conflict if it throws. */
     command_body_t

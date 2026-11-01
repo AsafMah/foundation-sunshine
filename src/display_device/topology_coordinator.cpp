@@ -169,6 +169,12 @@ namespace display_device::topology {
     if (options_.managed_mode && !options_.native_restore) {
       throw std::invalid_argument { "Managed topology mode needs a native restore body" };
     }
+    if (options_.managed_mode && options_.max_managed_attachments == 0) {
+      throw std::invalid_argument { "Managed topology needs at least one attachment" };
+    }
+    if (options_.managed_mode && !options_.probes.active_streams) {
+      throw std::invalid_argument { "Managed topology needs a video-quiescence probe" };
+    }
     if (options_.poll_interval <= std::chrono::milliseconds::zero()) {
       options_.poll_interval = std::chrono::milliseconds { 1 };
     }
@@ -586,6 +592,15 @@ namespace display_device::topology {
 
   launch_admission_t
   coordinator_t::admit_launch(const launch_request_t &request) {
+    if (options_.managed_mode) {
+      {
+        std::lock_guard lock { mutex_ };
+        if (const auto reason = admission_reason_locked(); reason != reject_reason_e::none) {
+          return { std::nullopt, reason };
+        }
+      }
+      tick();
+    }
     std::optional<lease_t> held;
     {
       std::lock_guard lock { mutex_ };
@@ -598,7 +613,7 @@ namespace display_device::topology {
 
     // Probes run unlocked; their answers apply only if the lease did not change meanwhile.
     bool ticket_gone = false;
-    if (held && held->stage == lease_stage_e::bound && options_.probes.ticket_present) {
+    if (held && held->flavor == launch_flavor_e::legacy && held->stage == lease_stage_e::bound && options_.probes.ticket_present) {
       ticket_gone = !options_.probes.ticket_present(held->launch_session_id);
     }
     const bool legacy_pending = options_.managed_mode && options_.probes.legacy_restore_pending &&
@@ -635,9 +650,131 @@ namespace display_device::topology {
     lease.flavor = options_.managed_mode ? launch_flavor_e::managed : launch_flavor_e::legacy;
     lease.client_key = request.client_key;
     lease.setup_deadline = now() + options_.setup_timeout;
+    if (options_.managed_mode) {
+      lease.attachments.push_back({ 0, request.launch_session_id, lease_stage_e::preparing, lease.setup_deadline });
+    }
     lease_ = lease;
     return { launch_token_t { lease.transaction, lease.launch_session_id, lease.flavor, lease.setup_deadline },
       reject_reason_e::none };
+  }
+
+  launch_admission_t
+  coordinator_t::admit_managed_join(const launch_request_t &request) {
+    std::lock_guard lock { mutex_ };
+    if (const auto reason = admission_reason_locked(); reason != reject_reason_e::none) {
+      return { std::nullopt, reason };
+    }
+    expire_preparing_locked();
+    expire_joins_locked();
+    if (!lease_ || lease_->flavor != launch_flavor_e::managed) {
+      return { std::nullopt, reject_reason_e::stale_transaction };
+    }
+    if (native_.in_conflict) {
+      return { std::nullopt, reject_reason_e::recovery_required };
+    }
+    if (lease_->stage == lease_stage_e::preparing || lease_->attachments.empty() ||
+        lease_->attachments.size() >= options_.max_managed_attachments ||
+        std::any_of(lease_->attachments.begin(), lease_->attachments.end(),
+          [&](const auto &ref) { return ref.launch_session_id == request.launch_session_id; })) {
+      return { std::nullopt, reject_reason_e::owner_busy };
+    }
+    const auto serial = lease_->next_attachment_serial++;
+    const auto deadline = now() + options_.setup_timeout;
+    lease_->attachments.push_back({ serial, request.launch_session_id, lease_stage_e::preparing, deadline });
+    touch_managed_locked();
+    return { launch_token_t { lease_->transaction, request.launch_session_id, launch_flavor_e::managed, deadline, serial },
+      reject_reason_e::none };
+  }
+
+  bool
+  coordinator_t::matches_owner_locked(const launch_token_t &token) const {
+    return lease_ && lease_->transaction == token.transaction && lease_->launch_session_id == token.launch_session_id &&
+           lease_->flavor == token.flavor && token.attachment_serial == 0;
+  }
+
+  coordinator_t::attachment_t *
+  coordinator_t::find_attachment_locked(const launch_token_t &token) {
+    if (!lease_ || lease_->flavor != launch_flavor_e::managed || token.flavor != launch_flavor_e::managed ||
+        lease_->transaction != token.transaction) {
+      return nullptr;
+    }
+    const auto found = std::find_if(lease_->attachments.begin(), lease_->attachments.end(), [&](const auto &ref) {
+      return ref.serial == token.attachment_serial && ref.launch_session_id == token.launch_session_id;
+    });
+    return found == lease_->attachments.end() ? nullptr : &*found;
+  }
+
+  void
+  coordinator_t::touch_managed_locked() {
+    ++lease_->activity_generation;
+    lease_->idle_since.reset();
+  }
+
+  void
+  coordinator_t::remove_attachment_locked(std::uint64_t serial, command_kind_e restore_kind) {
+    std::erase_if(lease_->attachments, [&](const auto &ref) { return ref.serial == serial; });
+    if (!lease_->restore_kind) {
+      lease_->restore_kind = restore_kind;
+    }
+    touch_managed_locked();
+  }
+
+  void
+  coordinator_t::expire_joins_locked() {
+    if (!lease_ || lease_->flavor != launch_flavor_e::managed) {
+      return;
+    }
+    const auto current = now();
+    const auto removed = std::erase_if(lease_->attachments, [&](const auto &ref) {
+      return ref.serial != 0 && ref.stage == lease_stage_e::preparing && current >= ref.setup_deadline;
+    });
+    if (removed != 0) {
+      if (!lease_->restore_kind) {
+        lease_->restore_kind = command_kind_e::native_restore;
+      }
+      touch_managed_locked();
+    }
+  }
+
+  bool
+  coordinator_t::launch_activated(const launch_token_t &token) {
+    std::lock_guard lock { mutex_ };
+    if (!lease_ || stopping_ || phase_ != coordinator_phase_e::running) {
+      return false;
+    }
+    if (lease_->flavor == launch_flavor_e::legacy) {
+      if (!matches_owner_locked(token) || lease_->stage != lease_stage_e::bound) {
+        return false;
+      }
+      lease_.reset();
+      return true;
+    }
+    auto *ref = find_attachment_locked(token);
+    if (!ref || ref->stage != lease_stage_e::bound) {
+      return false;
+    }
+    ref->stage = lease_stage_e::active;
+    lease_->stage = lease_stage_e::active;
+    touch_managed_locked();
+    return true;
+  }
+
+  bool
+  coordinator_t::end_managed_launch(const launch_token_t &token, command_kind_e kind) {
+    if (!kind_allows(kind, operation_e::native_restore, true)) {
+      throw std::invalid_argument { std::string { "Topology command " } + std::string { to_string(kind) } +
+                                    " cannot end a managed launch" };
+    }
+    {
+      std::lock_guard lock { mutex_ };
+      const auto *ref = find_attachment_locked(token);
+      if (!ref || ref->stage == lease_stage_e::preparing) {
+        return false;
+      }
+      remove_attachment_locked(ref->serial, kind);
+    }
+    tick();
+    return true;
   }
 
   command_result_t
@@ -651,6 +788,9 @@ namespace display_device::topology {
     monotonic_time_t deadline {};
     {
       std::lock_guard lock { mutex_ };
+      if (!matches_owner_locked(token)) {
+        return rejected(reject_reason_e::stale_transaction);
+      }
       if (const auto reason = evaluate_locked(command_kind_e::launch_prepare, token.transaction, false);
         reason != reject_reason_e::none) {
         return rejected(reason);
@@ -683,19 +823,24 @@ namespace display_device::topology {
       return false;
     }
     expire_preparing_locked();
-    if (!lease_ || lease_->transaction != token.transaction || lease_->stage != lease_stage_e::preparing ||
-        !lease_->prepared) {
+    expire_joins_locked();
+    if (!lease_) {
       return false;
     }
-    if (lease_->activated_before_bind) {
-      if (lease_->flavor == launch_flavor_e::managed) {
-        lease_->stage = lease_stage_e::active;
-        lease_->idle_since.reset();
+    if (lease_->flavor == launch_flavor_e::managed) {
+      auto *ref = find_attachment_locked(token);
+      if (!ref || ref->stage != lease_stage_e::preparing || !lease_->prepared) {
+        return false;
       }
-      else {
-        lease_.reset();
+      ref->stage = lease_stage_e::bound;
+      if (token.attachment_serial == 0) {
+        lease_->stage = lease_stage_e::bound;
       }
+      touch_managed_locked();
       return true;
+    }
+    if (!matches_owner_locked(token) || lease_->stage != lease_stage_e::preparing || !lease_->prepared) {
+      return false;
     }
     lease_->stage = lease_stage_e::bound;
     return true;
@@ -703,8 +848,20 @@ namespace display_device::topology {
 
   bool
   coordinator_t::abort_launch(const launch_token_t &token, command_body_t legacy_cleanup) {
+    if (token.attachment_serial != 0) {
+      {
+        std::lock_guard lock { mutex_ };
+        const auto *ref = find_attachment_locked(token);
+        if (!ref || ref->stage != lease_stage_e::preparing) {
+          return false;
+        }
+        remove_attachment_locked(ref->serial, command_kind_e::launch_failed_restore);
+      }
+      tick();
+      return true;
+    }
     std::lock_guard lock { mutex_ };
-    if (!lease_ || lease_->transaction != token.transaction || lease_->stage != lease_stage_e::preparing) {
+    if (!matches_owner_locked(token) || lease_->stage != lease_stage_e::preparing) {
       return false;
     }
     if (lease_->prepare_handle && queue_) {
@@ -720,45 +877,6 @@ namespace display_device::topology {
   }
 
   void
-  coordinator_t::launch_activated(std::uint32_t launch_session_id) {
-    std::lock_guard lock { mutex_ };
-    if (!lease_ || lease_->launch_session_id != launch_session_id) {
-      return;
-    }
-    switch (lease_->stage) {
-      case lease_stage_e::preparing:
-        lease_->activated_before_bind = true;
-        break;
-      case lease_stage_e::bound:
-        if (lease_->flavor == launch_flavor_e::managed) {
-          lease_->stage = lease_stage_e::active;
-          lease_->idle_since.reset();
-        }
-        else {
-          lease_.reset();
-        }
-        break;
-      case lease_stage_e::active:
-        break;
-    }
-  }
-
-  bool
-  coordinator_t::end_managed_lease(command_kind_e kind, std::optional<std::uint32_t> launch_session_id) {
-    if (!kind_allows(kind, operation_e::native_restore, true)) {
-      throw std::invalid_argument { std::string { "Topology command " } + std::string { to_string(kind) } +
-                                    " cannot end a managed lease" };
-    }
-    std::lock_guard lock { mutex_ };
-    if (!lease_ || lease_->flavor != launch_flavor_e::managed || lease_->stage != lease_stage_e::active ||
-        (launch_session_id && lease_->launch_session_id != *launch_session_id)) {
-      return false;
-    }
-    release_lease_locked(true, kind);
-    return true;
-  }
-
-  void
   coordinator_t::tick() {
     std::optional<lease_t> held;
     {
@@ -767,31 +885,62 @@ namespace display_device::topology {
         return;
       }
       expire_preparing_locked();
+      expire_joins_locked();
       held = lease_;
     }
     if (!held) {
       return;
     }
 
+    std::vector<attachment_t> gone;
     bool ticket_gone = false;
     std::optional<std::size_t> streams;
-    if (held->stage == lease_stage_e::bound && options_.probes.ticket_present) {
-      ticket_gone = !options_.probes.ticket_present(held->launch_session_id);
+    if (held->flavor == launch_flavor_e::managed) {
+      for (const auto &ref : held->attachments) {
+        if (ref.stage == lease_stage_e::bound && options_.probes.ticket_present &&
+            !options_.probes.ticket_present(ref.launch_session_id)) {
+          gone.push_back(ref);
+        }
+      }
+      if (held->stage != lease_stage_e::preparing && options_.probes.active_streams) {
+        streams = options_.probes.active_streams();
+      }
     }
-    else if (held->stage == lease_stage_e::active && options_.probes.active_streams) {
-      streams = options_.probes.active_streams();
+    else if (held->stage == lease_stage_e::bound && options_.probes.ticket_present) {
+      ticket_gone = !options_.probes.ticket_present(held->launch_session_id);
     }
 
     std::lock_guard lock { mutex_ };
-    if (!lease_ || lease_->transaction != held->transaction || lease_->stage != held->stage) {
+    if (!lease_ || lease_->transaction != held->transaction) {
       return;
     }
-    if (ticket_gone) {
-      // The ticket expired or was removed before the stream connected.
-      release_lease_locked(lease_->flavor == launch_flavor_e::managed, command_kind_e::native_restore);
+    if (held->flavor == launch_flavor_e::legacy) {
+      if (ticket_gone && lease_->stage == held->stage) {
+        release_lease_locked(false, command_kind_e::native_restore);
+      }
       return;
     }
-    if (!streams) {
+    const bool activity_unchanged = lease_->activity_generation == held->activity_generation;
+    for (const auto &old : gone) {
+      const auto *ref = find_attachment_locked({ held->transaction, old.launch_session_id, launch_flavor_e::managed,
+        old.setup_deadline, old.serial });
+      if (ref && ref->stage == old.stage) {
+        remove_attachment_locked(ref->serial, command_kind_e::native_restore);
+      }
+    }
+    if (!activity_unchanged) {
+      return;
+    }
+    if (lease_->attachments.empty()) {
+      if (streams && *streams == 0) {
+        release_lease_locked(true, lease_->restore_kind.value_or(command_kind_e::native_restore));
+      }
+      return;
+    }
+    const bool all_active = std::all_of(lease_->attachments.begin(), lease_->attachments.end(),
+      [](const auto &ref) { return ref.stage == lease_stage_e::active; });
+    if (!all_active || !streams) {
+      lease_->idle_since.reset();
       return;
     }
     if (*streams != 0) {
@@ -804,7 +953,7 @@ namespace display_device::topology {
       return;
     }
     if (current - *lease_->idle_since >= options_.native_idle_grace) {
-      release_lease_locked(true, command_kind_e::native_restore);
+      release_lease_locked(true, lease_->restore_kind.value_or(command_kind_e::native_restore));
     }
   }
 
@@ -895,7 +1044,8 @@ namespace display_device::topology {
     result.phase = phase_;
     result.managed_mode = options_.managed_mode;
     if (lease_) {
-      result.lease = lease_snapshot_t { lease_->transaction, lease_->launch_session_id, lease_->flavor, lease_->stage };
+      result.lease = lease_snapshot_t { lease_->transaction, lease_->launch_session_id, lease_->flavor, lease_->stage,
+        lease_->attachments.size(), lease_->flavor == launch_flavor_e::managed && lease_->attachments.empty() };
     }
     result.native = native_;
     result.fence_active = std::any_of(fences_.begin(), fences_.end(), [](const auto &settled) { return !settled(); });

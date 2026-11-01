@@ -274,6 +274,7 @@ namespace {
     if (managed) {
       // Managed mode requires a restore body; tests that observe restores replace this one.
       options.native_restore = [](const mutation_capability_t &, const command_context_t &) {};
+      options.probes.active_streams = []() { return 0u; };
     }
     return options;
   }
@@ -709,7 +710,7 @@ namespace {
 
     // An empty client key never matches, not even another empty key.
     ASSERT_TRUE(prepare_and_bind(coordinator, *superseding.token));
-    coordinator.launch_activated(14);
+    ASSERT_TRUE(coordinator.launch_activated(*superseding.token));
     const auto anonymous = coordinator.admit_launch({ 15, "" });
     ASSERT_TRUE(anonymous);
     ASSERT_TRUE(prepare_and_bind(coordinator, *anonymous.token));
@@ -764,19 +765,23 @@ namespace {
       const auto before_bind = legacy.admit_launch({ 31, "cert:a" });
       ASSERT_TRUE(before_bind);
       ASSERT_TRUE(legacy.run_launch_prepare(*before_bind.token, {}).completed());
-      legacy.launch_activated(31);
+      EXPECT_FALSE(legacy.launch_activated(*before_bind.token));
       ASSERT_TRUE(legacy.status().lease);
       EXPECT_EQ(legacy.status().lease->stage, lease_stage_e::preparing);
       ASSERT_TRUE(legacy.bind_launch(*before_bind.token));
-      EXPECT_FALSE(legacy.status().lease) << "activation before bind must end the legacy lease at bind";
+      EXPECT_TRUE(legacy.status().lease) << "pre-bind activation is refused";
+      EXPECT_TRUE(legacy.launch_activated(*before_bind.token));
+      EXPECT_FALSE(legacy.status().lease);
 
       const auto after_bind = legacy.admit_launch({ 32, "cert:a" });
       ASSERT_TRUE(after_bind);
       ASSERT_TRUE(prepare_and_bind(legacy, *after_bind.token));
-      legacy.launch_activated(999);
+      auto unknown = *after_bind.token;
+      unknown.launch_session_id = 999;
+      EXPECT_FALSE(legacy.launch_activated(unknown));
       ASSERT_TRUE(legacy.status().lease);
       EXPECT_EQ(legacy.status().lease->stage, lease_stage_e::bound);
-      legacy.launch_activated(32);
+      EXPECT_TRUE(legacy.launch_activated(*after_bind.token));
       EXPECT_FALSE(legacy.status().lease);
     }
     {
@@ -786,18 +791,19 @@ namespace {
       const auto before_bind = managed.admit_launch({ 33, "cert:a" });
       ASSERT_TRUE(before_bind);
       ASSERT_TRUE(managed.run_launch_prepare(*before_bind.token, {}).completed());
-      managed.launch_activated(33);
+      EXPECT_FALSE(managed.launch_activated(*before_bind.token));
       ASSERT_TRUE(managed.bind_launch(*before_bind.token));
+      EXPECT_TRUE(managed.launch_activated(*before_bind.token));
       ASSERT_TRUE(managed.status().lease);
       EXPECT_EQ(managed.status().lease->stage, lease_stage_e::active);
 
-      ASSERT_TRUE(managed.end_managed_lease(command_kind_e::stream_restore));
+      ASSERT_TRUE(managed.end_managed_launch(*before_bind.token));
       const auto after_bind = managed.admit_launch({ 34, "cert:a" });
       ASSERT_TRUE(after_bind);
       ASSERT_TRUE(prepare_and_bind(managed, *after_bind.token));
       ASSERT_TRUE(managed.status().lease);
       EXPECT_EQ(managed.status().lease->stage, lease_stage_e::bound);
-      managed.launch_activated(34);
+      EXPECT_TRUE(managed.launch_activated(*after_bind.token));
       ASSERT_TRUE(managed.status().lease);
       EXPECT_EQ(managed.status().lease->stage, lease_stage_e::active);
     }
@@ -872,7 +878,9 @@ namespace {
         const auto launch = coordinator.admit_launch({ 303, "client" });
         ASSERT_TRUE(launch);
         ASSERT_TRUE(coordinator.run_launch_prepare(*launch.token, {}).completed());
-        if (early_activation) coordinator.launch_activated(303);
+        if (early_activation) {
+          EXPECT_FALSE(coordinator.launch_activated(*launch.token));
+        }
         if (stop)
           coordinator.stop();
         else
@@ -1021,7 +1029,7 @@ namespace {
     EXPECT_TRUE(prepare.get().completed());
     EXPECT_TRUE(coordinator.bind_launch(*launch.token));
     EXPECT_FALSE(coordinator.bind_launch(*launch.token)) << "bound twice";
-    coordinator.launch_activated(241);
+    EXPECT_TRUE(coordinator.launch_activated(*launch.token));
     ASSERT_FALSE(coordinator.status().lease);
 
     const auto failing = coordinator.admit_launch({ 242, "cert:a" });
@@ -1070,7 +1078,7 @@ namespace {
     ASSERT_TRUE(launch);
     ASSERT_TRUE(prepare_and_bind(coordinator, *launch.token));
     EXPECT_EQ(coordinator.admit_launch({ 292, "cert:a" }).reason, reject_reason_e::owner_busy);
-    coordinator.launch_activated(291);
+    EXPECT_TRUE(coordinator.launch_activated(*launch.token));
     EXPECT_EQ(coordinator.admit_launch({ 293, "cert:a" }).reason, reject_reason_e::owner_busy);
     ASSERT_TRUE(flush(coordinator).completed());
 
@@ -1548,7 +1556,7 @@ namespace {
       });
       ASSERT_TRUE(probe_gate.wait_started());
 
-      coordinator.launch_activated(311);
+      EXPECT_TRUE(coordinator.launch_activated(*first.token));
       std::uint32_t expected_id = 311;
       auto expected_stage = lease_stage_e::active;
       if (test_case.replaced) {
@@ -1622,7 +1630,7 @@ namespace {
     const auto launch = coordinator.admit_launch({ 111, "cert:a" });
     ASSERT_TRUE(launch);
     ASSERT_TRUE(prepare_and_bind(coordinator, *launch.token));
-    coordinator.launch_activated(111);
+    EXPECT_TRUE(coordinator.launch_activated(*launch.token));
     const auto held = [&]() {
       return coordinator.status().lease.has_value();
     };
@@ -1665,12 +1673,12 @@ namespace {
 
       const auto launch = managed.admit_launch({ 121, "cert:a" });
       ASSERT_TRUE(launch);
-      EXPECT_FALSE(managed.end_managed_lease(command_kind_e::stream_restore)) << "a preparing lease ends through abort_launch";
+      EXPECT_FALSE(managed.end_managed_launch(*launch.token)) << "a preparing reference ends through abort_launch";
       ASSERT_TRUE(prepare_and_bind(managed, *launch.token));
-      managed.launch_activated(121);
-      EXPECT_THROW(static_cast<void>(managed.end_managed_lease(command_kind_e::rotate)), std::invalid_argument);
-      EXPECT_TRUE(managed.end_managed_lease(command_kind_e::stream_restore));
-      EXPECT_FALSE(managed.end_managed_lease(command_kind_e::stream_restore));
+      EXPECT_TRUE(managed.launch_activated(*launch.token));
+      EXPECT_THROW(static_cast<void>(managed.end_managed_launch(*launch.token, command_kind_e::rotate)), std::invalid_argument);
+      EXPECT_TRUE(managed.end_managed_launch(*launch.token));
+      EXPECT_FALSE(managed.end_managed_launch(*launch.token));
       ASSERT_TRUE(flush(managed).completed());
       EXPECT_EQ(managed.status().native_restores_posted, 1u);
     }
@@ -1684,7 +1692,7 @@ namespace {
     const auto launch = legacy.admit_launch({ 122, "cert:a" });
     ASSERT_TRUE(launch);
     ASSERT_TRUE(prepare_and_bind(legacy, *launch.token));
-    EXPECT_FALSE(legacy.end_managed_lease(command_kind_e::stream_restore));
+    EXPECT_FALSE(legacy.end_managed_launch(*launch.token));
     EXPECT_TRUE(legacy.status().lease);
   }
 
@@ -1696,22 +1704,27 @@ namespace {
     coordinator_t coordinator { std::move(options) };
     ASSERT_TRUE(start_ready(coordinator).completed());
 
-    // The previous stream ended after this launch bound its ticket but before it connected.
+    const auto previous = coordinator.admit_launch({ 210, "cert:a" });
+    ASSERT_TRUE(previous);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *previous.token));
+    ASSERT_TRUE(coordinator.launch_activated(*previous.token));
+    ASSERT_TRUE(coordinator.end_managed_launch(*previous.token));
+
+    // A duplicate terminal callback from the previous stream cannot end this bound reference.
     const auto launch = coordinator.admit_launch({ 211, "cert:a" });
     ASSERT_TRUE(launch);
     ASSERT_TRUE(prepare_and_bind(coordinator, *launch.token));
-    EXPECT_FALSE(coordinator.end_managed_lease(command_kind_e::stream_restore)) << "a stream end released a bound lease";
-    EXPECT_FALSE(coordinator.end_managed_lease(command_kind_e::stream_restore, 211)) << "a stream end released a bound lease";
+    EXPECT_FALSE(coordinator.end_managed_launch(*previous.token)) << "a late stream end released a bound lease";
     auto status = coordinator.status();
     ASSERT_TRUE(status.lease);
     EXPECT_EQ(status.lease->launch_session_id, 211u);
     EXPECT_EQ(status.lease->stage, lease_stage_e::bound);
-    EXPECT_EQ(status.native_restores_posted, 0u);
+    EXPECT_EQ(status.native_restores_posted, 1u);
 
-    coordinator.launch_activated(211);
-    EXPECT_TRUE(coordinator.end_managed_lease(command_kind_e::stream_restore));
+    EXPECT_TRUE(coordinator.launch_activated(*launch.token));
+    EXPECT_TRUE(coordinator.end_managed_launch(*launch.token));
     ASSERT_TRUE(flush(coordinator).completed());
-    EXPECT_EQ(restores.load(), 1);
+    EXPECT_EQ(restores.load(), 2);
   }
 
   TEST(DisplayTopologyCoordinator, ALateStreamEndCannotEndTheNextLaunchsLease) {
@@ -1725,21 +1738,21 @@ namespace {
     const auto first = coordinator.admit_launch({ 201, "cert:a" });
     ASSERT_TRUE(first);
     ASSERT_TRUE(prepare_and_bind(coordinator, *first.token));
-    coordinator.launch_activated(201);
-    ASSERT_TRUE(coordinator.end_managed_lease(command_kind_e::stream_restore, 201));
+    EXPECT_TRUE(coordinator.launch_activated(*first.token));
+    ASSERT_TRUE(coordinator.end_managed_launch(*first.token));
 
     const auto second = coordinator.admit_launch({ 202, "cert:b" });
     ASSERT_TRUE(second);
     ASSERT_TRUE(prepare_and_bind(coordinator, *second.token));
-    coordinator.launch_activated(202);
-    EXPECT_FALSE(coordinator.end_managed_lease(command_kind_e::stream_restore, 201)) << "launch 201's stream end released launch 202";
+    EXPECT_TRUE(coordinator.launch_activated(*second.token));
+    EXPECT_FALSE(coordinator.end_managed_launch(*first.token)) << "launch 201's stream end released launch 202";
     const auto status = coordinator.status();
     ASSERT_TRUE(status.lease);
     EXPECT_EQ(status.lease->launch_session_id, 202u);
     EXPECT_EQ(status.lease->stage, lease_stage_e::active);
     EXPECT_EQ(status.native_restores_posted, 1u);
 
-    EXPECT_TRUE(coordinator.end_managed_lease(command_kind_e::stream_restore, 202));
+    EXPECT_TRUE(coordinator.end_managed_launch(*second.token));
     ASSERT_TRUE(flush(coordinator).completed());
     EXPECT_EQ(restores.load(), 2);
   }
@@ -1763,12 +1776,12 @@ namespace {
     const auto first = coordinator.admit_launch({ 271, "cert:a" });
     ASSERT_TRUE(first);
     ASSERT_TRUE(prepare_and_bind(coordinator, *first.token));
-    coordinator.launch_activated(271);
+    EXPECT_TRUE(coordinator.launch_activated(*first.token));
     blocker = std::async(std::launch::async, [&]() {
       return coordinator.run(command_kind_e::stream_restore, busy.body());
     });
     ASSERT_TRUE(busy.wait_started());
-    ASSERT_TRUE(coordinator.end_managed_lease(command_kind_e::stream_restore, 271));
+    ASSERT_TRUE(coordinator.end_managed_launch(*first.token));
 
     // Admitted before the restore ran, so only the worker can see that it failed.
     const auto second = coordinator.admit_launch({ 272, "cert:a" });
@@ -2381,5 +2394,418 @@ namespace {
     ASSERT_TRUE(prepare_and_bind(coordinator, *launch.token));
     EXPECT_TRUE(wait_until([&]() { return coordinator.status().native_restores_posted == 1; })) << "the tick thread stopped after a probe threw";
     EXPECT_GE(probes.load(), 2);
+  }
+  TEST(DisplayTopologyCoordinator, ManagedJoinProtectsTopologyInEveryReferenceStage) {
+    for (const auto stage : { lease_stage_e::preparing, lease_stage_e::bound, lease_stage_e::active }) {
+      SCOPED_TRACE(to_string(stage));
+      fake_clock_t clock;
+      event_log_t log;
+      auto options = make_options(clock, true);
+      options.probes.active_streams = []() { return 0u; };
+      options.probes.ticket_present = [](auto) { return true; };
+      options.native_restore = [&](const auto &cap, const auto &) { log.add(std::string { to_string(cap.kind()) }); };
+      coordinator_t coordinator { std::move(options) };
+      ASSERT_TRUE(start_ready(coordinator).completed());
+      const auto owner = coordinator.admit_launch({ 401, "a" });
+      ASSERT_TRUE(owner);
+      ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+      ASSERT_TRUE(coordinator.launch_activated(*owner.token));
+      const auto join = coordinator.admit_managed_join({ 402, "b" });
+      ASSERT_TRUE(join);
+      EXPECT_EQ(join.token->transaction, owner.token->transaction);
+      EXPECT_NE(join.token->attachment_serial, 0u);
+      if (stage != lease_stage_e::preparing) {
+        ASSERT_TRUE(coordinator.bind_launch(*join.token));
+      }
+      if (stage == lease_stage_e::active) {
+        ASSERT_TRUE(coordinator.launch_activated(*join.token));
+      }
+      ASSERT_TRUE(coordinator.end_managed_launch(*owner.token));
+      ASSERT_TRUE(coordinator.status().lease);
+      EXPECT_EQ(coordinator.status().lease->launch_session_id, 401u);
+      EXPECT_EQ(coordinator.status().lease->attachments, 1u);
+      EXPECT_EQ(coordinator.status().native_restores_posted, 0u);
+      if (stage == lease_stage_e::preparing) {
+        ASSERT_TRUE(coordinator.abort_launch(*join.token, {}));
+      }
+      else {
+        ASSERT_TRUE(coordinator.end_managed_launch(*join.token, command_kind_e::native_restore));
+      }
+      ASSERT_TRUE(flush(coordinator).completed());
+      EXPECT_FALSE(coordinator.status().lease);
+      EXPECT_EQ(log.events(), (std::vector<std::string> { "stream_restore" })) << "the first restore obligation is sticky";
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, ManagedJoinAdmissionIsBoundedAndNeverPreparesTopology) {
+    fake_clock_t clock;
+    auto options = make_options(clock, true);
+    options.max_managed_attachments = 2;
+    coordinator_t coordinator { std::move(options) };
+    EXPECT_EQ(coordinator.admit_managed_join({ 402, "b" }).reason, reject_reason_e::not_started);
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    EXPECT_EQ(coordinator.admit_managed_join({ 402, "b" }).reason, reject_reason_e::stale_transaction);
+    const auto owner = coordinator.admit_launch({ 401, "a" });
+    ASSERT_TRUE(owner);
+    EXPECT_EQ(coordinator.admit_managed_join({ 402, "b" }).reason, reject_reason_e::owner_busy);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    auto fence = coordinator.hold_fence();
+    EXPECT_EQ(coordinator.admit_managed_join({ 402, "b" }).reason, reject_reason_e::fence_active);
+    fence.reset();
+    coordinator.publish_native_health({ true, true, "conflict" });
+    EXPECT_EQ(coordinator.admit_managed_join({ 402, "b" }).reason, reject_reason_e::recovery_required);
+    coordinator.publish_native_health({ true, false, {} });
+    EXPECT_EQ(coordinator.admit_managed_join({ 401, "a" }).reason, reject_reason_e::owner_busy);
+    const auto before = submitted(coordinator);
+    const auto join = coordinator.admit_managed_join({ 402, "b" });
+    ASSERT_TRUE(join);
+    EXPECT_EQ(coordinator.admit_managed_join({ 403, "c" }).reason, reject_reason_e::owner_busy);
+    EXPECT_EQ(coordinator.run_launch_prepare(*join.token, {}).reason, reject_reason_e::stale_transaction);
+    EXPECT_EQ(submitted(coordinator), before);
+    coordinator.begin_draining();
+    EXPECT_EQ(coordinator.admit_managed_join({ 403, "c" }).reason, reject_reason_e::draining);
+    auto invalid = make_options(clock, true);
+    invalid.max_managed_attachments = 0;
+    EXPECT_THROW(coordinator_t { invalid }, std::invalid_argument);
+    auto missing_probe = make_options(clock, true);
+    missing_probe.probes.active_streams = {};
+    EXPECT_THROW(coordinator_t { missing_probe }, std::invalid_argument);
+  }
+
+  TEST(DisplayTopologyCoordinator, ActivationRequiresBoundTokenAndTerminalRollbackCanEndBoundReference) {
+    for (const bool managed : { false, true }) {
+      fake_clock_t clock;
+      coordinator_t coordinator { make_options(clock, managed) };
+      ASSERT_TRUE(start_ready(coordinator).completed());
+      const auto owner = coordinator.admit_launch({ 401, "a" });
+      ASSERT_TRUE(owner);
+      ASSERT_TRUE(coordinator.run_launch_prepare(*owner.token, {}).completed());
+      EXPECT_FALSE(coordinator.launch_activated(*owner.token));
+      ASSERT_TRUE(coordinator.bind_launch(*owner.token));
+      if (managed) {
+        EXPECT_FALSE(coordinator.abort_launch(*owner.token, {}));
+        EXPECT_TRUE(coordinator.end_managed_launch(*owner.token));
+      }
+      else {
+        EXPECT_TRUE(coordinator.launch_activated(*owner.token));
+      }
+      EXPECT_FALSE(coordinator.status().lease);
+      EXPECT_EQ(coordinator.status().native_restores_posted, managed ? 1u : 0u);
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, ManagedJoinAbortCannotRemovePublishedOrConsumedReferences) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock, true) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 401, "a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    const auto join = coordinator.admit_managed_join({ 402, "b" });
+    ASSERT_TRUE(join);
+    EXPECT_FALSE(coordinator.launch_activated(*join.token));
+    EXPECT_TRUE(coordinator.abort_launch(*join.token, {}));
+    const auto next = coordinator.admit_managed_join({ 402, "b" });
+    ASSERT_TRUE(next);
+    ASSERT_TRUE(coordinator.bind_launch(*next.token));
+    EXPECT_FALSE(coordinator.abort_launch(*next.token, {}));
+    ASSERT_TRUE(coordinator.launch_activated(*next.token));
+    EXPECT_FALSE(coordinator.abort_launch(*next.token, {}));
+    EXPECT_EQ(coordinator.status().lease->attachments, 2u);
+  }
+
+  TEST(DisplayTopologyCoordinator, ManagedReferenceTokensRejectReusedIdsAndWrongIdentity) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock, true) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 401, "a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    const auto old = coordinator.admit_managed_join({ 402, "b" });
+    ASSERT_TRUE(old);
+    ASSERT_TRUE(coordinator.abort_launch(*old.token, {}));
+    const auto join = coordinator.admit_managed_join({ 402, "b" });
+    ASSERT_TRUE(join);
+    EXPECT_NE(old.token->attachment_serial, join.token->attachment_serial);
+    EXPECT_FALSE(coordinator.bind_launch(*old.token));
+    EXPECT_FALSE(coordinator.abort_launch(*old.token, {}));
+    ASSERT_TRUE(coordinator.bind_launch(*join.token));
+    EXPECT_FALSE(coordinator.launch_activated(*old.token));
+    EXPECT_FALSE(coordinator.end_managed_launch(*old.token));
+    auto wrong = *join.token;
+    wrong.launch_session_id = 999;
+    EXPECT_FALSE(coordinator.launch_activated(wrong));
+    EXPECT_FALSE(coordinator.end_managed_launch(wrong));
+    ASSERT_TRUE(coordinator.end_managed_launch(*join.token));
+    ASSERT_TRUE(coordinator.end_managed_launch(*owner.token));
+    const auto replacement = coordinator.admit_launch({ 401, "a" });
+    ASSERT_TRUE(replacement);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *replacement.token));
+    EXPECT_FALSE(coordinator.launch_activated(*owner.token));
+    EXPECT_FALSE(coordinator.end_managed_launch(*owner.token));
+    EXPECT_TRUE(coordinator.status().lease);
+  }
+
+  TEST(DisplayTopologyCoordinator, OnlyPreparingManagedJoinsExpireAtTheirOwnSetupDeadline) {
+    for (const auto stage : { lease_stage_e::preparing, lease_stage_e::bound, lease_stage_e::active }) {
+      SCOPED_TRACE(to_string(stage));
+      fake_clock_t clock;
+      auto options = make_options(clock, true);
+      options.probes.ticket_present = [](auto) { return true; };
+      options.probes.active_streams = []() { return 1u; };
+      coordinator_t coordinator { std::move(options) };
+      ASSERT_TRUE(start_ready(coordinator).completed());
+      const auto owner = coordinator.admit_launch({ 401, "a" });
+      ASSERT_TRUE(owner);
+      ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+      const auto join = coordinator.admit_managed_join({ 402, "b" });
+      ASSERT_TRUE(join);
+      if (stage != lease_stage_e::preparing) {
+        ASSERT_TRUE(coordinator.bind_launch(*join.token));
+      }
+      if (stage == lease_stage_e::active) {
+        ASSERT_TRUE(coordinator.launch_activated(*join.token));
+      }
+      clock.advance(999ms);
+      coordinator.tick();
+      EXPECT_EQ(coordinator.status().lease->attachments, 2u);
+      clock.advance(1ms);
+      coordinator.tick();
+      EXPECT_EQ(coordinator.status().lease->attachments, stage == lease_stage_e::preparing ? 1u : 2u);
+      auto forged = *join.token;
+      forged.setup_deadline = monotonic_time_t::max();
+      EXPECT_FALSE(coordinator.bind_launch(forged));
+      EXPECT_EQ(coordinator.status().native_restores_posted, 0u);
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, BoundManagedJoinSurvivesItsStaleTicketProbeAfterActivation) {
+    fake_clock_t clock;
+    gate_t gate;
+    std::atomic_bool block {};
+    auto options = make_options(clock, true);
+    options.probes.ticket_present = [&](auto id) {
+      if (id == 402 && block.exchange(false)) {
+        gate.hook()();
+        return false;
+      }
+      return true;
+    };
+    coordinator_t coordinator { std::move(options) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 401, "a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    const auto join = coordinator.admit_managed_join({ 402, "b" });
+    ASSERT_TRUE(join);
+    ASSERT_TRUE(coordinator.bind_launch(*join.token));
+    ASSERT_TRUE(coordinator.end_managed_launch(*owner.token));
+    std::future<void> probing;
+    const finally_t release { [&]() { gate.release(); } };
+    block = true;
+    probing = std::async(std::launch::async, [&]() { coordinator.tick(); });
+    ASSERT_TRUE(gate.wait_started());
+    ASSERT_TRUE(coordinator.launch_activated(*join.token));
+    gate.release();
+    probing.get();
+    ASSERT_TRUE(coordinator.status().lease);
+    EXPECT_EQ(coordinator.status().lease->attachments, 1u);
+    EXPECT_EQ(coordinator.status().native_restores_posted, 0u);
+  }
+
+  TEST(DisplayTopologyCoordinator, ManagedJoinBindExpiresOnlyItsOwnUnpublishedReference) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock, true) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 401, "a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    const auto expired = coordinator.admit_managed_join({ 402, "b" });
+    ASSERT_TRUE(expired);
+    clock.advance(500ms);
+    const auto current = coordinator.admit_managed_join({ 403, "c" });
+    ASSERT_TRUE(current);
+    clock.advance(500ms);
+    auto forged = *expired.token;
+    forged.setup_deadline = monotonic_time_t::max();
+    EXPECT_FALSE(coordinator.bind_launch(forged));
+    EXPECT_TRUE(coordinator.bind_launch(*current.token));
+    ASSERT_TRUE(coordinator.status().lease);
+    EXPECT_EQ(coordinator.status().lease->attachments, 2u);
+    EXPECT_EQ(coordinator.status().native_restores_posted, 0u);
+  }
+
+  TEST(DisplayTopologyCoordinator, BoundManagedJoinProbeCannotRemoveReusedLaunchId) {
+    fake_clock_t clock;
+    gate_t gate;
+    std::atomic_bool block {};
+    auto options = make_options(clock, true);
+    options.probes.ticket_present = [&](auto id) {
+      if (id == 402 && block.exchange(false)) {
+        gate.hook()();
+        return false;
+      }
+      return true;
+    };
+    coordinator_t coordinator { std::move(options) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 401, "a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    const auto old = coordinator.admit_managed_join({ 402, "b" });
+    ASSERT_TRUE(old);
+    ASSERT_TRUE(coordinator.bind_launch(*old.token));
+    std::future<void> probing;
+    const finally_t release { [&]() { gate.release(); } };
+    block = true;
+    probing = std::async(std::launch::async, [&]() { coordinator.tick(); });
+    ASSERT_TRUE(gate.wait_started());
+    ASSERT_TRUE(coordinator.end_managed_launch(*old.token));
+    const auto next = coordinator.admit_managed_join({ 402, "b" });
+    ASSERT_TRUE(next);
+    ASSERT_TRUE(coordinator.bind_launch(*next.token));
+    gate.release();
+    probing.get();
+    ASSERT_TRUE(coordinator.status().lease);
+    EXPECT_EQ(coordinator.status().lease->attachments, 2u);
+    EXPECT_TRUE(coordinator.launch_activated(*next.token));
+  }
+
+  TEST(DisplayTopologyCoordinator, RetiringManagedLeaseWaitsForQuiescenceAndRefusesNewJoins) {
+    fake_clock_t clock;
+    std::atomic<std::size_t> streams { 1 };
+    auto options = make_options(clock, true);
+    options.probes.active_streams = [&]() { return streams.load(); };
+    coordinator_t coordinator { std::move(options) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 401, "a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    ASSERT_TRUE(coordinator.launch_activated(*owner.token));
+    ASSERT_TRUE(coordinator.end_managed_launch(*owner.token));
+    ASSERT_TRUE(coordinator.status().lease);
+    EXPECT_TRUE(coordinator.status().lease->retiring);
+    EXPECT_EQ(coordinator.status().lease->attachments, 0u);
+    EXPECT_FALSE(coordinator.admit_managed_join({ 402, "b" }));
+    coordinator.tick();
+    EXPECT_TRUE(coordinator.status().lease);
+    streams = 0;
+    coordinator.tick();
+    EXPECT_FALSE(coordinator.status().lease) << "terminal completion does not wait for idle grace";
+    EXPECT_EQ(coordinator.status().native_restores_posted, 1u);
+  }
+
+  TEST(DisplayTopologyCoordinator, PreparingAndBoundManagedJoinsBlockIdleGrace) {
+    fake_clock_t clock;
+    auto options = make_options(clock, true);
+    options.probes.active_streams = []() { return 0u; };
+    options.probes.ticket_present = [](auto) { return true; };
+    coordinator_t coordinator { std::move(options) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 401, "a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    ASSERT_TRUE(coordinator.launch_activated(*owner.token));
+    coordinator.tick();
+    clock.advance(500ms);
+    const auto join = coordinator.admit_managed_join({ 402, "b" });
+    ASSERT_TRUE(join);
+    coordinator.tick();
+    clock.advance(999ms);
+    coordinator.tick();
+    ASSERT_TRUE(coordinator.status().lease);
+    ASSERT_TRUE(coordinator.bind_launch(*join.token));
+    clock.advance(10000ms);
+    coordinator.tick();
+    EXPECT_TRUE(coordinator.status().lease);
+    EXPECT_EQ(coordinator.status().native_restores_posted, 0u);
+  }
+
+  TEST(DisplayTopologyCoordinator, ManagedIdleProbeRevalidatesReferenceActivityBeforeStartingGrace) {
+    fake_clock_t clock;
+    gate_t gate;
+    std::atomic_bool block {};
+    std::atomic<std::size_t> streams { 1 };
+    auto options = make_options(clock, true);
+    options.probes.active_streams = [&]() {
+      if (block.exchange(false)) {
+        gate.hook()();
+        return std::size_t { 0 };
+      }
+      return streams.load();
+    };
+    coordinator_t coordinator { std::move(options) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 401, "a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    ASSERT_TRUE(coordinator.launch_activated(*owner.token));
+    std::future<void> probing;
+    const finally_t release { [&]() { gate.release(); } };
+    block = true;
+    probing = std::async(std::launch::async, [&]() { coordinator.tick(); });
+    ASSERT_TRUE(gate.wait_started());
+    const auto join = coordinator.admit_managed_join({ 402, "b" });
+    ASSERT_TRUE(join);
+    ASSERT_TRUE(coordinator.bind_launch(*join.token));
+    ASSERT_TRUE(coordinator.launch_activated(*join.token));
+    gate.release();
+    probing.get();
+    clock.advance(100ms);
+    streams = 0;
+    coordinator.tick();
+    clock.advance(400ms);
+    coordinator.tick();
+    EXPECT_TRUE(coordinator.status().lease) << "a stale zero answer started the grace period early";
+    clock.advance(100ms);
+    coordinator.tick();
+    EXPECT_FALSE(coordinator.status().lease);
+  }
+
+  TEST(DisplayTopologyCoordinator, ManagedTicketAbandonmentRetainsOtherReferences) {
+    fake_clock_t clock;
+    std::set<std::uint32_t> tickets { 401, 402 };
+    auto options = make_options(clock, true);
+    options.probes.ticket_present = [&](auto id) { return tickets.contains(id); };
+    coordinator_t coordinator { std::move(options) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 401, "a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    const auto join = coordinator.admit_managed_join({ 402, "b" });
+    ASSERT_TRUE(join);
+    ASSERT_TRUE(coordinator.bind_launch(*join.token));
+    tickets.erase(401);
+    coordinator.tick();
+    ASSERT_TRUE(coordinator.status().lease);
+    EXPECT_EQ(coordinator.status().lease->attachments, 1u);
+    EXPECT_EQ(coordinator.status().lease->launch_session_id, 401u);
+    EXPECT_EQ(coordinator.admit_launch({ 403, "c" }).reason, reject_reason_e::owner_busy);
+    tickets.erase(402);
+    coordinator.tick();
+    EXPECT_FALSE(coordinator.status().lease);
+    EXPECT_EQ(coordinator.status().native_restores_posted, 1u);
+  }
+
+  TEST(DisplayTopologyCoordinator, RetiringManagedLeaseSurvivesAThrowingQuiescenceProbe) {
+    fake_clock_t clock;
+    bool fail = true;
+    auto options = make_options(clock, true);
+    options.probes.active_streams = [&]() {
+      if (fail) throw std::runtime_error { "unavailable stream count" };
+      return 0u;
+    };
+    coordinator_t coordinator { std::move(options) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 401, "a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    EXPECT_THROW(coordinator.end_managed_launch(*owner.token), std::runtime_error);
+    ASSERT_TRUE(coordinator.status().lease);
+    EXPECT_TRUE(coordinator.status().lease->retiring);
+    fail = false;
+    coordinator.tick();
+    EXPECT_FALSE(coordinator.status().lease);
+    EXPECT_EQ(coordinator.status().native_restores_posted, 1u);
   }
 }  // namespace

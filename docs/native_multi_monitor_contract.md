@@ -338,8 +338,8 @@ body starts. Retry timers can associate receipts with their own generations;
 restore callers can keep a watchdog armed until completion without putting a
 waiter thread on every command. Accepted commands notify the observer exactly
 once, including commands whose body never ran. Observer failures are exposed
-through the receipt. A launch-ticket presence query and an active-only managed
-lease release are also implemented and tested.
+through the receipt. A launch-ticket presence query is also implemented and
+tested.
 
 The neutral retry scheduler now pairs each attempt with a distinct generation,
 waits for its receipt, and re-arms failed/rejected work unless shutdown prevents
@@ -372,6 +372,18 @@ cannot observe the interval between binding and publication. Legacy calls omit
 the hook and keep their existing behavior. Launch/resume wiring still needs to
 pass the coordinator bind operation and roll back any request-owned application
 on failure.
+
+Managed leases now retain independent, bounded owner/join references. Full
+transaction/attachment tokens replace ID-only activation and broad lease-end
+callbacks; activation requires a bound reference. Preparing joins have their
+own deadlines, while published/consumed references cannot be removed by a late
+HTTP abort. A terminal rollback may remove a bound reference only after its
+ticket and claimants are revoked/quiescent. Remaining references protect the
+original topology owner; restoration stays pending until the final reference
+and video work are gone. A retiring lease refuses new joiners. Unlocked ticket
+and idle probes revalidate reference stage, serial and activity generation.
+Managed construction requires an explicit video-quiescence probe. These fake
+interleaving fixtures do not yet establish production RTSP lifecycle wiring.
 
 Production `session_t`, launch/RTSP lifecycle, Windows mutation paths and the
 administrator profile/status surface do not yet call the coordinator.
