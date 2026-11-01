@@ -35,6 +35,16 @@ namespace platf {
     return process_.dwProcessId;
   }
 
+  std::optional<std::uint64_t>
+  owned_process_t::creation_time() const noexcept {
+    if (!started()) return std::nullopt;
+    FILETIME creation {}, exit {}, kernel {}, user {};
+    if (!GetProcessTimes(process_.hProcess, &creation, &exit, &kernel, &user)) return std::nullopt;
+    const auto ticks = (static_cast<std::uint64_t>(creation.dwHighDateTime) << 32) | creation.dwLowDateTime;
+    if (!ticks) return std::nullopt;
+    return ticks;
+  }
+
   process_observation_t
   owned_process_t::observe(DWORD timeout_ms) const noexcept {
     if (!started()) return {};

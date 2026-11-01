@@ -239,6 +239,7 @@ endif ()
 
 if (WIN32)
     add_executable(windows_owned_process_unit_tests
+            ${CMAKE_SOURCE_DIR}/src/platform/windows/topology_actor_process.cpp
             ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_owned_process.cpp)
     target_include_directories(windows_owned_process_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
     target_link_libraries(windows_owned_process_unit_tests PRIVATE gtest_main sunshine::host_headers
@@ -247,6 +248,17 @@ if (WIN32)
     set_target_properties(windows_owned_process_unit_tests PROPERTIES CXX_STANDARD 23 LINK_SEARCH_START_STATIC 1)
     add_test(NAME windows_owned_process_unit_tests COMMAND windows_owned_process_unit_tests)
     set_tests_properties(windows_owned_process_unit_tests PROPERTIES TIMEOUT 15)
+
+    add_executable(windows_topology_actor_observer_unit_tests
+            ${CMAKE_SOURCE_DIR}/src/platform/windows/topology_actor_observer.cpp
+            ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_topology_actor_observer.cpp)
+    target_include_directories(windows_topology_actor_observer_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(windows_topology_actor_observer_unit_tests PRIVATE gtest_main sunshine::host_headers
+            Boost::filesystem sunshine_project_options sunshine_coverage)
+    target_compile_definitions(windows_topology_actor_observer_unit_tests PRIVATE ${SUNSHINE_DEFINITIONS})
+    set_target_properties(windows_topology_actor_observer_unit_tests PROPERTIES CXX_STANDARD 23 LINK_SEARCH_START_STATIC 1)
+    add_test(NAME windows_topology_actor_observer_unit_tests COMMAND windows_topology_actor_observer_unit_tests)
+    set_tests_properties(windows_topology_actor_observer_unit_tests PROPERTIES TIMEOUT 15)
 endif ()
 
 add_executable(video_probe_unit_tests
@@ -358,6 +370,21 @@ if (WIN32)
     set_target_properties(topology_actor_supervisor_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
 endif ()
 add_test(NAME topology_actor_supervisor_unit_tests COMMAND topology_actor_supervisor_unit_tests)
+add_executable(topology_actor_body_unit_tests
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_durable_file.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_actor_record.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_actor_supervisor.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_actor_body.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_topology_actor_body.cpp)
+target_include_directories(topology_actor_body_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(topology_actor_body_unit_tests PRIVATE gtest_main nlohmann_json::nlohmann_json
+        sunshine_project_options sunshine_coverage)
+target_compile_options(topology_actor_body_unit_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>)
+set_target_properties(topology_actor_body_unit_tests PROPERTIES CXX_STANDARD 23)
+if (WIN32)
+    set_target_properties(topology_actor_body_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
+endif ()
+add_test(NAME topology_actor_body_unit_tests COMMAND topology_actor_body_unit_tests)
 
 add_executable(display_topology_coordinator_unit_tests
         ${CMAKE_SOURCE_DIR}/src/display_device/topology_capability.cpp
@@ -769,6 +796,8 @@ list(REMOVE_ITEM TEST_SOURCES
         ${CMAKE_SOURCE_DIR}/tests/unit/test_display_topology_native.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_topology_actor_record.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_topology_actor_supervisor.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_topology_actor_body.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_topology_actor_observer.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_frame_contract.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_http_util.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_input_activity.cpp

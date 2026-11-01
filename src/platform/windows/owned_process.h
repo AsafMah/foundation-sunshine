@@ -19,7 +19,10 @@ namespace platf {
     std::error_code error;
   };
 
-  /** Single-thread-confined ownership of the original creation handles; never terminates a child. */
+  /**
+   * Operations are confined to one thread; destruction only closes the original
+   * creation handles and may happen on any thread. Never terminates a child.
+   */
   class owned_process_t {
   public:
     owned_process_t() = default;
@@ -34,6 +37,8 @@ namespace platf {
 
     bool started() const noexcept;
     DWORD id() const noexcept;
+    /** Creation time (FILETIME ticks) read from the original process handle; never zero. */
+    std::optional<std::uint64_t> creation_time() const noexcept;
     /** A signaled process can still have an unavailable exit code, reported separately as an error. */
     process_observation_t observe(DWORD timeout_ms) const noexcept;
 

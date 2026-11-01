@@ -9,6 +9,7 @@
 
 #include "src/platform/windows/owned_process.h"
 #include "src/platform/windows/run_command_helpers.h"
+#include "src/platform/windows/topology_actor_process.h"
 #include "src/logging.h"
 #include "src/utility.h"
 
@@ -24,6 +25,7 @@ namespace fake_process {
     DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
   BOOL WINAPI create_as_user(HANDLE, LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL,
     DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
+  BOOL WINAPI times(HANDLE, LPFILETIME, LPFILETIME, LPFILETIME, LPFILETIME);
 }
 #define GetFileAttributesW fake_process::attributes
 #define GetCurrentProcess fake_process::current
@@ -34,7 +36,9 @@ namespace fake_process {
 #define GetExitCodeProcess fake_process::exit_code
 #define CreateProcessW fake_process::create
 #define CreateProcessAsUserW fake_process::create_as_user
+#define GetProcessTimes fake_process::times
 #include "src/platform/windows/run_command.cpp"
+#undef GetProcessTimes
 #undef GetFileAttributesW
 #undef GetCurrentProcess
 #undef OpenProcessToken
@@ -58,6 +62,9 @@ namespace {
   struct host_t {
     bool system {}, startup_fails {}, token_fails {}, merge_fails {}, impersonation_fails {};
     bool post_error {}, post_throw {}, creation_succeeds { true }, query_succeeds { true };
+    bool times_succeed { true };
+    std::uint64_t creation_time { 0x01DB'0000'0000'0042ULL };
+    unsigned timed {};
     bool elevated { true }, interactive { true };
     unsigned created {}, created_as_user {}, legacy_bridges {}, queries {}, waited {}, freed_attributes {};
     DWORD wait_result { WAIT_TIMEOUT }, code {}, native_error { ERROR_ACCESS_DENIED }, timeout {};
@@ -132,6 +139,15 @@ namespace fake_process {
     if (!host.query_succeeds) return FALSE;
     *code = host.code;
     return TRUE;
+  }
+  BOOL WINAPI times(HANDLE handle, LPFILETIME creation, LPFILETIME exit, LPFILETIME kernel, LPFILETIME user) {
+    EXPECT_EQ(handle, process_handle);
+    EXPECT_TRUE(exit && kernel && user);
+    ++host.timed;
+    // A failed call's outputs are unspecified; make ignoring the failure observable.
+    creation->dwLowDateTime = static_cast<DWORD>(host.creation_time);
+    creation->dwHighDateTime = static_cast<DWORD>(host.creation_time >> 32);
+    return host.times_succeed ? TRUE : FALSE;
   }
   BOOL WINAPI create(LPCWSTR application, LPWSTR command, LPSECURITY_ATTRIBUTES process_attributes,
     LPSECURITY_ATTRIBUTES thread_attributes, BOOL inherit, DWORD flags, LPVOID env, LPCWSTR directory,
@@ -456,4 +472,129 @@ TEST_F(OwnedProcess, ConcurrentLegacyAndOwnedLaunchesSerializeAndRestorePath) {
       EXPECT_TRUE(boost::this_process::wenvironment()[name].to_string() == original);
     }
   }
+}
+
+TEST_F(OwnedProcess, CreationTimeComesFromTheOriginalHandleAndIsNeverZero) {
+  platf::owned_process_t owner;
+  EXPECT_FALSE(owner.creation_time());
+  EXPECT_EQ(host.timed, 0u);
+  ASSERT_FALSE(launch(owner));
+  EXPECT_EQ(owner.creation_time(), host.creation_time);
+  host.creation_time = 0;
+  EXPECT_FALSE(owner.creation_time());
+  host.creation_time = 7;
+  host.times_succeed = false;
+  EXPECT_FALSE(owner.creation_time());
+  EXPECT_EQ(host.timed, 3u);
+  EXPECT_EQ(closed(process_handle), 0u);
+}
+
+namespace {
+  using display_device::topology::actor_receipt_t;
+  using display_device::topology::actor_wait_e;
+
+  std::shared_ptr<display_device::topology::actor_process_t> actor() {
+    platf::actor_launch_spec_t spec;
+    spec.cmd = "original command";
+    spec.working_dir = L"C:\\fake";
+    spec.env["OWNED_LAUNCH_TEST"] = "original";
+    spec.elevated = host.elevated;
+    spec.interactive = host.interactive;
+    auto made = platf::make_owned_actor_process(std::move(spec));
+    EXPECT_TRUE(made);
+    return made;
+  }
+}
+
+TEST_F(OwnedProcess, AnActorProcessLaunchesWithItsSpecAndReceiptsFromTheOriginalHandle) {
+  for (const bool system : { false, true }) {
+    for (const bool interactive : { false, true }) {
+      host = {};
+      host.system = system;
+      host.interactive = interactive;
+      host.elevated = !interactive;
+      {
+        auto process = actor();
+        ASSERT_TRUE(process);
+        EXPECT_FALSE(process->started());
+        EXPECT_FALSE(process->receipt());
+        std::error_code ec;
+        process->launch(ec);
+        EXPECT_FALSE(ec);
+        EXPECT_TRUE(process->started());
+        EXPECT_EQ(host.created, 1u);
+        EXPECT_EQ(process->receipt(), (actor_receipt_t { pid, host.creation_time }));
+        EXPECT_EQ(closed(process_handle), 0u);
+      }
+      EXPECT_EQ(closed(process_handle), 1u);
+      EXPECT_EQ(closed(thread_handle), 1u);
+    }
+  }
+}
+
+TEST_F(OwnedProcess, AnActorProcessWithoutACreationTimeHasNoReceipt) {
+  auto process = actor();
+  std::error_code ec;
+  process->launch(ec);
+  ASSERT_TRUE(process->started());
+  host.times_succeed = false;
+  EXPECT_FALSE(process->receipt());
+}
+
+TEST_F(OwnedProcess, AnActorProcessKeepsCreationRefusalAndPostCreateFailureDistinct) {
+  host.system = true;
+  host.creation_succeeds = false;
+  auto refused = actor();
+  std::error_code ec;
+  refused->launch(ec);
+  EXPECT_EQ(ec, std::error_code(ERROR_ACCESS_DENIED, std::system_category()));
+  EXPECT_FALSE(refused->started());
+
+  host = {};
+  host.system = true;
+  host.post_throw = true;
+  auto thrown = actor();
+  EXPECT_THROW(thrown->launch(ec), std::runtime_error);
+  EXPECT_TRUE(thrown->started());
+  EXPECT_EQ(closed(process_handle), 0u);
+}
+
+TEST_F(OwnedProcess, AnActorProcessWaitsWithoutATimeoutAndNeverConfusesFailureWithExit) {
+  auto process = actor();
+  std::error_code ec;
+  process->launch(ec);
+  ASSERT_TRUE(process->started());
+
+  host.wait_result = WAIT_TIMEOUT;
+  EXPECT_EQ(process->wait().state, actor_wait_e::running);
+  EXPECT_EQ(host.timeout, INFINITE);
+
+  host.wait_result = WAIT_FAILED;
+  host.native_error = ERROR_ACCESS_DENIED;
+  auto failed = process->wait();
+  EXPECT_EQ(failed.state, actor_wait_e::failed);
+  EXPECT_FALSE(failed.detail.empty());
+
+  host.wait_result = WAIT_ABANDONED;
+  EXPECT_EQ(process->wait().state, actor_wait_e::failed);
+
+  host.wait_result = WAIT_OBJECT_0;
+  host.code = 259;
+  auto exited = process->wait();
+  EXPECT_EQ(exited.state, actor_wait_e::exited);
+  EXPECT_EQ(exited.exit_code, 259u);
+
+  host.query_succeeds = false;
+  host.native_error = ERROR_ACCESS_DENIED;
+  auto uncoded = process->wait();
+  EXPECT_EQ(uncoded.state, actor_wait_e::exited);
+  EXPECT_FALSE(uncoded.exit_code);
+  EXPECT_FALSE(uncoded.detail.empty());
+  EXPECT_EQ(closed(process_handle), 0u);
+}
+
+TEST_F(OwnedProcess, AnUnstartedActorProcessCannotBeObservedAsRunningOrExited) {
+  auto process = actor();
+  EXPECT_EQ(process->wait().state, actor_wait_e::failed);
+  EXPECT_EQ(host.waited, 0u);
 }
