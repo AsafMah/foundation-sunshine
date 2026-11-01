@@ -117,14 +117,21 @@ namespace display_device::topology {
     sleep(std::chrono::milliseconds duration) = 0;
   };
 
-  /** ZakoVDD v0.15.10 (the Win10 pin) is the oldest pinned driver that carries the GUID as ContainerId. */
-  inline constexpr driver_version_t minimum_container_driver { { 100, 0, 15, 10 } };
+  /**
+   * Refusal reason when a ZakoVDD control interface with this DriverVer may not carry the
+   * CREATEMONITOR client GUID as the monitor's ContainerId, or nullopt to accept it.
+   * Every release tag from v0.1.4 sets MonitorContainerId to the client GUID. Accepted:
+   *  - main line, tag vA.B.C = DriverVer 100.A.B.C, from 100.0.1.4;
+   *  - Win10 line, tag v0.15.P = DriverVer 15.0.15.P.
+   * Branch/PR artifacts (15.0.0.N), CI dev builds (99.x) and unknown schemes are refused.
+   */
+  std::optional<std::string>
+  container_driver_refusal(const driver_version_t &version);
 
   struct windows_native_options_t {
     driver_instance_id_t driver;
     /** Friendly name of the driver's heads (`ZAKO_NAME`). */
     std::string virtual_name;
-    driver_version_t minimum_driver { minimum_container_driver };
     std::chrono::milliseconds wait { 5000 };
     std::chrono::milliseconds poll { 100 };
   };

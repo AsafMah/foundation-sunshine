@@ -139,7 +139,7 @@ namespace {
 
   dt::windows_native_options_t
   options() {
-    return { driver(), zako, dt::minimum_container_driver, 500ms, 100ms };
+    return { driver(), zako, 500ms, 100ms };
   }
 
   void
@@ -260,8 +260,26 @@ TEST(WindowsNativeConverters, DriverVersionsCompareNumericallyPartByPart) {
   EXPECT_LT(v("100.0.15.9"), v("100.0.15.10"));
   EXPECT_LT(v("100.0.15.10"), v("100.0.18.2"));
   EXPECT_LT(v("99.9.99.99"), v("100.0.0.0"));
-  EXPECT_EQ(v("100.0.15.10"), dt::minimum_container_driver);
-  EXPECT_LT(v("100.0.15.9"), dt::minimum_container_driver);
+}
+
+TEST(WindowsNativeConverters, ContainerDriverPolicyFollowsTheZakoVddReleaseLines) {
+  const auto refusal = [](const char *text) {
+    const auto parsed = dt::parse_driver_version(text);
+    if (!parsed) {
+      ADD_FAILURE() << "unparsed " << text;
+      return std::optional<std::string> { "unparsed" };
+    }
+    return dt::container_driver_refusal(*parsed);
+  };
+  // Main line: tag vA.B.C is DriverVer 100.A.B.C; every tag from v0.1.4 sets MonitorContainerId from the client GUID.
+  // Win10 line: tag v0.15.P is DriverVer 15.0.15.P (earlier Win10 packages were published as 100.0.15.P).
+  for (const auto *accepted : { "100.0.1.4", "100.0.15.10", "100.0.18.2", "100.1.0.0", "15.0.15.0", "15.0.15.10" }) {
+    EXPECT_EQ(refusal(accepted), std::nullopt) << accepted;
+  }
+  // Older than v0.1.4, branch/PR artifacts (15.0.0.N), CI dev builds (99.MM.dd.HHmm) and unknown schemes.
+  for (const auto *refused : { "100.0.1.3", "100.0.0.9", "15.0.0.321", "15.0.14.9", "15.1.15.10", "99.10.27.1530", "101.0.0.0", "1.0.0.0" }) {
+    EXPECT_NE(refusal(refused), std::nullopt) << refused;
+  }
 }
 
 TEST(WindowsNativeConverters, GuidTextKeepsBytesInTextualOrder) {
@@ -314,6 +332,24 @@ TEST_F(WindowsNative, AHeadWithoutAContainerIsVirtualButUnproven) {
   ASSERT_TRUE(head);
   EXPECT_TRUE(platform.is_virtual_head(*head));
   EXPECT_FALSE(head->head);
+  EXPECT_TRUE(inventory.heads.empty());
+}
+
+TEST_F(WindowsNative, AnotherVirtualDisplayDriverIsNeverAdoptedAsAHead) {
+  // Punktfunk Virtual Display (root\pf_vdisplay): the edge classes it physical; even with a
+  // ContainerId equal to a pending intent and an arrival time, it is not a head of ours.
+  const auto guid = id<dt::head_guid_t>(0x33);
+  auto punktfunk = physical("pf-1", 5760);
+  punktfunk.info.friendly_name = "Punktfunk Virtual Display";
+  punktfunk.container = guid.value;
+  punktfunk.arrival = 88;
+  edge.displays.push_back(punktfunk);
+  const auto inventory = platform.inventory();
+  ASSERT_TRUE(inventory.available);
+  const auto *display = find(inventory, "pf-1");
+  ASSERT_TRUE(display);
+  EXPECT_FALSE(platform.is_virtual_head(*display));
+  EXPECT_FALSE(display->head);
   EXPECT_TRUE(inventory.heads.empty());
 }
 
@@ -391,7 +427,8 @@ TEST_F(WindowsNative, ADeliveredCreateThatIsNeverListedIsStillAcceptedAfterABoun
 
 TEST_F(WindowsNative, CreateIsGatedOnTheControlInterfaceDriverVersion) {
   for (const std::optional<std::string> version : { std::optional<std::string> {}, std::optional<std::string> { "garbage" },
-         std::optional<std::string> { "100.0.15.9" }, std::optional<std::string> { "1.0.0.0" } }) {
+         std::optional<std::string> { "100.0.1.3" }, std::optional<std::string> { "15.0.0.321" },
+         std::optional<std::string> { "99.10.27.1530" }, std::optional<std::string> { "1.0.0.0" } }) {
     SCOPED_TRACE(version.value_or("<unreadable>"));
     edge.version = version;
     edge.refusals.clear();
@@ -402,7 +439,7 @@ TEST_F(WindowsNative, CreateIsGatedOnTheControlInterfaceDriverVersion) {
   }
   EXPECT_TRUE(edge.creates.empty());
   EXPECT_EQ(edge.snapshots, 0);
-  for (const auto *version : { "100.0.15.10", "100.0.18.2", "101.0.0.0" }) {
+  for (const auto *version : { "15.0.15.10", "100.0.18.2", "100.0.15.10" }) {
     SCOPED_TRACE(version);
     edge.version = version;
     edge.drop_heads();

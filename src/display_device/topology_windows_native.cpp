@@ -59,6 +59,19 @@ namespace display_device::topology {
     return version;
   }
 
+  std::optional<std::string>
+  container_driver_refusal(const driver_version_t &version) {
+    const auto &[major, minor, build, revision] = version.parts;
+    if (major == 100) {
+      if (version < driver_version_t { { 100, 0, 1, 4 } }) {
+        return "it is older than v0.1.4 (100.0.1.4), the first release that reports the head GUID as its ContainerId";
+      }
+      return std::nullopt;
+    }
+    if (major == 15 && minor == 0 && build == 15) return std::nullopt;
+    return "it is not a tagged ZakoVDD release (" + describe(version) + ")";
+  }
+
   std::string
   format_guid(const uuid_bytes_t &bytes) {
     static constexpr char digits[] = "0123456789ABCDEF";
@@ -158,14 +171,12 @@ namespace display_device::topology {
 
   result_t<creation_delivery_e>
   windows_native_platform_t::do_create_head(const mutation_capability_t &capability, const head_guid_t &intent) {
-    const auto minimum = options_.minimum_driver;
-    const version_gate_t gate = [minimum](const std::optional<std::string> &text) -> std::optional<std::string> {
+    const version_gate_t gate = [](const std::optional<std::string> &text) -> std::optional<std::string> {
       if (!text) return "the virtual display driver version could not be read";
       const auto version = parse_driver_version(*text);
       if (!version) return "the virtual display driver version \"" + *text + "\" is not a four-part version";
-      if (*version < minimum) {
-        return "the virtual display driver version " + *text + " is older than " + describe(minimum) +
-               ", which is the first to report the head GUID as its ContainerId";
+      if (auto refusal = container_driver_refusal(*version)) {
+        return "the virtual display driver version " + *text + " is not accepted: " + *refusal;
       }
       return std::nullopt;
     };

@@ -51,4 +51,10 @@ namespace {
     EXPECT_EQ(classify_parent_hardware_ids(L"PCI\\X\0\0Root\\ZakoVDD\0"s), head_class_e::physical)
       << "entries after the empty terminator are not part of the list";
   }
+
+  TEST(Win32NativeEdge, AnotherVirtualDisplayDriverIsNotAZakoVddHead) {
+    // Punktfunk Virtual Display, observed on a host next to ZakoVDD.
+    EXPECT_EQ(classify_parent_hardware_ids(L"root\\pf_vdisplay\0"s), head_class_e::physical);
+    EXPECT_EQ(classify_parent_hardware_ids(L"ROOT\\PF_VDISPLAY\0pf_vdisplay\0"s), head_class_e::physical);
+  }
 }  // namespace
