@@ -44,6 +44,8 @@
 #include "ai/proxy.h"
 #include "ai/http_stream.h"
 #include "display_device/session.h"
+#include "display_device/topology_runtime.h"
+#include "entry_handler.h"
 #include "display_device/parsed_config.h"
 #include "display_device/vdd_capability.h"
 #include "file_handler.h"
@@ -292,11 +294,100 @@ namespace nvhttp {
     return launch_session;
   }
 
+  /**
+   * The display-topology owner lease of a first-stream launch or resume.
+   * Admission precedes every display mutation; the lease binds atomically with
+   * ticket publication; anything that ends the request before then aborts it,
+   * and the coordinator runs the registered cleanup only if preparation began.
+   */
+  class display_launch_t {
+  public:
+    display_launch_t() = default;
+    display_launch_t(const display_launch_t &) = delete;
+    display_launch_t &
+    operator=(const display_launch_t &) = delete;
+
+    ~display_launch_t() {
+      if (!token_ || bound_) return;
+      try {
+        display_device::coordinated::coordinator().abort_launch(*token_, {});
+      }
+      catch (const std::exception &e) {
+        BOOST_LOG(error) << "Aborting the display launch failed: "sv << e.what();
+      }
+    }
+
+    bool
+    admit(pt::ptree &tree, rtsp_stream::launch_session_t &session, std::string_view result_node) {
+      auto &coordinator = display_device::coordinated::coordinator();
+      // An empty key never supersedes: certificate-less clients wait for the lease to end.
+      const auto admission = coordinator.admit_launch({ session.id, session.client_cert_uuid });
+      if (!admission) {
+        BOOST_LOG(warning) << "Display topology rejected the launch: "sv
+                           << display_device::topology::to_string(admission.reason);
+        tree.put(std::string { "root." } + std::string { result_node }, 0);
+        stream_start::set_sunshine_error(tree, 503,
+          "The display topology is busy: " + std::string { display_device::topology::to_string(admission.reason) },
+          "DISPLAY_TOPOLOGY_BUSY", "Retry after the current display operation completes.", "retry_launch",
+          "display", "display_configuration", true);
+        return false;
+      }
+      token_ = admission.token;
+      policy_ = display_device::coordinated::automatic_vdd_policy();
+      session.display_activation = [token = *token_]() {
+        return display_device::coordinated::coordinator().launch_activated(token);
+      };
+      return true;
+    }
+
+    /** Whether a failed request must restore what preparation changed (legacy parity). */
+    void
+    restore_on_failure() {
+      restore_->store(true);
+    }
+
+    stream_start::launch_coordination_t
+    coordination() const {
+      return {
+        display_device::coordinated::coordinator(), *token_,
+        [restore = restore_, policy = policy_](const auto &capability, const auto &) {
+          if (restore->load()) display_device::session_t::get().restore_state(capability, policy);
+        },
+        []() { lifetime::force_terminate(EXIT_FAILURE); },
+        {}, policy_
+      };
+    }
+
+    /** Ticket publication seam: runs under the ticket lock, so it only binds. */
+    std::function<bool()>
+    bind_before_publish() {
+      if (!token_) return {};
+      return [this]() {
+        bound_ = display_device::coordinated::coordinator().bind_launch(*token_);
+        return bound_;
+      };
+    }
+
+  private:
+    std::optional<display_device::topology::launch_token_t> token_;
+    std::shared_ptr<std::atomic_bool> restore_ { std::make_shared<std::atomic_bool>(false) };
+    display_device::automatic_vdd_policy_e policy_ { display_device::automatic_vdd_policy_e::suppress };
+    bool bound_ {};
+  };
+
   bool
   register_launch_ticket(pt::ptree &tree,
                          const std::shared_ptr<rtsp_stream::launch_session_t> &launch_session,
-                         std::string_view result_node) {
-    const auto result = rtsp_stream::launch_session_raise(launch_session);
+                         std::string_view result_node,
+                         std::function<bool()> before_publish = {}) {
+    const auto result = rtsp_stream::launch_session_raise(launch_session, std::move(before_publish));
+    if (result == rtsp_stream::launch_ticket_register_e::binding_rejected) {
+      tree.put(std::string { "root." } + std::string { result_node }, 0);
+      stream_start::set_sunshine_error(tree, 503, "The display preparation expired before the stream could be published",
+        "DISPLAY_SETUP_ABORTED", "Retry after the current display operation completes.", "retry_launch",
+        "display", "display_configuration", true);
+      return false;
+    }
     if (result == rtsp_stream::launch_ticket_register_e::denied) {
       tree.put("root.<xmlattr>.status_code", 403);
       tree.put("root.<xmlattr>.status_message", "Client disabled or unpaired");
@@ -542,8 +633,9 @@ namespace nvhttp {
 
     print_request_ip<SunshineHTTPS>(request, "Launch request");
 
+    // Declared before the response guard so an abort follows the response, as the restore did.
+    display_launch_t display_launch;
     pt::ptree tree;
-    bool need_to_restore_display_state { false };
     auto g = util::fail_guard([&]() {
       std::ostringstream data;
 
@@ -554,10 +646,6 @@ namespace nvhttp {
       pt::write_xml(data, tree);
       response->write(data.str());
       response->close_connection_after_response = true;
-
-      if (need_to_restore_display_state) {
-        display_device::session_t::get().restore_state();
-      }
     });
 
     auto args = request->parse_query_string();
@@ -627,10 +715,14 @@ namespace nvhttp {
       // We want to prepare display only if there are no active sessions at
       // the moment. This should to be done before probing encoders as it could
       // change display device's state.
-      // The display should be restored by the fail guard in case something happens.
-      need_to_restore_display_state = true;
+      // The display is restored by the lease's cleanup if the request fails from here on.
+      if (!display_launch.admit(tree, *launch_session, "gamesession")) {
+        return;
+      }
+      display_launch.restore_on_failure();
 
-      if (!stream_start::prepare_display_and_probe_encoders(tree, launch_session, true)) {
+      const auto coordination = display_launch.coordination();
+      if (!stream_start::prepare_display_and_probe_encoders(tree, launch_session, true, &coordination)) {
         tree.put("root.gamesession", 0);
 
         return;
@@ -666,7 +758,7 @@ namespace nvhttp {
       }
     }
 
-    if (!register_launch_ticket(tree, launch_session, "gamesession")) {
+    if (!register_launch_ticket(tree, launch_session, "gamesession", display_launch.bind_before_publish())) {
       // The application was started solely for this launch request. Roll it
       // back if the bounded ticket registry cannot publish the handshake.
       if (appid > 0 && proc::proc.running() == appid) {
@@ -708,8 +800,6 @@ namespace nvhttp {
       BOOST_LOG(error) << "Webhook launch event construction failed"sv;
     }
 
-    // Stream was started successfully, we will restore the state when the app or session terminates
-    need_to_restore_display_state = false;
   }
 
   void
@@ -724,8 +814,9 @@ namespace nvhttp {
       platf::exit_away_mode();
     }
 
+    // Declared before the response guard so an abort follows the response, as the restore did.
+    display_launch_t display_launch;
     pt::ptree tree;
-    bool need_to_restore_display_state { false };
     auto g = util::fail_guard([&]() {
       std::ostringstream data;
 
@@ -736,10 +827,6 @@ namespace nvhttp {
       pt::write_xml(data, tree);
       response->write(data.str());
       response->close_connection_after_response = true;
-
-      if (need_to_restore_display_state) {
-        display_device::session_t::get().restore_state();
-      }
     });
 
     auto current_appid = proc::proc.running();
@@ -812,11 +899,15 @@ namespace nvhttp {
     if (no_active_sessions) {
       // Prepare before publishing the ticket so the handshake expiration
       // window starts only when the host is ready to accept RTSP.
-      if (!stream_start::prepare_display_and_probe_encoders(tree, launch_session, false)) {
+      if (!display_launch.admit(tree, *launch_session, "resume")) {
+        return;
+      }
+      const auto coordination = display_launch.coordination();
+      if (!stream_start::prepare_display_and_probe_encoders(tree, launch_session, false, &coordination)) {
         tree.put("root.resume", 0);
         return;
       }
-      need_to_restore_display_state = true;
+      display_launch.restore_on_failure();
     }
 
     auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
@@ -837,7 +928,7 @@ namespace nvhttp {
     }
 #endif
 
-    if (!register_launch_ticket(tree, launch_session, "resume")) {
+    if (!register_launch_ticket(tree, launch_session, "resume", display_launch.bind_before_publish())) {
       return;
     }
 
@@ -846,7 +937,6 @@ namespace nvhttp {
                                    net::addr_to_url_escaped_string(request->local_endpoint().address()) + ':' +
                                    std::to_string(net::map_port(rtsp_stream::RTSP_SETUP_PORT)));
     tree.put("root.resume", 1);
-    need_to_restore_display_state = false;
 
     try {
       const auto app_id = proc::proc.running();

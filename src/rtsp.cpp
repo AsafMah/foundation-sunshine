@@ -795,7 +795,7 @@ namespace rtsp_stream {
      * @param launch_session Streaming session information.
      */
     launch_ticket_register_e
-    session_raise(std::shared_ptr<launch_session_t> launch_session) {
+    session_raise(std::shared_ptr<launch_session_t> launch_session, std::function<bool()> before_publish) {
       if (!launch_session) {
         return launch_ticket_register_e::global_limit;
       }
@@ -804,7 +804,8 @@ namespace rtsp_stream {
       }
 
       const auto result = _launch_sessions.register_session(
-        std::move(launch_session), config::stream.ping_timeout);
+        std::move(launch_session), config::stream.ping_timeout,
+        launch_session_manager_t::clock_t::now(), std::move(before_publish));
       if (result == launch_ticket_register_e::accepted || result == launch_ticket_register_e::replaced) {
         schedule_pending_prune();
       }
@@ -836,8 +837,13 @@ namespace rtsp_stream {
     }
 
     bool
-    activate_launch_session(std::uint32_t launch_session_id) {
-      return _launch_sessions.activate(launch_session_id);
+    activate_launch_session(std::uint32_t launch_session_id, std::function<bool()> before_consume = {}) {
+      return _launch_sessions.activate(launch_session_id, std::move(before_consume));
+    }
+
+    bool
+    launch_ticket_present(std::uint32_t launch_session_id) {
+      return _launch_sessions.contains(launch_session_id);
     }
 
     void
@@ -1038,13 +1044,23 @@ namespace rtsp_stream {
   rtsp_server_t server {};
 
   launch_ticket_register_e
-  launch_session_raise(std::shared_ptr<launch_session_t> launch_session) {
-    return server.session_raise(std::move(launch_session));
+  launch_session_raise(std::shared_ptr<launch_session_t> launch_session, std::function<bool()> before_publish) {
+    return server.session_raise(std::move(launch_session), std::move(before_publish));
   }
 
   void
   launch_session_clear(uint32_t launch_session_id) {
     server.session_clear(launch_session_id);
+  }
+
+  bool
+  launch_session_activate(uint32_t launch_session_id, std::function<bool()> before_consume) {
+    return server.activate_launch_session(launch_session_id, std::move(before_consume));
+  }
+
+  bool
+  launch_ticket_present(uint32_t launch_session_id) {
+    return server.launch_ticket_present(launch_session_id);
   }
 
   int

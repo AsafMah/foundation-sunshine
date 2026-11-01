@@ -5,6 +5,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -65,6 +66,10 @@ namespace rtsp_stream {
 
     // Shared with the active stream after RTSP allocation; released on failure/expiry.
     std::shared_ptr<void> nvidia_vsync_lease;
+
+    // Releases this launch's display-topology lease when its control stream
+    // consumes the ticket; runs under the ticket lock, so it must be a short leaf.
+    std::function<bool()> display_activation;
 
     bool host_audio;
     std::string unique_id;
@@ -140,8 +145,9 @@ namespace rtsp_stream {
     std::shared_ptr<spatial_transport::LiveSession> mat_live;
   };
 
+  /** before_publish runs under the ticket lock just before publication; see launch_session_manager_t. */
   launch_ticket_register_e
-  launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
+  launch_session_raise(std::shared_ptr<launch_session_t> launch_session, std::function<bool()> before_publish = {});
 
   /**
    * @brief Track an NVHTTP launch while it prepares the display and publishes its RTSP ticket.
@@ -162,6 +168,17 @@ namespace rtsp_stream {
    */
   void
   launch_session_clear(uint32_t launch_session_id);
+
+  /**
+   * @brief Consume the ticket of a stream whose control connection is established.
+   * @param before_consume Runs under the ticket lock before consumption; a false result keeps the ticket.
+   */
+  bool
+  launch_session_activate(uint32_t launch_session_id, std::function<bool()> before_consume);
+
+  /** Whether the ticket of this launch is still pending or claimed (expired tickets are pruned first). */
+  bool
+  launch_ticket_present(uint32_t launch_session_id);
 
   /**
    * @brief Get the number of active sessions.

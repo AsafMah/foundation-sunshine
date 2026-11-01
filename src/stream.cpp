@@ -46,6 +46,7 @@ extern "C" {
 #include "streaming/fec.h"
 #include "display_device/display_device.h"
 #include "display_device/session.h"
+#include "display_device/topology_runtime.h"
 #include "globals.h"
 #include "haptics/authored_ir.h"
 #include "haptics/authored_ir_extended.h"
@@ -692,6 +693,7 @@ namespace stream {
 
     std::uint32_t launch_session_id;
     std::shared_ptr<void> nvidia_vsync_lease;
+    std::function<bool()> display_activation;
 
     // 保存 launch_session 的关键字段，用于动态参数更新
     bool enable_sops { false };
@@ -1084,8 +1086,20 @@ namespace stream {
         }
       }
 
-      // Once the control stream connection is established, RTSP session state can be torn down
-      rtsp_stream::launch_session_clear(session_p->launch_session_id);
+      // Once the control stream connection is established, RTSP session state can be torn down.
+      // The display lease becomes the stream's before the ticket disappears, so the topology
+      // owner never mistakes this consumption for an abandoned ticket.
+      // A lease that can no longer activate (expired or aborted) refuses the connection and
+      // keeps the ticket, rather than streaming on a display its owner may have restored.
+      bool lease_refused = false;
+      rtsp_stream::launch_session_activate(session_p->launch_session_id, [&activation = session_p->display_activation, &lease_refused]() {
+        lease_refused = activation && !activation();
+        return !lease_refused;
+      });
+      if (lease_refused) {
+        BOOST_LOG(warning) << "Refusing the control connection: the display topology lease is no longer bound"sv;
+        continue;
+      }
 
       session_p->control.peer = peer;
 
@@ -2063,9 +2077,18 @@ namespace stream {
       
       if (active_display_resolved) {
         const bool display_reconfigured = stream::session::run_display_reconfiguration_if_single_video_session([&]() {
-          const auto result = display_device::session_t::get().configure_display(config::video, temp_launch_session, true);
-          if (!result) {
-            BOOST_LOG(warning) << "Dynamic display reconfiguration failed: " << result.message;
+          namespace topology = display_device::topology;
+          const auto command = display_device::coordinated::coordinator().run(topology::command_kind_e::reconfigure,
+            [&](const topology::mutation_capability_t &capability, const topology::command_context_t &) {
+              const auto result = display_device::session_t::get().configure_display(capability, config::video,
+                temp_launch_session, display_device::coordinated::automatic_vdd_policy(), true);
+              if (!result) {
+                BOOST_LOG(warning) << "Dynamic display reconfiguration failed: " << result.message;
+              }
+            });
+          if (!command.completed()) {
+            BOOST_LOG(warning) << "Dynamic display reconfiguration skipped by the display topology owner: "
+                               << topology::to_string(command.outcome) << " / " << topology::to_string(command.reason);
           }
         });
         if (!display_reconfigured) {
@@ -4229,6 +4252,32 @@ namespace stream {
   }
 
   namespace session {
+    namespace {
+      /** Queue the stream's display restoration with the topology owner; never runs it inline. */
+      void
+      post_stream_display_restore(std::string_view trigger) {
+        namespace topology = display_device::topology;
+        const auto posted = display_device::coordinated::coordinator().post_tracked(topology::command_kind_e::stream_restore,
+          [](const topology::mutation_capability_t &capability, const topology::command_context_t &) {
+            display_device::session_t::get().restore_state(capability, display_device::coordinated::automatic_vdd_policy());
+          });
+        if (posted.reason != topology::reject_reason_e::none) {
+          BOOST_LOG(error) << "Display restoration after "sv << trigger << " was rejected by the display topology owner: "sv
+                           << topology::to_string(posted.reason);
+          return;
+        }
+        // Diagnostics only: a queued restore may legitimately wait behind other display work.
+        task_pool.pushDelayed([completion = posted.completion, trigger = std::string { trigger }]() {
+          if (completion.wait_for(0s) != std::future_status::ready) {
+            BOOST_LOG(error) << "Display restoration after "sv << trigger << " has not finished after 10 seconds"sv;
+          }
+          else if (const auto &result = completion.get(); !result.completed()) {
+            BOOST_LOG(error) << "Display restoration after "sv << trigger << " ended: "sv << topology::to_string(result.outcome);
+          }
+        }, 10s);
+      }
+    }  // namespace
+
     const char *
     stop_reason_name(stop_reason_e reason) {
       switch (reason) {
@@ -4294,7 +4343,7 @@ namespace stream {
             }
 
             try {
-              display_device::session_t::get().restore_state();
+              post_stream_display_restore("app cancel"sv);
             }
             catch (const std::exception &e) {
               BOOST_LOG(error) << "Failed to restore display state during app cancel: "sv << e.what();
@@ -4428,7 +4477,7 @@ namespace stream {
           }
 
           if (restore_display_state) {
-            display_device::session_t::get().restore_state();
+            post_stream_display_restore("session end"sv);
           }
 
 #ifdef _WIN32
@@ -4645,6 +4694,7 @@ namespace stream {
       session->shutdown_event = mail->event<bool>(mail::shutdown);
       session->launch_session_id = launch_session.id;
       session->nvidia_vsync_lease = launch_session.nvidia_vsync_lease;
+      session->display_activation = launch_session.display_activation;
       session->created_at_ms = steady_now_ms();
 
       // 设置客户端名称

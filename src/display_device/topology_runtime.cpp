@@ -42,6 +42,7 @@ namespace display_device::coordinated {
         options.tick_interval = std::chrono::seconds { 1 };
         options.probes.startup_restore_quiescent = [] { return !rtsp_stream::session_starting_or_active(); };
         options.probes.legacy_restore_pending = [] { return session_t::get().restore_pending(); };
+        options.probes.ticket_present = [](std::uint32_t id) { return rtsp_stream::launch_ticket_present(id); };
 
         topology::lifecycle_hooks_t hooks;
         hooks.startup_restore = [](const auto &capability, const auto &) {
