@@ -905,6 +905,19 @@ namespace display_device::topology {
     return true;
   }
 
+  std::optional<monotonic_time_t>
+  coordinator_t::launch_setup_deadline(const launch_token_t &token) {
+    std::lock_guard lock { mutex_ };
+    if (phase_ != coordinator_phase_e::running || stopping_) {
+      return std::nullopt;
+    }
+    expire_preparing_locked();
+    if (!matches_owner_locked(token) || lease_->stage != lease_stage_e::preparing) {
+      return std::nullopt;
+    }
+    return lease_->setup_deadline;
+  }
+
   bool
   coordinator_t::abort_launch(const launch_token_t &token, command_body_t legacy_cleanup) {
     if (token.attachment_serial != 0) {
@@ -1100,6 +1113,11 @@ namespace display_device::topology {
     auto token = std::shared_ptr<const admission_fence_t> { new admission_fence_t };
     install_fence([weak = std::weak_ptr { token }]() { return weak.expired(); });
     return token;
+  }
+
+  bool
+  probe_fence_t::on_worker_thread() const noexcept {
+    return worker_ == std::this_thread::get_id();
   }
 
   std::shared_ptr<const probe_fence_t>

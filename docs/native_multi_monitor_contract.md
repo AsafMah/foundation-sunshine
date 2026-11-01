@@ -379,10 +379,21 @@ admission exclusion with a queue dispatch hold. It is acquired before the
 preceding mutation completes, so even cleanup cannot start during the probe.
 Independent holds compose and survive queue-generation changes; skipped head
 commands still settle FIFO. Stop cancels queued work without waiting for an
-external holder, which may safely outlive the queue/coordinator. This is a
-software-verified scheduling primitive, not a running probe supervisor:
-production must retain it through encoder teardown, enqueue required cleanup
-before releasing admission, and provide fatal timeout/resource supervision.
+external holder, which may safely outlive the queue/coordinator.
+
+The neutral probe supervisor now runs a separately owned probe thread under the
+recorded absolute setup deadline. An independent watchdog covers construction
+and actual join acknowledgment, including thread-local teardown on success or
+exception. Future readiness, even `set_value_at_thread_exit`, proved too early
+on the Windows toolchain. Expired work never invokes the driver; admitted work
+that exceeds the deadline invokes the fatal hook. Returning/throwing fake hooks
+still join the driver and cannot convert timeout into success. Supervision on
+the mutation worker is forbidden. A shared handoff transfers a fence exactly
+once and rejects abandoned late publication, so stale results cannot strand
+cleanup. These fixtures use no hardware. The production launch helper, startup
+probe and nonreturning fatal hook remain unwired; this is not a streaming claim.
+Callers must still retain the fence through teardown and enqueue cleanup before
+releasing admission.
 
 The ticket manager also supports a short binding check before publication or
 replacement, under its mutex and after capacity checks. A refused or throwing

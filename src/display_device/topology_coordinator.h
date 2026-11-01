@@ -193,9 +193,13 @@ namespace display_device::topology {
     probe_fence_t &
     operator=(const probe_fence_t &) = delete;
 
+    bool
+    on_worker_thread() const noexcept;
+
   private:
     friend class coordinator_t;
     probe_fence_t() = default;
+    const std::thread::id worker_ { std::this_thread::get_id() };
     std::shared_ptr<const dispatch_hold_t> dispatch_;
   };
 
@@ -333,6 +337,10 @@ namespace display_device::topology {
     /** Seal successful staged preparation after probes end, before atomic ticket binding. */
     bool
     finish_launch_prepare(const launch_token_t &token);
+
+    /** Recorded absolute monotonic deadline for a live preparing owner; reaps expiry. */
+    std::optional<monotonic_time_t>
+    launch_setup_deadline(const launch_token_t &token);
 
     /**
      * @brief Mark the launch's ticket as registered. Called once the handler succeeded.
