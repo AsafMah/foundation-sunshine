@@ -4,6 +4,7 @@
  */
 #pragma once
 
+#include "display_device/settings.h"
 #include "display_device/topology_routes.h"
 #include "rtsp.h"
 
@@ -23,6 +24,8 @@ namespace nvhttp::stream_start {
     display_device::topology::command_body_t legacy_cleanup;
     std::function<void()> fatal_probe_timeout;
     display_device::topology::probe_thread_factory_t spawn_probe;
+    /** The runtime's automatic-VDD policy, latched by the caller for this launch. */
+    display_device::automatic_vdd_policy_e vdd_policy { display_device::automatic_vdd_policy_e::suppress };
   };
 
   void
@@ -40,13 +43,14 @@ namespace nvhttp::stream_start {
   /**
    * A coordinated success seals preparation, not ticket publication. The caller
    * still owns abort/bind and any application it starts. Invalid bundles throw
-   * before ownership is adopted. Omitting coordination preserves the direct path.
+   * before ownership is adopted, including a missing bundle: every display
+   * mutation needs the coordinator's capability, so there is no direct path.
    */
   bool
   prepare_display_and_probe_encoders(
     boost::property_tree::ptree &tree,
     std::shared_ptr<rtsp_stream::launch_session_t> launch_session,
     bool is_reconfigure,
-    const launch_coordination_t *coordination = nullptr);
+    const launch_coordination_t *coordination);
 
 }  // namespace nvhttp::stream_start

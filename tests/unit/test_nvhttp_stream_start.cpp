@@ -52,6 +52,7 @@ namespace {
     std::vector<probe_call_t> probed;
     std::vector<std::string> events;
     std::vector<bool> touch;
+    std::vector<display_device::automatic_vdd_policy_e> policies;
     int queries {};
     int commits {};
     std::function<bool()> on_worker = []() { return false; };
@@ -107,7 +108,11 @@ namespace display_device {
   }
 
   session_t::configure_result_t
-  session_t::configure_display(const config::video_t &, const rtsp_stream::launch_session_t &session, bool reconfigure) {
+  session_t::configure_display(const topology::mutation_capability_t &capability, const config::video_t &,
+    const rtsp_stream::launch_session_t &session, automatic_vdd_policy_e vdd_policy, bool reconfigure) {
+    capability.require(topology::operation_e::configure_display);
+    EXPECT_EQ(capability.kind(), topology::command_kind_e::launch_prepare);
+    fake.policies.push_back(vdd_policy);
     fake.events.push_back(session.use_vdd ? "configure.vdd" : "configure.physical");
     fake.configured.push_back({ session.use_vdd, reconfigure, session.id,
       session.width, session.height, session.fps, session.enable_hdr,
@@ -119,7 +124,9 @@ namespace display_device {
   }
 
   void
-  session_t::restore_state() {
+  session_t::restore_state(const topology::mutation_capability_t &capability, automatic_vdd_policy_e vdd_policy) {
+    capability.require(topology::operation_e::restore_state);
+    fake.policies.push_back(vdd_policy);
     fake.events.push_back("restore");
     config::video.output_name = "physical";
   }
@@ -246,14 +253,14 @@ namespace {
 
     bool
     prepare(bool reconfigure = true) {
-      if (!coordinator) return nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, reconfigure);
       const auto admission = coordinator->admit_launch({ launch->id, "fixture" });
       if (!admission) throw std::logic_error { "test launch was not admitted" };
       nvhttp::stream_start::launch_coordination_t coordination {
         *coordinator, *admission.token, [](const auto &, const auto &) {},
-        []() { ADD_FAILURE() << "unexpected probe timeout"; }, {}
+        []() { ADD_FAILURE() << "unexpected probe timeout"; }, {}, display_device::automatic_vdd_policy_e::allow
       };
       const auto result = nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, reconfigure, &coordination);
+      for (const auto policy : fake.policies) EXPECT_EQ(policy, display_device::automatic_vdd_policy_e::allow);
       for (const auto &call : fake.configured) EXPECT_TRUE(call.on_worker);
       for (const auto &call : fake.probed) {
         EXPECT_FALSE(call.on_worker);
@@ -295,7 +302,7 @@ namespace {
       const auto admitted = coordinator->admit_launch({ launch->id, "fixture" });
       if (!admitted) throw std::logic_error { "test launch was not admitted" };
       return { *coordinator, *admitted.token, std::move(cleanup),
-        []() { ADD_FAILURE() << "unexpected probe timeout"; }, {} };
+        []() { ADD_FAILURE() << "unexpected probe timeout"; }, {}, display_device::automatic_vdd_policy_e::allow };
     }
 
     void
@@ -718,5 +725,23 @@ namespace {
     EXPECT_TRUE(coordinator->abort_launch(coordination.token, {}));
   }
 
-  INSTANTIATE_TEST_SUITE_P(DirectAndCoordinated, StreamStartPolicy, ::testing::Bool());
+  TEST_F(CoordinatedStreamStart, PreparationWithoutCoordinationIsRefusedBeforePlatformCode) {
+    EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, nullptr), std::invalid_argument);
+    EXPECT_EQ(fake.intent_reads, 0);
+    EXPECT_EQ(fake.queries, 0);
+    EXPECT_TRUE(fake.events.empty());
+  }
+
+  TEST_F(CoordinatedStreamStart, MutationsCarryTheLatchedAutomaticVddPolicy) {
+    auto coordination = route();
+    coordination.vdd_policy = display_device::automatic_vdd_policy_e::suppress;
+    fake.configurations = { configured(result_e::topology_fail, true), configured(result_e::success) };
+    fake.probes = { probed(probe_error_e::no_working_encoder), probed(probe_error_e::none) };
+    ASSERT_TRUE(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, false, &coordination));
+    events({ "configure.physical", "touch", "probe", "restore", "configure.vdd", "hdr.vdd", "probe", "commit" });
+    EXPECT_EQ(fake.policies, std::vector(3, display_device::automatic_vdd_policy_e::suppress));
+    EXPECT_TRUE(coordinator->bind_launch(coordination.token));
+  }
+
+  INSTANTIATE_TEST_SUITE_P(Coordinated, StreamStartPolicy, ::testing::Values(true));
 }  // namespace

@@ -99,16 +99,16 @@ namespace nvhttp::stream_start {
     public:
       explicit preparation_context_t(const launch_coordination_t *coordination):
           coordination_ { coordination } {
-        if (coordination_ && (coordination_->coordinator.managed_mode() ||
-                               coordination_->token.flavor != topology::launch_flavor_e::legacy ||
-                               !coordination_->legacy_cleanup || !coordination_->fatal_probe_timeout)) {
+        if (!coordination_) throw std::invalid_argument { "Display preparation requires coordinator ownership" };
+        if (coordination_->coordinator.managed_mode() ||
+            coordination_->token.flavor != topology::launch_flavor_e::legacy ||
+            !coordination_->legacy_cleanup || !coordination_->fatal_probe_timeout) {
           throw std::invalid_argument { "Legacy preparation requires legacy ownership, cleanup and fatal supervision" };
         }
       }
 
       std::chrono::steady_clock::time_point
       deadline() const {
-        if (!coordination_) return std::chrono::steady_clock::time_point::max();
         const auto value = coordination_->coordinator.launch_setup_deadline(coordination_->token);
         if (!value) {
           throw preparation_error_t { { topology::outcome_e::rejected, topology::reject_reason_e::stale_transaction } };
@@ -118,34 +118,27 @@ namespace nvhttp::stream_start {
 
       display_device::session_t::configure_result_t
       configure(std::shared_ptr<rtsp_stream::launch_session_t> session, bool reconfigure) {
-        if (!coordination_) return display_device::session_t::get().configure_display(config::video, *session, reconfigure);
         auto output = std::make_shared<std::optional<display_device::session_t::configure_result_t>>();
-        step([session = std::move(session), output, reconfigure](const auto &cap, const auto &) {
-          cap.require(topology::operation_e::configure_display);
-          *output = display_device::session_t::get().configure_display(config::video, *session, reconfigure);
+        step([session = std::move(session), output, reconfigure, policy = coordination_->vdd_policy](const auto &cap, const auto &) {
+          *output = display_device::session_t::get().configure_display(cap, config::video, *session, policy, reconfigure);
         });
         return std::move(output->value());
       }
 
       void
       restore() {
-        if (!coordination_) {
-          display_device::session_t::get().restore_state();
-          return;
-        }
-        step([](const auto &cap, const auto &) {
-          cap.require(topology::operation_e::restore_state);
-          display_device::session_t::get().restore_state();
+        step([policy = coordination_->vdd_policy](const auto &cap, const auto &) {
+          display_device::session_t::get().restore_state(cap, policy);
         });
       }
 
       int
       probe(video::probe_target_t target, std::optional<config::video_t> temporary = {}) {
         auto output = std::make_shared<std::optional<int>>();
-        auto *coordinator = coordination_ ? &coordination_->coordinator : nullptr;
-        const auto token = coordination_ ? coordination_->token : topology::launch_token_t {};
+        auto *coordinator = &coordination_->coordinator;
+        const auto token = coordination_->token;
         auto work = [coordinator, token, output, target = std::move(target), temporary = std::move(temporary)]() mutable {
-          if (coordinator && !coordinator->launch_setup_deadline(token)) {
+          if (!coordinator->launch_setup_deadline(token)) {
             throw preparation_error_t { { topology::outcome_e::rejected, topology::reject_reason_e::stale_transaction } };
           }
           if (temporary) {
@@ -156,13 +149,8 @@ namespace nvhttp::stream_start {
             *output = video::probe_encoders(target);
           }
         };
-        if (coordination_) {
-          topology::run_supervised_probe(deadline(), fence_, std::move(work),
-            coordination_->fatal_probe_timeout, coordination_->spawn_probe);
-        }
-        else {
-          work();
-        }
+        topology::run_supervised_probe(deadline(), fence_, std::move(work),
+          coordination_->fatal_probe_timeout, coordination_->spawn_probe);
         return output->value();
       }
 
@@ -175,7 +163,6 @@ namespace nvhttp::stream_start {
 
       void
       finish() {
-        if (!coordination_) return;
         fence_.reset();
         if (!coordination_->coordinator.finish_launch_prepare(coordination_->token)) {
           throw preparation_error_t { { topology::outcome_e::rejected, topology::reject_reason_e::stale_transaction } };
@@ -184,7 +171,7 @@ namespace nvhttp::stream_start {
 
       void
       abort() {
-        if (coordination_) coordination_->coordinator.abort_launch(coordination_->token, {});
+        coordination_->coordinator.abort_launch(coordination_->token, {});
         fence_.reset();
       }
 
