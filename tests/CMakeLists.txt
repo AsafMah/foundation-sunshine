@@ -745,6 +745,7 @@ add_executable(abr_api_unit_tests
         ${ABR_TEST_STUB_SOURCE})
 target_include_directories(abr_api_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}" "${CMAKE_BINARY_DIR}")
 target_link_libraries(abr_api_unit_tests PRIVATE sunshine_http Boost::log Boost::filesystem Boost::thread
+        Boost::format Boost::property_tree
         gtest_main nlohmann_json::nlohmann_json sunshine_project_options sunshine_coverage)
 target_compile_definitions(abr_api_unit_tests PRIVATE ${SUNSHINE_DEFINITIONS})
 set_target_properties(abr_api_unit_tests PROPERTIES CXX_STANDARD 23)
