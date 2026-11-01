@@ -365,6 +365,16 @@ does not release another holder's fence. Cleanup commands remain admissible;
 new prepares follow submitted cleanup in queue order. The neutral interleaving
 fixtures cover this contract; RTSP has not yet been wired to use it.
 
+Off-worker encoder probes have a separate, worker-acquired fence that combines
+admission exclusion with a queue dispatch hold. It is acquired before the
+preceding mutation completes, so even cleanup cannot start during the probe.
+Independent holds compose and survive queue-generation changes; skipped head
+commands still settle FIFO. Stop cancels queued work without waiting for an
+external holder, which may safely outlive the queue/coordinator. This is a
+software-verified scheduling primitive, not a running probe supervisor:
+production must retain it through encoder teardown, enqueue required cleanup
+before releasing admission, and provide fatal timeout/resource supervision.
+
 The ticket manager also supports a short binding check before publication or
 replacement, under its mutex and after capacity checks. A refused or throwing
 bind leaves the existing ticket untouched; concurrent claim/liveness readers

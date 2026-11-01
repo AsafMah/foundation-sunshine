@@ -253,4 +253,185 @@ namespace {
     }
     EXPECT_EQ(queue.submit(1, 100ms, [](const auto &) {}).completion.get().status, command_status_e::completed);
   }
+
+  TEST(DisplayTopologyCommandQueue, WorkerGuardBlocksFollowingBodiesUntilReleased) {
+    fake_clock_t clock;
+    topology_command_queue_t queue { [&clock]() { return clock.now(); } };
+    std::shared_ptr<const dispatch_hold_t> hold;
+    std::promise<void> guarded;
+    std::promise<void> finish_mutation;
+    auto finish = finish_mutation.get_future();
+    std::thread::id worker;
+    std::atomic_int following_bodies {};
+    auto mutation = queue.submit(1, 100ms, [&](const auto &) {
+      worker = std::this_thread::get_id();
+      hold = queue.hold_dispatch();
+      guarded.set_value();
+      finish.wait();
+    });
+    guarded.get_future().wait();
+    auto following = queue.submit(1, 100ms, [&](const auto &) {
+      EXPECT_EQ(std::this_thread::get_id(), worker);
+      ++following_bodies;
+    });
+    auto cleanup = queue.submit(1, 100ms, [&](const auto &) {
+      EXPECT_EQ(std::this_thread::get_id(), worker);
+      ++following_bodies;
+    });
+    finish_mutation.set_value();
+    EXPECT_EQ(mutation.completion.get().status, command_status_e::completed);
+    EXPECT_EQ(following.completion.wait_for(50ms), std::future_status::timeout)
+      << "a mutation crossed the off-worker probe guard";
+    EXPECT_EQ(cleanup.completion.wait_for(50ms), std::future_status::timeout)
+      << "cleanup crossed the off-worker probe guard";
+    EXPECT_EQ(following_bodies.load(), 0);
+    hold.reset();
+    EXPECT_EQ(following.completion.wait_for(2s), std::future_status::ready)
+      << "releasing the final guard did not wake dispatch";
+    EXPECT_EQ(following.completion.get().status, command_status_e::completed);
+    EXPECT_EQ(cleanup.completion.get().status, command_status_e::completed);
+    EXPECT_EQ(following_bodies.load(), 2);
+  }
+
+  TEST(DisplayTopologyCommandQueue, DispatchGuardCopiesAndIndependentHoldsCompose) {
+    fake_clock_t clock;
+    topology_command_queue_t queue { [&clock]() { return clock.now(); } };
+    std::shared_ptr<const dispatch_hold_t> first;
+    std::shared_ptr<const dispatch_hold_t> second;
+    queue.submit(1, 100ms, [&](const auto &) {
+           first = queue.hold_dispatch();
+           second = queue.hold_dispatch();
+         })
+      .completion.get();
+    auto copy = first;
+    auto next = queue.submit(1, 100ms, [](const auto &) {});
+    first.reset();
+    EXPECT_EQ(next.completion.wait_for(50ms), std::future_status::timeout)
+      << "a shared copy must keep its guard alive";
+    copy.reset();
+    EXPECT_EQ(next.completion.wait_for(50ms), std::future_status::timeout)
+      << "releasing one independent guard must not release another";
+    second.reset();
+    EXPECT_EQ(next.completion.get().status, command_status_e::completed);
+  }
+
+  TEST(DisplayTopologyCommandQueue, DispatchGuardAllowsOwnCancellationWithoutReleasingOtherWork) {
+    fake_clock_t clock;
+    topology_command_queue_t queue { [&clock]() { return clock.now(); } };
+    std::shared_ptr<const dispatch_hold_t> hold;
+    queue.submit(1, 100ms, [&](const auto &) { hold = queue.hold_dispatch(); }).completion.get();
+    std::atomic_bool cancelled_body {};
+    std::atomic_bool unrelated_body {};
+    auto cancelled = queue.submit(1, 100ms, [&](const auto &) { cancelled_body = true; });
+    auto unrelated = queue.submit(1, 100ms, [&](const auto &) { unrelated_body = true; });
+    EXPECT_TRUE(queue.cancel(cancelled.handle));
+    EXPECT_FALSE(queue.cancel(cancelled.handle));
+    EXPECT_EQ(cancelled.completion.wait_for(2s), std::future_status::ready)
+      << "a skipped head command must settle while dispatch is held";
+    EXPECT_EQ(unrelated.completion.wait_for(50ms), std::future_status::timeout);
+    hold.reset();
+    EXPECT_EQ(cancelled.completion.get().status, command_status_e::cancelled_before_start);
+    EXPECT_EQ(unrelated.completion.get().status, command_status_e::completed);
+    EXPECT_FALSE(cancelled_body.load());
+    EXPECT_TRUE(unrelated_body.load());
+  }
+
+  TEST(DisplayTopologyCommandQueue, GenerationChangeDoesNotReleaseDispatchGuard) {
+    fake_clock_t clock;
+    topology_command_queue_t queue { [&clock]() { return clock.now(); } };
+    std::shared_ptr<const dispatch_hold_t> hold;
+    queue.submit(1, 100ms, [&](const auto &) { hold = queue.hold_dispatch(); }).completion.get();
+    std::atomic_bool old_body {};
+    auto old = queue.submit(1, 100ms, [&](const auto &) { old_body = true; });
+    const auto generation = queue.begin_generation();
+    auto next = queue.submit(generation, 100ms, [](const auto &) {});
+    EXPECT_EQ(old.completion.wait_for(2s), std::future_status::ready);
+    EXPECT_EQ(next.completion.wait_for(50ms), std::future_status::timeout)
+      << "new-generation work must not race a previous generation's probe";
+    hold.reset();
+    EXPECT_EQ(old.completion.get().status, command_status_e::cancelled_before_start);
+    EXPECT_EQ(next.completion.get().status, command_status_e::completed);
+    EXPECT_FALSE(old_body.load());
+  }
+
+  TEST(DisplayTopologyCommandQueue, StopDrainsSkippedReceiptsWhileGuardOutlivesQueue) {
+    fake_clock_t clock;
+    auto queue = std::make_unique<topology_command_queue_t>([&clock]() { return clock.now(); });
+    std::shared_ptr<const dispatch_hold_t> hold;
+    queue->submit(1, 100ms, [&](const auto &) { hold = queue->hold_dispatch(); }).completion.get();
+    std::atomic_int callbacks {};
+    std::atomic_bool body {};
+    auto pending = queue->submit(1, 100ms, [&](const auto &) { body = true; }, [&](const auto &result) {
+      EXPECT_EQ(result.status, command_status_e::cancelled_before_start);
+      EXPECT_FALSE(result.started);
+      ++callbacks; });
+    auto stopped = std::async(std::launch::async, [&]() { queue.reset(); });
+    const auto before_release = stopped.wait_for(2s);
+    hold.reset();
+    stopped.get();
+    EXPECT_EQ(before_release, std::future_status::ready)
+      << "queue shutdown must not wait for an external probe guard";
+    EXPECT_EQ(pending.completion.get().status, command_status_e::cancelled_before_start);
+    EXPECT_EQ(callbacks.load(), 1);
+    EXPECT_FALSE(body.load());
+  }
+
+  TEST(DisplayTopologyCommandQueue, CancelledCaptureReleasesLastDispatchGuardOutsideQueueLock) {
+    fake_clock_t clock;
+    topology_command_queue_t queue { [&clock]() { return clock.now(); } };
+    std::shared_ptr<const dispatch_hold_t> hold;
+    queue.submit(1, 100ms, [&](const auto &) { hold = queue.hold_dispatch(); }).completion.get();
+    auto cancelled = queue.submit(1, 100ms, [hold = std::move(hold)](const auto &) {
+      FAIL() << "cancelled guard-owning body ran";
+    });
+    auto next = queue.submit(1, 100ms, [](const auto &) {});
+    EXPECT_TRUE(queue.cancel(cancelled.handle));
+    EXPECT_EQ(cancelled.completion.wait_for(2s), std::future_status::ready);
+    EXPECT_EQ(next.completion.wait_for(2s), std::future_status::ready)
+      << "destroying a cancelled capture deadlocked or retained its dispatch guard";
+    EXPECT_EQ(cancelled.completion.get().status, command_status_e::cancelled_before_start);
+    EXPECT_EQ(next.completion.get().status, command_status_e::completed);
+  }
+
+  TEST(DisplayTopologyCommandQueue, DispatchGuardRequiresItsOwnWorker) {
+    fake_clock_t clock;
+    topology_command_queue_t queue { [&clock]() { return clock.now(); } };
+    topology_command_queue_t other { [&clock]() { return clock.now(); } };
+    EXPECT_THROW(queue.hold_dispatch(), std::logic_error);
+    auto result = queue.submit(1, 100ms, [&](const auto &) {
+                         EXPECT_THROW(other.hold_dispatch(), std::logic_error);
+                         EXPECT_NO_THROW(queue.hold_dispatch());
+                       })
+                    .completion.get();
+    EXPECT_EQ(result.status, command_status_e::completed);
+  }
+
+  TEST(DisplayTopologyCommandQueue, DispatchGuardSkipsExpiredHeadWithoutRunningOtherBodies) {
+    fake_clock_t clock;
+    topology_command_queue_t queue { [&clock]() { return clock.now(); } };
+    std::shared_ptr<const dispatch_hold_t> hold;
+    queue.submit(1, 100ms, [&](const auto &) { hold = queue.hold_dispatch(); }).completion.get();
+    auto expired = queue.submit(1, 10ms, [](const auto &) { FAIL() << "expired body ran"; });
+    clock.set(10ms);
+    auto next = queue.submit(1, 100ms, [](const auto &) {});
+    EXPECT_EQ(expired.completion.wait_for(2s), std::future_status::ready);
+    EXPECT_EQ(next.completion.wait_for(50ms), std::future_status::timeout);
+    hold.reset();
+    EXPECT_EQ(expired.completion.get().status, command_status_e::expired_before_start);
+    EXPECT_EQ(next.completion.get().status, command_status_e::completed);
+  }
+
+  TEST(DisplayTopologyCommandQueue, CompletionCallbackCanReleaseDispatchGuard) {
+    fake_clock_t clock;
+    topology_command_queue_t queue { [&clock]() { return clock.now(); } };
+    std::shared_ptr<const dispatch_hold_t> hold;
+    auto guarded = queue.submit(1, 100ms, [&](const auto &) { hold = queue.hold_dispatch(); }, [&](const auto &) {
+      hold.reset();
+      EXPECT_EQ(queue.generation(), 1u); });
+    EXPECT_EQ(guarded.completion.wait_for(2s), std::future_status::ready);
+    EXPECT_EQ(guarded.completion.get().status, command_status_e::completed);
+    EXPECT_FALSE(hold) << "completion must release its guard before publishing the receipt";
+    hold.reset();
+    EXPECT_EQ(queue.submit(1, 100ms, [](const auto &) {}).completion.get().status, command_status_e::completed);
+  }
 }  // namespace

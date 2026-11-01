@@ -1056,6 +1056,21 @@ namespace display_device::topology {
     return token;
   }
 
+  std::shared_ptr<const probe_fence_t>
+  coordinator_t::hold_probe_fence() {
+    if (!on_worker_thread()) {
+      throw std::logic_error { "A topology probe fence must be acquired on its mutation worker" };
+    }
+    auto token = std::shared_ptr<probe_fence_t> { new probe_fence_t };
+    std::lock_guard lock { mutex_ };
+    if (!queue_ || stopping_ || phase_ == coordinator_phase_e::draining) {
+      throw std::logic_error { "A topology probe cannot start while draining or stopped" };
+    }
+    token->dispatch_ = queue_->hold_dispatch();
+    fences_.push_back([weak = std::weak_ptr { token }]() { return weak.expired(); });
+    return token;
+  }
+
   void
   coordinator_t::publish_native_health(native_health_t health) {
     std::lock_guard lock { mutex_ };

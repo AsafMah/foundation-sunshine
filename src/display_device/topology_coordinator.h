@@ -185,6 +185,20 @@ namespace display_device::topology {
     admission_fence_t() = default;
   };
 
+  /** Shared admission and dispatch exclusion for a separately supervised encoder probe. */
+  class probe_fence_t {
+  public:
+    ~probe_fence_t() = default;
+    probe_fence_t(const probe_fence_t &) = delete;
+    probe_fence_t &
+    operator=(const probe_fence_t &) = delete;
+
+  private:
+    friend class coordinator_t;
+    probe_fence_t() = default;
+    std::shared_ptr<const dispatch_hold_t> dispatch_;
+  };
+
   /**
    * @brief Read-only probes. They are always called without the coordinator lock held
    *        and must not call back into the coordinator.
@@ -362,6 +376,18 @@ namespace display_device::topology {
      */
     std::shared_ptr<const admission_fence_t>
     hold_fence();
+
+    /**
+     * Acquire on the worker before finishing the mutation preceding an off-worker probe.
+     * Unlike a teardown fence, this also queues cleanup without executing it. The probe
+     * owns a copy through encoder teardown; cancellation must not release its last copy.
+     * Enqueue required cleanup before releasing admission, and never wait for queued
+     * work while holding this fence. Stop cancels queued work without waiting for it.
+     * This guards topology only; callers still own probe supervision and resource lifetime.
+     * @throws std::logic_error off this worker or after draining/stop begins.
+     */
+    std::shared_ptr<const probe_fence_t>
+    hold_probe_fence();
 
     void
     publish_native_health(native_health_t health);

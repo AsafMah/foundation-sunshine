@@ -2120,6 +2120,136 @@ namespace {
     EXPECT_EQ(coordinator.run(command_kind_e::scale, {}).reason, reject_reason_e::fence_active);
   }
 
+  TEST(DisplayTopologyCoordinator, ProbeFenceQueuesEveryCleanupAndRejectsAdmission) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto launch = coordinator.admit_launch({ 420, "probing" });
+    ASSERT_TRUE(launch);
+    std::shared_ptr<const probe_fence_t> probe;
+    ASSERT_TRUE(coordinator.run_launch_prepare(*launch.token, [&](const auto &, const auto &) {
+                             probe = coordinator.hold_probe_fence();
+                           })
+        .completed());
+    std::atomic_int mutations {};
+    EXPECT_TRUE(coordinator.status().fence_active);
+    EXPECT_EQ(coordinator.admit_launch({ 421, "competing" }).reason, reject_reason_e::fence_active);
+    EXPECT_EQ(coordinator.post_tracked(command_kind_e::rotate, counting(mutations)).reason, reject_reason_e::fence_active);
+    std::vector<posted_command_t> cleanup;
+    for (const auto kind : expected_cleanup_kinds) {
+      cleanup.push_back(coordinator.post_tracked(kind, counting(mutations)));
+      EXPECT_EQ(cleanup.back().reason, reject_reason_e::none);
+      EXPECT_EQ(cleanup.back().completion.wait_for(50ms), std::future_status::timeout)
+        << to_string(kind) << " mutated during a probe";
+    }
+    EXPECT_EQ(mutations.load(), 0);
+    probe.reset();
+    for (const auto &command : cleanup) {
+      EXPECT_TRUE(command.completion.get().completed());
+    }
+    EXPECT_EQ(mutations.load(), expected_cleanup_kinds.size());
+    EXPECT_FALSE(coordinator.status().fence_active);
+  }
+
+  TEST(DisplayTopologyCoordinator, ProbeFenceOrdersExpiredSetupRestoreBeforeReplacement) {
+    for (const bool managed : { false, true }) {
+      fake_clock_t clock;
+      event_log_t log;
+      auto options = make_options(clock, managed);
+      if (managed) options.native_restore = logging(log, "restore");
+      coordinator_t coordinator { options };
+      ASSERT_TRUE(start_ready(coordinator).completed());
+      const auto first = coordinator.admit_launch({ 422, "expiring" });
+      ASSERT_TRUE(first);
+      std::shared_ptr<const probe_fence_t> probe;
+      ASSERT_TRUE(coordinator.run_launch_prepare(*first.token, [&](const auto &, const auto &) {
+        probe = coordinator.hold_probe_fence();
+        log.add("first"); }, logging(log, "restore")).completed());
+      clock.advance(1000ms);
+      coordinator.tick();
+      EXPECT_FALSE(coordinator.status().lease);
+      EXPECT_FALSE(coordinator.bind_launch(*first.token));
+      EXPECT_EQ(coordinator.admit_launch({ 423, "too early" }).reason, reject_reason_e::fence_active);
+      const auto barrier = coordinator.post_tracked(command_kind_e::stream_restore, logging(log, "barrier"));
+      EXPECT_EQ(barrier.completion.wait_for(50ms), std::future_status::timeout);
+      EXPECT_EQ(log.events(), (std::vector<std::string> { "first" }));
+      probe.reset();
+      const auto next = coordinator.admit_launch({ 424, "replacement" });
+      ASSERT_TRUE(next);
+      ASSERT_TRUE(coordinator.run_launch_prepare(*next.token, logging(log, "next")).completed());
+      EXPECT_TRUE(barrier.completion.get().completed());
+      EXPECT_EQ(log.events(), (std::vector<std::string> { "first", "restore", "barrier", "next" }));
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, ProbeFenceReleaseDoesNotClearTeardownFence) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    std::shared_ptr<const probe_fence_t> probe;
+    ASSERT_TRUE(coordinator.run(command_kind_e::rotate, [&](const auto &, const auto &) {
+                             probe = coordinator.hold_probe_fence();
+                           })
+        .completed());
+    auto teardown = coordinator.hold_fence();
+    const auto cleanup = coordinator.post_tracked(command_kind_e::stream_restore, {});
+    EXPECT_EQ(cleanup.completion.wait_for(50ms), std::future_status::timeout);
+    probe.reset();
+    EXPECT_EQ(cleanup.completion.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_TRUE(cleanup.completion.get().completed());
+    EXPECT_EQ(coordinator.admit_launch({ 425, "still tearing down" }).reason, reject_reason_e::fence_active);
+    teardown.reset();
+    EXPECT_TRUE(coordinator.admit_launch({ 426, "ready" }));
+  }
+
+  TEST(DisplayTopologyCoordinator, ProbeFenceOutlivesStoppedCoordinatorWithoutRunningCleanup) {
+    fake_clock_t clock;
+    auto coordinator = std::make_unique<coordinator_t>(make_options(clock));
+    ASSERT_TRUE(start_ready(*coordinator).completed());
+    std::shared_ptr<const probe_fence_t> probe;
+    ASSERT_TRUE(coordinator->run(command_kind_e::rotate, [&](const auto &, const auto &) {
+                             probe = coordinator->hold_probe_fence();
+                           })
+        .completed());
+    std::atomic_int mutations {};
+    const auto cleanup = coordinator->post_tracked(command_kind_e::stream_restore, counting(mutations));
+    auto stopped = std::async(std::launch::async, [&]() { coordinator->stop(); });
+    const auto before_release = stopped.wait_for(real_timeout);
+    if (before_release != std::future_status::ready) probe.reset();
+    stopped.get();
+    EXPECT_EQ(before_release, std::future_status::ready);
+    EXPECT_EQ(cleanup.completion.get().outcome, outcome_e::stopped);
+    coordinator.reset();
+    probe.reset();
+    EXPECT_EQ(mutations.load(), 0);
+  }
+
+  TEST(DisplayTopologyCoordinator, ProbeFenceRefusesOtherThreadsAndDrainingWorker) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    coordinator_t other { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    ASSERT_TRUE(start_ready(other).completed());
+    EXPECT_THROW(coordinator.hold_probe_fence(), std::logic_error);
+    gate_t worker;
+    auto running = std::async(std::launch::async, [&]() {
+      return coordinator.run(command_kind_e::rotate, [&](const auto &, const auto &) {
+        EXPECT_THROW(other.hold_probe_fence(), std::logic_error);
+        worker.hook()();
+        coordinator.hold_probe_fence();
+      });
+    });
+    const finally_t release { [&]() { worker.release(); } };
+    ASSERT_TRUE(worker.wait_started());
+    coordinator.begin_draining();
+    worker.release();
+    const auto result = running.get();
+    EXPECT_EQ(result.outcome, outcome_e::failed);
+    ASSERT_TRUE(result.exception);
+    EXPECT_THROW(std::rethrow_exception(result.exception), std::logic_error);
+    EXPECT_FALSE(coordinator.status().fence_active);
+  }
+
   TEST(DisplayTopologyCoordinator, FenceRefusesNonCleanupWorkUntilItSettles) {
     fake_clock_t clock;
     std::atomic_bool settled {};

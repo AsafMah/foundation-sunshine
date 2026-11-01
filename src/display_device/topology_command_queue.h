@@ -71,6 +71,22 @@ namespace display_device::topology {
     std::function<monotonic_time_t()> now_;
   };
 
+  struct dispatch_state_t;
+
+  /** Keeps dispatch paused until the last shared holder releases it, even after shutdown. */
+  class dispatch_hold_t {
+  public:
+    ~dispatch_hold_t();
+    dispatch_hold_t(const dispatch_hold_t &) = delete;
+    dispatch_hold_t &
+    operator=(const dispatch_hold_t &) = delete;
+
+  private:
+    friend class topology_command_queue_t;
+    explicit dispatch_hold_t(std::shared_ptr<dispatch_state_t> state);
+    std::shared_ptr<dispatch_state_t> state_;
+  };
+
   // One worker owns command execution. State locks are released before invoking
   // commands; an in-flight command remains the serialization fence until return.
   class topology_command_queue_t {
@@ -107,6 +123,17 @@ namespace display_device::topology {
     command_submission_t
     submit(std::uint64_t generation, monotonic_time_t deadline, task_t task, completion_function_t completed = {});
 
+    /**
+     * Pause subsequent command bodies before this worker command completes. Independent
+     * holds compose and survive generation changes. Skipped head commands still complete
+     * FIFO; cancellation behind a live held head waits for it, as behind a running body.
+     * Shutdown cancels pending commands without waiting for holds. Holders must not await
+     * queued work, and must keep the token through all off-worker probe teardown.
+     * @throws std::logic_error unless called on this queue's worker.
+     */
+    std::shared_ptr<const dispatch_hold_t>
+    hold_dispatch();
+
   private:
     struct command_t {
       std::uint64_t id {};
@@ -128,8 +155,7 @@ namespace display_device::topology {
     complete(const std::shared_ptr<command_t> &command, command_completion_t completion);
 
     clock_function_t now_;
-    mutable std::mutex mutex_;
-    std::condition_variable wake_;
+    std::shared_ptr<dispatch_state_t> dispatch_;
     std::deque<std::shared_ptr<command_t>> pending_;
     std::shared_ptr<command_t> active_;
     std::uint64_t generation_ { 1 };
