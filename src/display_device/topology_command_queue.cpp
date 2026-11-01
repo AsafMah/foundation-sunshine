@@ -133,6 +133,18 @@ namespace display_device::topology {
 
   command_submission_t
   topology_command_queue_t::submit(std::uint64_t generation, monotonic_time_t deadline, task_t task, completion_function_t completed) {
+    return enqueue(generation, deadline, std::move(task), std::move(completed), false);
+  }
+
+  command_submission_t
+  topology_command_queue_t::submit_first(std::uint64_t generation, monotonic_time_t deadline, task_t task,
+    completion_function_t completed) {
+    return enqueue(generation, deadline, std::move(task), std::move(completed), true);
+  }
+
+  command_submission_t
+  topology_command_queue_t::enqueue(std::uint64_t generation, monotonic_time_t deadline, task_t task,
+    completion_function_t completed, bool front) {
     auto command = std::make_shared<command_t>();
     command->generation = generation;
     command->deadline = deadline;
@@ -155,6 +167,9 @@ namespace display_device::topology {
       }
       else if (now_() >= deadline) {
         status = command_status_e::expired_before_start;
+      }
+      else if (front) {
+        pending_.push_front(command);
       }
       else {
         pending_.push_back(command);

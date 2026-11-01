@@ -167,6 +167,7 @@ namespace display_device::topology {
     std::shared_future<command_result_t> posted_future { posted_completion.get_future().share() };
     std::once_flag posted_once;
     std::shared_ptr<startup_restore_t> startup_restore;
+    std::shared_ptr<external_startup_t> external_startup;
     bool holds_startup_fence {};
 
     void
@@ -189,6 +190,16 @@ namespace display_device::topology {
     posted_command_t attempt;
   };
 
+  struct coordinator_t::external_startup_t {
+    std::shared_ptr<const external_mutation_fence_t> exclusion;
+    command_body_t continuation;
+    command_result_t body_result;
+    bool body_returned {};
+    bool settled {};
+    bool submitted {};
+    bool done {};
+  };
+
   coordinator_t::coordinator_t(coordinator_options_t options):
       options_ { std::move(options) },
       clock_ { options_.clock ? options_.clock : topology_command_queue_t::clock_function_t { &steady_now } } {
@@ -204,9 +215,16 @@ namespace display_device::topology {
     if (options_.poll_interval <= std::chrono::milliseconds::zero()) {
       options_.poll_interval = std::chrono::milliseconds { 1 };
     }
+    recovery_link_ = std::make_shared<external_recovery_t::link_t>();
+    recovery_link_->owner = this;
   }
 
   coordinator_t::~coordinator_t() {
+    {
+      // Waits out a settle() already inside this coordinator; later ones become no-ops.
+      std::lock_guard link { recovery_link_->mutex };
+      recovery_link_->owner = nullptr;
+    }
     stop();
   }
 
@@ -471,6 +489,32 @@ namespace display_device::topology {
         return;
       }
 
+      if (state->external_startup) {
+        // The resumed tail of a suspended startup: merge both results, finish once.
+        auto result = state->external_startup->body_result;
+        try {
+          if (body) {
+            body(capability, context);
+          }
+          if (result.outcome != outcome_e::failed && !context.may_continue()) {
+            result.outcome = outcome_e::completed_late;
+          }
+        }
+        catch (...) {
+          if (result.outcome != outcome_e::failed) {
+            result.outcome = outcome_e::failed;
+            result.exception = std::current_exception();
+          }
+        }
+        {
+          std::lock_guard lock { mutex_ };
+          state->external_startup->done = true;
+        }
+        finish_recovery(result.outcome != outcome_e::failed);
+        complete_startup(std::move(result));
+        return;
+      }
+
       command_result_t result;
       try {
         if (body) {
@@ -481,6 +525,22 @@ namespace display_device::topology {
       catch (...) {
         result.outcome = outcome_e::failed;
         result.exception = std::current_exception();
+      }
+      std::shared_ptr<const external_mutation_fence_t> released;
+      {
+        std::lock_guard lock { mutex_ };
+        if (external_startup_ && !external_startup_->body_returned) {
+          // Suspended: stay Recovering and fenced; the continuation finishes startup.
+          external_startup_->body_result = std::move(result);
+          external_startup_->body_returned = true;
+          try {
+            released = resume_external_startup_locked();
+          }
+          catch (...) {
+            // Still held and unsubmitted; the actor's next settle() retries.
+          }
+          return;
+        }
       }
       finish_recovery(result.outcome != outcome_e::failed);
       complete_startup(std::move(result));
@@ -1225,6 +1285,14 @@ namespace display_device::topology {
 
     // Joins the worker once the running command returns; pending ones complete as stopped.
     queue.reset();
+    std::shared_ptr<const external_mutation_fence_t> abandoned;
+    {
+      std::lock_guard lock { mutex_ };
+      if (external_startup_) {
+        external_startup_->done = true;
+        abandoned = std::move(external_startup_->exclusion);
+      }
+    }
     complete_startup(outcome(outcome_e::stopped));
   }
 
@@ -1284,6 +1352,70 @@ namespace display_device::topology {
     return token;
   }
 
+  void
+  external_recovery_t::settle() {
+    std::lock_guard lock { link_->mutex };
+    if (link_->owner) {
+      link_->owner->settle_external_startup();
+    }
+  }
+
+  std::shared_ptr<external_recovery_t>
+  coordinator_t::suspend_startup_for_external_recovery(const mutation_capability_t &capability, command_body_t continuation) {
+    capability.require(operation_e::native_recover);
+    if (capability.kind() != command_kind_e::startup_recovery) {
+      throw capability_error_t { "Startup suspension requires the startup command" };
+    }
+    if (!continuation) {
+      throw std::invalid_argument { "Startup suspension needs a continuation" };
+    }
+    if (!on_worker_thread() || capability.external_mutation_ != external_mutation_) {
+      throw std::logic_error { "Startup suspension needs its coordinator's worker capability" };
+    }
+    auto external = std::make_shared<external_startup_t>();
+    external->continuation = std::move(continuation);
+    {
+      std::lock_guard lock { mutex_ };
+      if (external_startup_) {
+        throw std::logic_error { "Startup can be suspended for external recovery only once" };
+      }
+    }
+    // Only this worker registers, so nothing can intervene between the check and the store.
+    auto exclusion = hold_external_actor(capability, true);
+    std::lock_guard lock { mutex_ };
+    external->exclusion = std::move(exclusion);
+    external_startup_ = external;
+    return std::shared_ptr<external_recovery_t> { new external_recovery_t { recovery_link_ } };
+  }
+
+  void
+  coordinator_t::settle_external_startup() {
+    std::shared_ptr<const external_mutation_fence_t> released;
+    std::lock_guard lock { mutex_ };
+    if (!external_startup_ || external_startup_->submitted) {
+      return;
+    }
+    external_startup_->settled = true;
+    // Throws on enqueue failure with the obligation still held, so a later settle() retries.
+    released = resume_external_startup_locked();
+  }
+
+  std::shared_ptr<const external_mutation_fence_t>
+  coordinator_t::resume_external_startup_locked() {
+    const auto &external = external_startup_;
+    if (!external || !external->settled || !external->body_returned || external->submitted || stopping_ || !queue_) {
+      return nullptr;
+    }
+    auto state = std::make_shared<command_state_t>();
+    state->external_startup = external;
+    // Ahead of cleanup queued while suspended; the still-held dispatch keeps it unstarted until release.
+    static_cast<void>(queue_->submit_first(queue_generation_, no_deadline,
+      make_task(command_kind_e::startup_recovery, std::move(state), external->continuation, std::nullopt)));
+    ++submitted_commands_;
+    external->submitted = true;
+    return std::move(external->exclusion);
+  }
+
   std::shared_ptr<const admission_fence_t>
   coordinator_t::hold_fence() {
     auto token = std::shared_ptr<const admission_fence_t> { new admission_fence_t };
@@ -1331,6 +1463,7 @@ namespace display_device::topology {
     result.fence_active = startup_restore_attempt_active_ ||
                           std::any_of(fences_.begin(), fences_.end(), [](const auto &settled) { return !settled(); });
     result.startup_restore_pending = static_cast<bool>(startup_restore_);
+    result.external_recovery_pending = external_startup_ && !external_startup_->done;
     result.native_restores_posted = native_restores_posted_;
     result.submitted_commands = submitted_commands_;
     return result;

@@ -169,6 +169,8 @@ namespace display_device::topology {
     /** Commands handed to the worker queue so far (including startup recovery). */
     std::uint64_t submitted_commands {};
     bool startup_restore_pending {};
+    /** Startup is suspended behind an unsettled external actor. */
+    bool external_recovery_pending {};
   };
 
   using command_body_t = std::function<void(const mutation_capability_t &, const command_context_t &)>;
@@ -200,6 +202,38 @@ namespace display_device::topology {
     std::shared_ptr<std::atomic_bool> blocked_;
     std::shared_ptr<const dispatch_hold_t> dispatch_;
     bool armed_ {};
+  };
+
+  /**
+   * Monitor-side handle of a startup suspended behind an external actor. The
+   * coordinator owns the exclusion and continuation; dropping every handle never
+   * settles, so unresolved or uninspectable actors stay excluded until stop.
+   */
+  class external_recovery_t {
+  public:
+    ~external_recovery_t() = default;
+    external_recovery_t(const external_recovery_t &) = delete;
+    external_recovery_t &
+    operator=(const external_recovery_t &) = delete;
+
+    /**
+     * The actor has settled: resume startup ahead of every queued command.
+     * Idempotent and callable from any thread, also after stop or destruction
+     * of the coordinator, where it does nothing. Never call it while holding a
+     * lock that a coordinator probe, observer or worker body may need.
+     */
+    void
+    settle();
+
+  private:
+    friend class coordinator_t;
+    struct link_t {
+      std::mutex mutex;
+      coordinator_t *owner {};
+    };
+    explicit external_recovery_t(std::shared_ptr<link_t> link):
+        link_ { std::move(link) } {}
+    std::shared_ptr<link_t> link_;
   };
 
   /** Shared admission and dispatch exclusion for a separately supervised encoder probe. */
@@ -260,6 +294,8 @@ namespace display_device::topology {
   };
 
   class coordinator_t {
+    friend class external_recovery_t;
+
   public:
     /**
      * @throws std::invalid_argument in managed mode without a `native_restore` body,
@@ -460,6 +496,20 @@ namespace display_device::topology {
     hold_external_recovery(const mutation_capability_t &capability);
 
     /**
+     * Suspend startup behind an existing or possibly existing external actor.
+     * Call before any fallible inspection or monitor publication. The coordinator
+     * itself retains the exclusion: the current startup body loses raw authority,
+     * and neither its return nor an exception ends startup or permits legacy
+     * operation. After `settle()`, and once the body returned, `continuation` runs
+     * with exact startup authority ahead of all queued work (including shutdown
+     * cleanup queued while draining); its result and any earlier startup failure
+     * complete the `start()` future. Same requirements as hold_external_recovery;
+     * once per coordinator. Never grants permission to launch another actor.
+     */
+    std::shared_ptr<external_recovery_t>
+    suspend_startup_for_external_recovery(const mutation_capability_t &capability, command_body_t continuation);
+
+    /**
      * @brief Hold an admission fence until every copy of the returned token is released.
      * @details For teardown, acquire before removing a session from the visible registry;
      *          keep it through join and submission of all stream/app cleanup. Cleanup may
@@ -608,6 +658,20 @@ namespace display_device::topology {
     void
     complete_startup(command_result_t result);
 
+    struct external_startup_t;
+
+    /** From external_recovery_t::settle(); the link mutex is held, mutex_ is not. */
+    void
+    settle_external_startup();
+
+    /**
+     * Caller holds mutex_. Once settled and the suspended body returned, put the
+     * continuation at the queue front while dispatch is still held, and hand back
+     * the exclusion for release after unlocking.
+     */
+    std::shared_ptr<const external_mutation_fence_t>
+    resume_external_startup_locked();
+
     void
     tick_loop();
 
@@ -632,6 +696,9 @@ namespace display_device::topology {
     std::optional<lease_t> lease_;
     std::vector<std::function<bool()>> fences_;
     std::shared_ptr<std::atomic_bool> external_mutation_ { std::make_shared<std::atomic_bool>(false) };
+    std::shared_ptr<external_startup_t> external_startup_;
+    /** Shared with every external_recovery_t; cleared under its mutex before teardown begins. */
+    std::shared_ptr<external_recovery_t::link_t> recovery_link_;
     native_health_t native_;
     std::uint64_t next_transaction_ { 1 };
     std::uint64_t native_restores_posted_ {};

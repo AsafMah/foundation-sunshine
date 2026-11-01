@@ -135,6 +135,15 @@ namespace display_device::topology {
     hold_dispatch();
 
   private:
+    friend class coordinator_t;
+
+    /** As submit(), but ahead of every pending command (still behind a running body). */
+    command_submission_t
+    submit_first(std::uint64_t generation, monotonic_time_t deadline, task_t task, completion_function_t completed = {});
+
+    command_submission_t
+    enqueue(std::uint64_t generation, monotonic_time_t deadline, task_t task, completion_function_t completed, bool front);
+
     struct command_t {
       std::uint64_t id {};
       std::uint64_t generation {};

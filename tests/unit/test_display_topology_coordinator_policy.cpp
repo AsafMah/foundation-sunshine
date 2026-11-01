@@ -2962,6 +2962,334 @@ namespace {
     EXPECT_FALSE(coordinator.status().fence_active);
   }
 
+  TEST(DisplayTopologyCoordinator, SuspendedStartupResumesBeforePrequeuedShutdownCleanup) {
+    for (const bool managed : { false, true }) {
+      SCOPED_TRACE(managed);
+      fake_clock_t clock;
+      event_log_t log;
+      coordinator_t coordinator { make_options(clock, managed) };
+      std::shared_ptr<external_recovery_t> actor;
+      gate_t worker;
+      const auto startup = coordinator.start([&](const auto &capability, const auto &) {
+        actor = coordinator.suspend_startup_for_external_recovery(capability, [&](const auto &resumed, const auto &) {
+          EXPECT_EQ(resumed.kind(), command_kind_e::startup_recovery);
+          EXPECT_NO_THROW(resumed.require(operation_e::native_recover));
+          EXPECT_NO_THROW(resumed.require(operation_e::restore_state));
+          log.add("continuation");
+        });
+        worker.hook()();
+        EXPECT_THROW(capability.require(operation_e::restore_state), capability_error_t);
+      });
+      const finally_t release { [&]() { worker.release(); } };
+      ASSERT_TRUE(worker.wait_started());
+      coordinator.begin_draining();
+      const auto cleanup = coordinator.post_tracked(command_kind_e::shutdown_restore, logging(log, "cleanup"));
+      ASSERT_EQ(cleanup.reason, reject_reason_e::none);
+      worker.release();
+      EXPECT_EQ(startup.wait_for(50ms), std::future_status::timeout);
+      EXPECT_EQ(cleanup.completion.wait_for(50ms), std::future_status::timeout);
+      EXPECT_TRUE(coordinator.status().external_recovery_pending);
+      EXPECT_TRUE(log.events().empty());
+      ASSERT_NE(actor, nullptr);
+      std::thread monitor { [actor]() { actor->settle(); } };
+      monitor.join();
+      ASSERT_EQ(startup.wait_for(real_timeout), std::future_status::ready);
+      EXPECT_TRUE(startup.get().completed());
+      EXPECT_TRUE(cleanup.completion.get().completed());
+      EXPECT_EQ(log.events(), (std::vector<std::string> { "continuation", "cleanup" }));
+      EXPECT_FALSE(coordinator.status().external_recovery_pending);
+      EXPECT_FALSE(coordinator.status().fence_active);
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, SuspendedStartupStaysFencedWhenInspectionThrows) {
+    fake_clock_t clock;
+    event_log_t log;
+    std::shared_ptr<external_recovery_t> monitor;
+    coordinator_t coordinator { make_options(clock) };
+    const auto startup = coordinator.start([&](const auto &capability, const auto &) {
+      monitor = coordinator.suspend_startup_for_external_recovery(capability, logging(log, "continuation"));
+      throw std::runtime_error { "External process receipt could not be inspected" };
+    });
+    EXPECT_EQ(startup.wait_for(50ms), std::future_status::timeout);
+    auto status = coordinator.status();
+    EXPECT_EQ(status.phase, coordinator_phase_e::recovering);
+    EXPECT_TRUE(status.fence_active);
+    EXPECT_TRUE(status.external_recovery_pending);
+    EXPECT_EQ(coordinator.admit_launch({ 450, "unresolved actor" }).reason, reject_reason_e::recovering);
+    for (const auto kind : { command_kind_e::reset_persistence, command_kind_e::vdd_create, command_kind_e::vdd_destroy,
+           command_kind_e::shutdown_restore }) {
+      SCOPED_TRACE(to_string(kind));
+      EXPECT_EQ(coordinator.post(kind, logging(log, "rejected")), reject_reason_e::recovering);
+    }
+    ASSERT_NE(monitor, nullptr);
+    monitor->settle();
+    const auto result = startup.get();
+    EXPECT_EQ(result.outcome, outcome_e::failed);
+    ASSERT_TRUE(result.exception);
+    EXPECT_THROW(std::rethrow_exception(result.exception), std::runtime_error);
+    EXPECT_EQ(log.events(), (std::vector<std::string> { "continuation" }));
+    status = coordinator.status();
+    EXPECT_EQ(status.phase, coordinator_phase_e::running);
+    EXPECT_TRUE(status.native.in_conflict);
+    EXPECT_FALSE(status.fence_active);
+    EXPECT_FALSE(status.external_recovery_pending);
+    // Native-only failure still permits the approved legacy path once the actor settled.
+    EXPECT_TRUE(coordinator.admit_launch({ 451, "settled" }));
+  }
+
+  TEST(DisplayTopologyCoordinator, SettlementDuringSuspendedBodyWaitsForItsReturn) {
+    fake_clock_t clock;
+    event_log_t log;
+    coordinator_t coordinator { make_options(clock) };
+    std::shared_ptr<external_recovery_t> actor;
+    const auto startup = coordinator.start([&](const auto &capability, const auto &) {
+      actor = coordinator.suspend_startup_for_external_recovery(capability, logging(log, "continuation"));
+      std::thread monitor { [settled = actor]() { settled->settle(); } };
+      monitor.join();
+      EXPECT_THROW(capability.require(operation_e::restore_state), capability_error_t);
+      EXPECT_TRUE(coordinator.status().fence_active);
+      log.add("body-returning");
+    });
+    EXPECT_TRUE(startup.get().completed());
+    EXPECT_EQ(log.events(), (std::vector<std::string> { "body-returning", "continuation" }));
+    actor->settle();
+    EXPECT_TRUE(coordinator.run(command_kind_e::reconfigure, logging(log, "later")).completed());
+    EXPECT_EQ(log.events(), (std::vector<std::string> { "body-returning", "continuation", "later" }));
+    EXPECT_FALSE(coordinator.status().external_recovery_pending);
+  }
+
+  TEST(DisplayTopologyCoordinator, StopWhileSuspendedRunsNeitherContinuationNorCleanup) {
+    for (const bool body_running_at_stop : { false, true }) {
+      SCOPED_TRACE(body_running_at_stop);
+      fake_clock_t clock;
+      std::atomic_int mutations {};
+      std::shared_ptr<external_recovery_t> actor;
+      std::promise<void> suspended;
+      auto coordinator = std::make_unique<coordinator_t>(make_options(clock));
+      gate_t worker;
+      const auto startup = coordinator->start([&](const auto &capability, const auto &) {
+        actor = coordinator->suspend_startup_for_external_recovery(capability, counting(mutations));
+        suspended.set_value();
+        if (body_running_at_stop) worker.hook()();
+      });
+      const finally_t release { [&]() { worker.release(); } };
+      ASSERT_EQ(suspended.get_future().wait_for(real_timeout), std::future_status::ready);
+      if (body_running_at_stop) {
+        ASSERT_TRUE(worker.wait_started());
+      }
+      coordinator->begin_draining();
+      const auto cleanup = coordinator->post_tracked(command_kind_e::shutdown_restore, counting(mutations));
+      ASSERT_EQ(cleanup.reason, reject_reason_e::none);
+      auto stopping = std::async(std::launch::async, [&]() { coordinator->stop(); });
+      ASSERT_TRUE(wait_until([&]() { return coordinator->status().phase == coordinator_phase_e::stopped; }));
+      actor->settle();
+      worker.release();
+      ASSERT_EQ(stopping.wait_for(real_timeout), std::future_status::ready);
+      stopping.get();
+      EXPECT_EQ(startup.get().outcome, outcome_e::stopped);
+      const auto cleanup_result = cleanup.completion.get();
+      EXPECT_TRUE(cleanup_result.outcome == outcome_e::stopped ||
+                  (cleanup_result.outcome == outcome_e::rejected && cleanup_result.reason == reject_reason_e::stopped));
+      EXPECT_EQ(mutations.load(), 0);
+      EXPECT_FALSE(coordinator->status().fence_active);
+      EXPECT_FALSE(coordinator->status().external_recovery_pending);
+      coordinator.reset();
+      actor->settle();
+      EXPECT_EQ(mutations.load(), 0);
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, StartupSuspensionRequiresOwnStartupAuthorityOnce) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    coordinator_t other { make_options(clock) };
+    ASSERT_TRUE(start_ready(other).completed());
+    std::atomic_int continuations {};
+    const auto startup = coordinator.start([&](const auto &capability, const auto &) {
+      std::thread outsider { [&]() {
+        EXPECT_THROW(coordinator.suspend_startup_for_external_recovery(capability, counting(continuations)), capability_error_t);
+      } };
+      outsider.join();
+      EXPECT_THROW(other.suspend_startup_for_external_recovery(capability, counting(continuations)), std::logic_error);
+      EXPECT_THROW(coordinator.suspend_startup_for_external_recovery(capability, {}), std::invalid_argument);
+      EXPECT_FALSE(coordinator.status().fence_active);
+      EXPECT_FALSE(coordinator.status().external_recovery_pending);
+      auto actor = coordinator.suspend_startup_for_external_recovery(capability, [&](const auto &resumed, const auto &) {
+        ++continuations;
+        EXPECT_THROW(coordinator.suspend_startup_for_external_recovery(resumed, counting(continuations)), std::logic_error);
+      });
+      EXPECT_THROW(coordinator.suspend_startup_for_external_recovery(capability, counting(continuations)), capability_error_t);
+      actor->settle();
+    });
+    ASSERT_EQ(startup.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_TRUE(startup.get().completed());
+    EXPECT_EQ(continuations.load(), 1);
+    for (const auto kind : { command_kind_e::reconfigure, command_kind_e::stream_restore }) {
+      EXPECT_TRUE(coordinator.run(kind, [&](const auto &capability, const auto &) {
+        EXPECT_THROW(coordinator.suspend_startup_for_external_recovery(capability, counting(continuations)), capability_error_t);
+      }).completed());
+    }
+    EXPECT_FALSE(other.status().fence_active);
+    EXPECT_FALSE(other.status().external_recovery_pending);
+  }
+
+  TEST(DisplayTopologyCoordinator, SuspendedStartupMergesContinuationFailure) {
+    for (const bool body_throws : { false, true }) {
+      SCOPED_TRACE(body_throws);
+      fake_clock_t clock;
+      coordinator_t coordinator { make_options(clock) };
+      std::shared_ptr<external_recovery_t> actor;
+      std::promise<void> suspended;
+      const auto startup = coordinator.start([&](const auto &capability, const auto &) {
+        actor = coordinator.suspend_startup_for_external_recovery(capability, [](const auto &, const auto &) {
+          throw std::logic_error { "continuation" };
+        });
+        suspended.set_value();
+        if (body_throws) {
+          throw std::runtime_error { "original" };
+        }
+      });
+      ASSERT_EQ(suspended.get_future().wait_for(real_timeout), std::future_status::ready);
+      actor->settle();
+      const auto result = startup.get();
+      EXPECT_EQ(result.outcome, outcome_e::failed);
+      ASSERT_TRUE(result.exception);
+      if (body_throws) {
+        EXPECT_THROW(std::rethrow_exception(result.exception), std::runtime_error);
+      }
+      else {
+        EXPECT_THROW(std::rethrow_exception(result.exception), std::logic_error);
+      }
+      const auto status = coordinator.status();
+      EXPECT_EQ(status.phase, coordinator_phase_e::running);
+      EXPECT_TRUE(status.native.in_conflict);
+      EXPECT_FALSE(status.external_recovery_pending);
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, ConcurrentSettlementResumesStartupOnce) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    std::atomic_int continuations {};
+    std::shared_ptr<external_recovery_t> actor;
+    std::promise<void> suspended;
+    const auto startup = coordinator.start([&](const auto &capability, const auto &) {
+      actor = coordinator.suspend_startup_for_external_recovery(capability, counting(continuations));
+      suspended.set_value();
+    });
+    ASSERT_EQ(suspended.get_future().wait_for(real_timeout), std::future_status::ready);
+    std::vector<std::thread> monitors;
+    for (int i = 0; i < 8; ++i) {
+      monitors.emplace_back([actor]() { actor->settle(); });
+    }
+    for (auto &monitor : monitors) {
+      monitor.join();
+    }
+    EXPECT_TRUE(startup.get().completed());
+    actor->settle();
+    EXPECT_TRUE(coordinator.run(command_kind_e::reconfigure, [](const auto &, const auto &) {}).completed());
+    EXPECT_EQ(continuations.load(), 1);
+    EXPECT_FALSE(coordinator.status().fence_active);
+  }
+
+  TEST(DisplayTopologyCoordinator, SettlementRacingDestructionIsSafe) {
+    for (int i = 0; i < 100; ++i) {
+      fake_clock_t clock;
+      std::atomic_int continuations {};
+      auto coordinator = std::make_unique<coordinator_t>(make_options(clock));
+      std::shared_ptr<external_recovery_t> actor;
+      std::promise<void> suspended;
+      const auto startup = coordinator->start([&](const auto &capability, const auto &) {
+        actor = coordinator->suspend_startup_for_external_recovery(capability, counting(continuations));
+        suspended.set_value();
+      });
+      ASSERT_EQ(suspended.get_future().wait_for(real_timeout), std::future_status::ready);
+      std::atomic_bool go {};
+      std::thread monitor { [&go, actor]() {
+        while (!go.load()) {}
+        for (int n = 0; n < 50; ++n) {
+          actor->settle();
+        }
+      } };
+      go.store(true);
+      coordinator.reset();
+      monitor.join();
+      actor->settle();
+      EXPECT_LE(continuations.load(), 1);
+      EXPECT_EQ(startup.wait_for(0ms), std::future_status::ready);
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, StaleRecoveryHandleCannotSettleReplacementCoordinator) {
+    fake_clock_t clock;
+    std::atomic_int stale_continuations {};
+    std::atomic_int continuations {};
+    std::optional<coordinator_t> coordinator;
+    auto suspend = [&](std::atomic_int &counter) {
+      auto actor = std::make_shared<std::shared_ptr<external_recovery_t>>();
+      auto suspended = std::make_shared<std::promise<void>>();
+      auto ready = suspended->get_future();
+      auto *owner = &*coordinator;
+      auto startup = owner->start([owner, actor, suspended, &counter](const auto &capability, const auto &) {
+        *actor = owner->suspend_startup_for_external_recovery(capability, counting(counter));
+        suspended->set_value();
+      });
+      EXPECT_EQ(ready.wait_for(real_timeout), std::future_status::ready);
+      return std::pair { *actor, startup };
+    };
+    coordinator.emplace(make_options(clock));
+    const auto *first = &*coordinator;
+    const auto [stale, stale_startup] = suspend(stale_continuations);
+    coordinator.reset();
+    EXPECT_EQ(stale_startup.get().outcome, outcome_e::stopped);
+    // Same storage: a dangling owner pointer would now resume the replacement's startup.
+    coordinator.emplace(make_options(clock));
+    ASSERT_EQ(&*coordinator, first);
+    const auto [actor, startup] = suspend(continuations);
+    stale->settle();
+    EXPECT_EQ(startup.wait_for(50ms), std::future_status::timeout);
+    EXPECT_TRUE(coordinator->status().external_recovery_pending);
+    EXPECT_EQ(continuations.load(), 0);
+    actor->settle();
+    ASSERT_EQ(startup.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_TRUE(startup.get().completed());
+    EXPECT_EQ(continuations.load(), 1);
+    EXPECT_EQ(stale_continuations.load(), 0);
+  }
+
+  TEST(DisplayTopologyCoordinator, StopRejectsReleasedButUnstartedContinuationAndCleanup) {
+    fake_clock_t clock;
+    std::atomic_int mutations {};
+    coordinator_t coordinator { make_options(clock) };
+    std::shared_ptr<external_recovery_t> actor;
+    std::shared_ptr<const probe_fence_t> probe;
+    std::promise<void> suspended;
+    const auto startup = coordinator.start([&](const auto &capability, const auto &) {
+      actor = coordinator.suspend_startup_for_external_recovery(capability, counting(mutations));
+      probe = coordinator.hold_probe_fence();
+      suspended.set_value();
+    });
+    ASSERT_EQ(suspended.get_future().wait_for(real_timeout), std::future_status::ready);
+    coordinator.begin_draining();
+    const auto cleanup = coordinator.post_tracked(command_kind_e::shutdown_restore, counting(mutations));
+    ASSERT_EQ(cleanup.reason, reject_reason_e::none);
+    const auto before = coordinator.status().submitted_commands;
+    // Continuation goes first and the exclusion is released; only the probe holds dispatch.
+    actor->settle();
+    ASSERT_TRUE(wait_until([&]() { return coordinator.status().submitted_commands == before + 1; }));
+    EXPECT_EQ(startup.wait_for(50ms), std::future_status::timeout);
+    EXPECT_EQ(mutations.load(), 0);
+    auto stopping = std::async(std::launch::async, [&]() { coordinator.stop(); });
+    ASSERT_TRUE(wait_until([&]() { return coordinator.status().phase == coordinator_phase_e::stopped; }));
+    probe.reset();
+    ASSERT_EQ(stopping.wait_for(real_timeout), std::future_status::ready);
+    stopping.get();
+    EXPECT_EQ(startup.get().outcome, outcome_e::stopped);
+    static_cast<void>(cleanup.completion.get());
+    EXPECT_EQ(mutations.load(), 0);
+  }
+
   TEST(DisplayTopologyCoordinator, ProbeFenceQueuesEveryCleanupAndRejectsAdmission) {
     fake_clock_t clock;
     coordinator_t coordinator { make_options(clock) };
