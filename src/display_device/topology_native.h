@@ -10,9 +10,9 @@
  *
  * Field replay (restore managed fields that still hold the values this host applied)
  * is implemented generically so recovery honours journals with field steps, but the
- * production platform refuses field writes in P1.
+ * P1 Windows implementation must refuse field writes.
  *
- * Every entry point takes the worker-only `mutation_capability_t`.
+ * Every mutating entry point takes the worker-only `mutation_capability_t`.
  */
 #pragma once
 
@@ -70,15 +70,27 @@ namespace display_device::topology {
      * success means it accepted, even if the head is not listed yet.
      */
     virtual result_t<void>
-    create_head(const head_guid_t &intent) = 0;
+    create_head(const mutation_capability_t &capability, const head_guid_t &intent) final;
 
     /** Remove every virtual head, then wait (bounded) for them to be unlisted. The driver offers no per-head removal. */
     virtual result_t<void>
-    remove_all_heads() = 0;
+    remove_all_heads(const mutation_capability_t &capability) final;
 
     /** Write the set fields of one display; unset fields stay untouched. */
     virtual result_t<void>
-    apply_fields(const os_display_id_t &display, const managed_values_t &values) = 0;
+    apply_fields(const mutation_capability_t &capability, const os_display_id_t &display, const managed_values_t &values) final;
+
+  protected:
+    // Keep concrete hooks nonpublic and carry the capability through to raw setters.
+    // The entry guards check authority, not proof that a head belongs to this request.
+    virtual result_t<void>
+    do_create_head(const mutation_capability_t &capability, const head_guid_t &intent) = 0;
+
+    virtual result_t<void>
+    do_remove_all_heads(const mutation_capability_t &capability) = 0;
+
+    virtual result_t<void>
+    do_apply_fields(const mutation_capability_t &capability, const os_display_id_t &display, const managed_values_t &values) = 0;
   };
 
   enum class native_verdict_e : std::uint8_t {
@@ -153,16 +165,16 @@ namespace display_device::topology {
 
   private:
     native_outcome_t
-    reconcile(const journal_record_t &record, bool same_run);
+    reconcile(const mutation_capability_t &capability, const journal_record_t &record, bool same_run);
 
     native_outcome_t
     prepare_physical(const os_display_id_t &display);
 
     native_outcome_t
-    prepare_virtual();
+    prepare_virtual(const mutation_capability_t &capability);
 
     native_outcome_t
-    roll_back_head(const journal_record_t &record, const std::string &why);
+    roll_back_head(const mutation_capability_t &capability, const journal_record_t &record, const std::string &why);
 
     /** In conflict: the journal is kept. */
     native_outcome_t

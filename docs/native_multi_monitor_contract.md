@@ -333,6 +333,18 @@ strict one-monitor profile parsing and ownership-aware recovery using fake
 platform operations. Native replay preserves unmanaged fields and fails closed
 on unknown ownership. These implementations are still unwired.
 
+Native platform mutation entries now require the original live capability and
+are final, checked wrappers over nonpublic backend hooks. Creation uses native
+preparation authority; same-command failed-create rollback remains possible.
+Startup can replay fields, but cannot create or remove heads; P1 preparation
+cannot write host fields. Executor helpers preserve the same capability through
+creation, rollback, restore and recovery, without changing ownership proofs.
+Four fake-backed fixtures cover all 17 command kinds, three mutation surfaces
+and both modes, off-worker rejection, absence of ungated public overloads and
+actual executor forwarding. They fail against the former ungated interface and
+under 13 deliberate faults; all 85 native-suite cases pass after restoration.
+The concrete Windows native backend and shared raw-setter gates remain pending.
+
 Posted commands now offer individual completion receipts, including eager
 rejection, worker-side rejection, failure and shutdown cancellation before a
 body starts. Retry timers can associate receipts with their own generations;

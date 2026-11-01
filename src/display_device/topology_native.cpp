@@ -318,6 +318,26 @@ namespace display_device::topology {
       os_display_id_t { monitor.at("display").get<std::string>() } } };
   }
 
+  result_t<void>
+  native_platform_t::create_head(const mutation_capability_t &capability, const head_guid_t &intent) {
+    capability.require(operation_e::native_apply);
+    return do_create_head(capability, intent);
+  }
+
+  result_t<void>
+  native_platform_t::remove_all_heads(const mutation_capability_t &capability) {
+    // Preparation can roll back its own failed create without acquiring a new capability.
+    capability.require(capability.kind() == command_kind_e::launch_prepare ? operation_e::native_apply : operation_e::native_restore);
+    return do_remove_all_heads(capability);
+  }
+
+  result_t<void>
+  native_platform_t::apply_fields(const mutation_capability_t &capability, const os_display_id_t &display, const managed_values_t &values) {
+    // P1 field writes are replay only; preparing a native profile does not change host fields.
+    capability.require(capability.kind() == command_kind_e::startup_recovery ? operation_e::native_recover : operation_e::native_restore);
+    return do_apply_fields(capability, display, values);
+  }
+
   native_executor_t::native_executor_t(journal_store_t &store, native_platform_t &platform, native_executor_options_t options):
       store_(store),
       platform_(platform),
@@ -351,7 +371,7 @@ namespace display_device::topology {
       }
       else {
         // Nothing on the host is provably ours after a restart, so nothing is removed.
-        reconcile(*loaded.record, false);
+        reconcile(capability, *loaded.record, false);
       }
     }
     catch (const std::exception &error) {
@@ -370,7 +390,7 @@ namespace display_device::topology {
       if (store_.load().present()) {
         return conflict("A native journal is still present; it must be reconciled or reset first");
       }
-      return profile.source == native_profile_t::source_e::virtual_head ? prepare_virtual() :
+      return profile.source == native_profile_t::source_e::virtual_head ? prepare_virtual(capability) :
                                                                           prepare_physical(profile.display);
     }
     catch (const std::exception &error) {
@@ -399,7 +419,7 @@ namespace display_device::topology {
   }
 
   native_outcome_t
-  native_executor_t::prepare_virtual() {
+  native_executor_t::prepare_virtual(const mutation_capability_t &capability) {
     const auto baseline = platform_.inventory();
     if (!baseline.available) {
       return refused("The display inventory is unavailable");
@@ -443,7 +463,7 @@ namespace display_device::topology {
         return clear_journal(refusal("The native journal could not be saved: " + saved.error().detail));
       }
 
-      const auto created = platform_.create_head(intent);
+      const auto created = platform_.create_head(capability, intent);
       const auto after = platform_.inventory();
       if (!after.available) {
         return unresolved("The display inventory is unavailable after asking for a virtual display");
@@ -469,10 +489,10 @@ namespace display_device::topology {
 
       const auto &head = *heads.front();
       if (!created) {
-        return roll_back_head(record, "The driver reported an error but a virtual display appeared: " + created.error().detail);
+        return roll_back_head(capability, record, "The driver reported an error but a virtual display appeared: " + created.error().detail);
       }
       if (unmanaged_signature(platform_, after, record) != expected) {
-        return roll_back_head(record, "Creating the virtual display changed other displays");
+        return roll_back_head(capability, record, "Creating the virtual display changed other displays");
       }
       auto &step = record.steps.back();
       step.state = journal_step_state_e::observed;
@@ -481,7 +501,7 @@ namespace display_device::topology {
       record.owned_heads.push_back({ head_identity_t { options_.driver, intent, head_incarnation_t { 1 } }, owner_,
         head.adapter.value_or(adapter_luid_t {}), 0 });
       if (const auto saved = store_.save(record); !saved) {
-        return roll_back_head(record, "The native journal could not record the new virtual display: " + saved.error().detail);
+        return roll_back_head(capability, record, "The native journal could not record the new virtual display: " + saved.error().detail);
       }
       created_in_this_run_ = record.transaction;
       health_ = { true, false, {} };
@@ -491,10 +511,10 @@ namespace display_device::topology {
   }
 
   native_outcome_t
-  native_executor_t::roll_back_head(const journal_record_t &record, const std::string &why) {
+  native_executor_t::roll_back_head(const mutation_capability_t &capability, const journal_record_t &record, const std::string &why) {
     // Same-run proof: no virtual display existed before, exactly one exists now, and
     // the coordinator serializes every other virtual display operation.
-    if (const auto removed = platform_.remove_all_heads(); !removed) {
+    if (const auto removed = platform_.remove_all_heads(capability); !removed) {
       return conflict(why + "; removing it failed: " + removed.error().detail);
     }
     const auto after = platform_.inventory();
@@ -521,7 +541,7 @@ namespace display_device::topology {
         return conflict("The native journal is " + std::string { to_string(loaded.status) } + ": " + loaded.detail);
       }
       const auto &record = *loaded.record;
-      return reconcile(record, record.owner == owner_ && created_in_this_run_ == record.transaction);
+      return reconcile(capability, record, record.owner == owner_ && created_in_this_run_ == record.transaction);
     }
     catch (const std::exception &error) {
       return after_exception(std::string { "Native restore failed: " } + error.what());
@@ -554,7 +574,7 @@ namespace display_device::topology {
   }
 
   native_outcome_t
-  native_executor_t::reconcile(const journal_record_t &record, bool same_run) {
+  native_executor_t::reconcile(const mutation_capability_t &capability, const journal_record_t &record, bool same_run) {
     if (const auto problem = semantic_problem(record)) {
       return conflict("The native journal cannot be reconciled: " + *problem);
     }
@@ -615,7 +635,7 @@ namespace display_device::topology {
     }
 
     for (const auto &[id, values] : restores) {
-      if (const auto applied = platform_.apply_fields(id, values); !applied) {
+      if (const auto applied = platform_.apply_fields(capability, id, values); !applied) {
         return conflict("Restoring display " + id.value + " failed: " + applied.error().detail);
       }
     }
@@ -628,7 +648,7 @@ namespace display_device::topology {
           return conflict("The virtual display could not be proven to be this host's after restoring fields, so it is left in place");
         }
       }
-      if (const auto removed = platform_.remove_all_heads(); !removed) {
+      if (const auto removed = platform_.remove_all_heads(capability); !removed) {
         return conflict("Removing the virtual display failed: " + removed.error().detail);
       }
     }

@@ -13,6 +13,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -275,8 +276,10 @@ namespace {
       return display.info.friendly_name == "ZakoVDD";
     }
 
+  private:
     dt::result_t<void>
-    create_head(const dt::head_guid_t &intent) override {
+    do_create_head(const dt::mutation_capability_t &capability, const dt::head_guid_t &intent) override {
+      if (on_mutation) on_mutation(&capability);
       log_.add("create_head");
       intents.push_back(intent);
       if (on_create) {
@@ -287,7 +290,8 @@ namespace {
     }
 
     dt::result_t<void>
-    remove_all_heads() override {
+    do_remove_all_heads(const dt::mutation_capability_t &capability) override {
+      if (on_mutation) on_mutation(&capability);
       log_.add("remove_all_heads");
       if (on_remove) {
         return on_remove();
@@ -297,7 +301,8 @@ namespace {
     }
 
     dt::result_t<void>
-    apply_fields(const dt::os_display_id_t &display, const dt::managed_values_t &values) override {
+    do_apply_fields(const dt::mutation_capability_t &capability, const dt::os_display_id_t &display, const dt::managed_values_t &values) override {
+      if (on_mutation) on_mutation(&capability);
       log_.add("apply_fields:" + display.value);
       applied.emplace_back(display, values);
       if (apply_error) {
@@ -319,6 +324,7 @@ namespace {
       return {};
     }
 
+  public:
     std::string
     add_head() {
       auto name = "vdd-" + std::to_string(++created);
@@ -347,6 +353,7 @@ namespace {
     /** Replaces the default removal (every head goes, success). */
     std::function<dt::result_t<void>()> on_remove;
     std::function<void()> after_apply;
+    std::function<void(const dt::mutation_capability_t *)> on_mutation;
     /** Edits one snapshot; receives the 1-based read number. */
     std::function<void(int, dt::inventory_t &)> tamper;
     bool throw_on_inventory {};
@@ -357,10 +364,16 @@ namespace {
     event_log_t &log_;
   };
 
-  /** Run `body` on the worker with a real capability of `kind`, minted by a legacy-mode coordinator. */
+  /** Run `body` on the worker with a real capability of `kind`. */
   void
-  with_capability(dt::command_kind_e kind, const std::function<void(const dt::mutation_capability_t &)> &body) {
-    dt::coordinator_t coordinator;
+  with_capability(dt::command_kind_e kind, const std::function<void(const dt::mutation_capability_t &)> &body, bool managed_mode = false) {
+    dt::coordinator_options_t options;
+    options.managed_mode = managed_mode;
+    if (managed_mode) {
+      options.probes.active_streams = [] { return std::size_t {}; };
+      options.native_restore = [](const auto &, const auto &) {};
+    }
+    dt::coordinator_t coordinator { options };
     bool ran = false;
     std::exception_ptr thrown;
     const dt::command_body_t wrapped = [&](const dt::mutation_capability_t &capability, const dt::command_context_t &) {
@@ -398,6 +411,52 @@ namespace {
       std::rethrow_exception(thrown);
     }
   }
+
+  dt::result_t<void>
+  platform_create(dt::native_platform_t &platform, const dt::mutation_capability_t &capability) {
+    return platform.create_head(capability, id<dt::head_guid_t>(0x71));
+  }
+
+  dt::result_t<void>
+  platform_remove(dt::native_platform_t &platform, const dt::mutation_capability_t &capability) {
+    return platform.remove_all_heads(capability);
+  }
+
+  dt::result_t<void>
+  platform_apply(dt::native_platform_t &platform, const dt::mutation_capability_t &capability) {
+    return platform.apply_fields(capability, dt::os_display_id_t { "os-B" }, dt::managed_values_t {});
+  }
+
+  template <class Platform>
+  concept ungated_create = requires(Platform &platform, dt::head_guid_t intent) {
+    platform.create_head(intent);
+  };
+
+  template <class Platform>
+  concept ungated_remove = requires(Platform &platform) {
+    platform.remove_all_heads();
+  };
+
+  template <class Platform>
+  concept ungated_apply = requires(Platform &platform, dt::os_display_id_t display, dt::managed_values_t values) {
+    platform.apply_fields(display, values);
+  };
+
+  template <class Platform>
+  concept public_create_hook = requires(Platform &platform, const dt::mutation_capability_t &capability, dt::head_guid_t intent) {
+    platform.do_create_head(capability, intent);
+  };
+
+  template <class Platform>
+  concept public_remove_hook = requires(Platform &platform, const dt::mutation_capability_t &capability) {
+    platform.do_remove_all_heads(capability);
+  };
+
+  template <class Platform>
+  concept public_apply_hook = requires(Platform &platform, const dt::mutation_capability_t &capability,
+    dt::os_display_id_t display, dt::managed_values_t values) {
+    platform.do_apply_fields(capability, display, values);
+  };
 
   dt::native_health_t
   recover_with(dt::native_executor_t &executor) {
@@ -629,6 +688,131 @@ TEST_F(NativeExecutor, EveryEntryPointRequiresItsOwnCapability) {
   EXPECT_EQ(platform.reads, 0);
   EXPECT_TRUE(log.events.empty());
   EXPECT_TRUE(store.bytes.has_value());
+}
+
+TEST_F(NativeExecutor, PlatformBoundaryChecksEveryCommandKindBeforeEnteringTheBackend) {
+  using enum dt::command_kind_e;
+  const std::vector kinds { startup_recovery, launch_prepare, launch_failed_restore, reconfigure,
+    stream_restore, shutdown_restore, shutdown_vdd_destroy, rotate, scale, vdd_toggle,
+    vdd_toggle_followup, vdd_create, vdd_destroy, reset_persistence, legacy_retry_tick,
+    legacy_unlock_restore, native_restore };
+  dt::native_platform_t &boundary = platform;
+  platform.on_create = [](std::size_t) { return failure("create refused"); };
+  platform.on_remove = [] { return failure("remove refused"); };
+  platform.apply_error = true;
+  for (const bool managed_mode : { false, true }) {
+    for (const auto kind : kinds) {
+      with_capability(kind, [&](const auto &capability) {
+        SCOPED_TRACE(std::string { dt::to_string(kind) } + (managed_mode ? "/managed" : "/legacy"));
+        EXPECT_EQ(capability.managed_mode(), managed_mode);
+        const bool restore = kind == launch_failed_restore || kind == stream_restore ||
+                             kind == shutdown_restore || kind == native_restore;
+        const auto check = [&](bool allowed, const auto &invoke, const char *detail) {
+          SCOPED_TRACE(detail);
+          const auto before = log.host_writes();
+          if (allowed) {
+            const auto outcome = invoke();
+            ASSERT_FALSE(outcome);
+            EXPECT_EQ(outcome.error().detail, detail);
+          }
+          else {
+            EXPECT_THROW((void) invoke(), dt::capability_error_t);
+          }
+          EXPECT_EQ(log.host_writes(), before + (allowed ? 1 : 0));
+        };
+        check(kind == launch_prepare, [&] { return platform_create(boundary, capability); }, "create refused");
+        check(kind == launch_prepare || restore, [&] { return platform_remove(boundary, capability); }, "remove refused");
+        check(kind == startup_recovery || restore, [&] { return platform_apply(boundary, capability); }, "apply refused"); }, managed_mode);
+    }
+  }
+}
+
+TEST_F(NativeExecutor, PlatformBoundaryRejectsOffWorkerUseBeforeEnteringTheBackend) {
+  dt::native_platform_t &boundary = platform;
+  for (const auto kind : { dt::command_kind_e::launch_prepare, dt::command_kind_e::native_restore,
+         dt::command_kind_e::startup_recovery }) {
+    with_capability(kind, [&](const auto &capability) {
+      std::thread outsider([&] {
+        SCOPED_TRACE(dt::to_string(kind));
+        if (kind == dt::command_kind_e::launch_prepare) {
+          EXPECT_THROW((void) platform_create(boundary, capability), dt::capability_error_t);
+        }
+        else if (kind == dt::command_kind_e::native_restore) {
+          EXPECT_THROW((void) platform_remove(boundary, capability), dt::capability_error_t);
+        }
+        else {
+          EXPECT_THROW((void) platform_apply(boundary, capability), dt::capability_error_t);
+        }
+      });
+      outsider.join(); }, true);
+  }
+  EXPECT_EQ(log.host_writes(), 0);
+}
+
+TEST_F(NativeExecutor, PlatformBoundaryExposesNoUngatedMutationOverload) {
+  EXPECT_FALSE(ungated_create<dt::native_platform_t>);
+  EXPECT_FALSE(ungated_remove<dt::native_platform_t>);
+  EXPECT_FALSE(ungated_apply<dt::native_platform_t>);
+  EXPECT_FALSE(public_create_hook<dt::native_platform_t>);
+  EXPECT_FALSE(public_remove_hook<dt::native_platform_t>);
+  EXPECT_FALSE(public_apply_hook<dt::native_platform_t>);
+}
+
+TEST_F(NativeExecutor, PlatformCallsRetainTheOriginalCapabilityThroughRollbackAndReplay) {
+  std::size_t observed {};
+  const auto run = [&](dt::command_kind_e kind, const auto &body) {
+    with_capability(kind, [&](const auto &capability) {
+      platform.on_mutation = [&](const auto *received) {
+        SCOPED_TRACE(dt::to_string(capability.kind()));
+        EXPECT_EQ(received, &capability);
+        ++observed;
+      };
+      body(capability);
+      platform.on_mutation = {}; }, true);
+  };
+  run(dt::command_kind_e::launch_prepare, [&](const auto &capability) {
+    EXPECT_TRUE(verdict_is(executor.prepare(capability, virtual_profile()), native_verdict_e::ok));
+  });
+  run(dt::command_kind_e::native_restore, [&](const auto &capability) {
+    EXPECT_TRUE(verdict_is(executor.restore(capability), native_verdict_e::ok));
+  });
+  EXPECT_EQ(observed, 2);
+
+  platform.on_create = [&](std::size_t) {
+    platform.add_head();
+    return failure("driver refused after creation");
+  };
+  run(dt::command_kind_e::launch_prepare, [&](const auto &capability) {
+    EXPECT_TRUE(verdict_is(executor.prepare(capability, virtual_profile()), native_verdict_e::refused));
+  });
+  EXPECT_EQ(observed, 4);
+  EXPECT_EQ(platform.head_count(), 0);
+
+  platform.on_create = {};
+  store.fail_save_call = store.saves + 2;
+  run(dt::command_kind_e::launch_prepare, [&](const auto &capability) {
+    EXPECT_TRUE(verdict_is(executor.prepare(capability, virtual_profile()), native_verdict_e::refused));
+  });
+  EXPECT_EQ(observed, 6);
+  EXPECT_EQ(platform.head_count(), 0);
+  store.fail_save_call = 0;
+
+  for (const auto kind : { dt::command_kind_e::startup_recovery, dt::command_kind_e::native_restore }) {
+    const dt::managed_values_t intended { .mode = mode(2560, 1440) };
+    store.put(field_journal({ managed("os-B", intended) }, { { "os-B", step_e::attempted } }));
+    find(platform.host, "os-B").layout->mode = *intended.mode;
+    run(kind, [&](const auto &capability) {
+      if (kind == dt::command_kind_e::startup_recovery) {
+        EXPECT_TRUE(healthy(executor.recover(capability)));
+      }
+      else {
+        EXPECT_TRUE(verdict_is(executor.restore(capability), native_verdict_e::ok));
+      }
+    });
+    EXPECT_FALSE(store.bytes);
+    EXPECT_TRUE(platform.host.displays == host_inventory().displays);
+  }
+  EXPECT_EQ(observed, 8);
 }
 
 // --- Physical profile ---------------------------------------------------------------
