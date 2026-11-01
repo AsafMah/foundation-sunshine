@@ -100,6 +100,8 @@ namespace display_device::topology {
     /** Shared by the fake process and the test; outlives both. */
     struct actor_t {
       bool create_fails {};
+      /** Attempts with a lower index fail creation. */
+      int fail_first {};
       actor_wait_e ends { actor_wait_e::exited };
       std::promise<void> exit;
       std::shared_future<void> exited { exit.get_future().share() };
@@ -111,11 +113,11 @@ namespace display_device::topology {
     class process_t final: public actor_process_t {
     public:
       explicit process_t(std::shared_ptr<actor_t> actor):
-          actor_ { std::move(actor) } {}
+          actor_ { std::move(actor) }, index_ { actor_->made - 1 } {}
 
       void
       launch(std::error_code &ec) override {
-        if (actor_->create_fails) {
+        if (actor_->create_fails || index_ < actor_->fail_first) {
           ec = std::make_error_code(std::errc::no_such_file_or_directory);
           return;
         }
@@ -142,6 +144,7 @@ namespace display_device::topology {
 
     private:
       std::shared_ptr<actor_t> actor_;
+      int index_ {};
       bool started_ {};
     };
 
@@ -191,8 +194,13 @@ namespace display_device::topology {
           return std::make_shared<process_t>(actor);
         };
         result.options.spawn = spawn;
+        result.retry = retry;
+        if (deadline.count() > 0) result.options.deadline = deadline;
         return result;
       }
+
+      actor_launch_retry_t retry;
+      std::chrono::milliseconds deadline {};
 
       external_cleanup_body_t
       restore(bool result = true) {
@@ -262,6 +270,82 @@ namespace display_device::topology {
     EXPECT_EQ(f.log.events(), (std::vector<std::string> { "launch-returned", "restore", "prequeued" }));
     EXPECT_EQ(f.actor->made, 1);
     EXPECT_EQ(f.actor->launched, 0);
+    EXPECT_EQ(f.store->load().status, actor_load_status_e::absent);
+  }
+
+  TEST(AdapterRestart, RetriedCreationLaunchesUnderOneIntentAndStillRestoresFirstOnce) {
+    fixture_t f;
+    f.actor->fail_first = 2;
+    std::vector<unsigned> waits;
+    f.retry = { 3, [&waits](unsigned failed) { waits.push_back(failed); } };
+    posted_command_t prequeued;
+    const auto result = f.restart(prequeued);
+    ASSERT_EQ(result.status, adapter_restart_e::cleanup_owned) << result.detail;
+    ASSERT_TRUE(result.launch);
+    EXPECT_EQ(result.launch->status, actor_launch_e::launched);
+    EXPECT_EQ(result.launch->receipt, actor_receipt);
+    EXPECT_EQ(f.actor->made, 3);
+    EXPECT_EQ(f.actor->launched, 1);
+    EXPECT_EQ(waits, (std::vector<unsigned> { 0, 1 }));
+    const auto running = f.store->load();
+    ASSERT_TRUE(running.record);
+    EXPECT_EQ(running.record->operation, op);
+    EXPECT_EQ(running.record->receipt, actor_receipt);
+
+    f.release();
+    ASSERT_EQ(prequeued.completion.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_EQ(f.log.events(), (std::vector<std::string> { "actor", "launch-returned", "restore", "prequeued" }));
+    EXPECT_EQ(f.restores, 1);
+    EXPECT_EQ(f.store->load().status, actor_load_status_e::absent);
+  }
+
+  TEST(AdapterRestart, ExhaustedRetriesLaunchNothingAndStillRestoreFirstOnce) {
+    fixture_t f;
+    f.actor->create_fails = true;
+    unsigned waited {};
+    f.retry = { 3, [&waited](unsigned) { ++waited; } };
+    posted_command_t prequeued;
+    const auto result = f.restart(prequeued);
+    ASSERT_EQ(result.status, adapter_restart_e::cleanup_owned) << result.detail;
+    ASSERT_TRUE(result.launch);
+    EXPECT_EQ(result.launch->status, actor_launch_e::not_launched);
+    EXPECT_NE(result.launch->detail.find("attempt 3/3"), std::string::npos) << result.launch->detail;
+
+    ASSERT_EQ(prequeued.completion.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_EQ(f.log.events(), (std::vector<std::string> { "launch-returned", "restore", "prequeued" }));
+    EXPECT_EQ(f.actor->made, 3);
+    EXPECT_EQ(waited, 2u);
+    EXPECT_EQ(f.restores, 1);
+    EXPECT_EQ(f.store->load().status, actor_load_status_e::absent);
+  }
+
+  TEST(AdapterRestart, TheBackoffHoldsTheFenceAndALateCreationIsUncertainNotRetriedByTheCaller) {
+    fixture_t f;
+    f.actor->fail_first = 1;
+    f.deadline = 200ms;
+    std::promise<void> resume;
+    std::shared_future<void> resumed = resume.get_future().share();
+    f.retry = { 3, [resumed](unsigned) { resumed.wait(); } };
+    posted_command_t prequeued;
+    const auto result = f.restart(prequeued);
+    ASSERT_EQ(result.status, adapter_restart_e::cleanup_owned) << result.detail;
+    ASSERT_TRUE(result.launch);
+    EXPECT_EQ(result.launch->status, actor_launch_e::uncertain);
+
+    // Between attempts the intent is durable and everything queued stays fenced.
+    EXPECT_EQ(prequeued.completion.wait_for(200ms), std::future_status::timeout);
+    const auto between = f.store->load();
+    ASSERT_TRUE(between.record);
+    EXPECT_EQ(between.record->stage, actor_stage_e::intent);
+    EXPECT_EQ(f.restores, 0);
+
+    resume.set_value();
+    f.release();
+    ASSERT_EQ(prequeued.completion.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_EQ(f.log.events(), (std::vector<std::string> { "launch-returned", "actor", "restore", "prequeued" }));
+    EXPECT_EQ(f.actor->made, 2);
+    EXPECT_EQ(f.actor->launched, 1);
+    EXPECT_EQ(f.restores, 1);
     EXPECT_EQ(f.store->load().status, actor_load_status_e::absent);
   }
 

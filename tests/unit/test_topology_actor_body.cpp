@@ -215,6 +215,135 @@ TEST_F(ActorBody, TheFactoryRunsOncePerBodyInvocation) {
 }
 
 namespace {
+  struct retry_script_t {
+    /** One entry per attempt: whether creation succeeds. */
+    std::vector<bool> creates;
+    std::vector<std::shared_ptr<fake_process_t>> made;
+    std::vector<unsigned> waits;
+  };
+
+  actor_body_t
+  retrying_body(journal_t &journal, retry_script_t &script, unsigned attempts) {
+    return make_process_actor_body(
+      [&journal, &script]() -> std::shared_ptr<actor_process_t> {
+        auto next = std::make_shared<fake_process_t>(journal);
+        const auto index = script.made.size();
+        next->creates = index < script.creates.size() && script.creates[index];
+        if (!next->creates) next->launch_error = std::make_error_code(std::errc::no_such_file_or_directory);
+        script.made.push_back(next);
+        return next;
+      },
+      { attempts, [&journal, &script](unsigned failed) {
+         journal.events.push_back("backoff");
+         script.waits.push_back(failed);
+       } });
+  }
+}
+
+TEST_F(ActorBody, DefiniteCreationFailuresAreRetriedUpToTheBoundWithABackoffBetween) {
+  retry_script_t script { { false, false, false } };
+  const auto result = retrying_body(journal, script, 3)(context);
+  EXPECT_EQ(result.exit, actor_body_exit_e::not_launched);
+  EXPECT_EQ(script.made.size(), 3u);
+  EXPECT_EQ(script.waits, (std::vector<unsigned> { 0, 1 }));
+  EXPECT_TRUE(context.reports.empty());
+  for (const auto *attempt : { "attempt 1/3", "attempt 2/3", "attempt 3/3" }) {
+    EXPECT_NE(result.detail.find(attempt), std::string::npos) << result.detail;
+  }
+  const std::vector<std::string> expected { "retain", "launch", "backoff", "retain", "launch", "backoff", "retain", "launch" };
+  EXPECT_EQ(journal.events, expected);
+}
+
+TEST_F(ActorBody, ARetryThatCreatesIsReportedOnceAndObservedToExit) {
+  retry_script_t script { { false, true, true } };
+  const auto result = retrying_body(journal, script, 3)(context);
+  EXPECT_EQ(result.exit, actor_body_exit_e::exited);
+  EXPECT_EQ(script.made.size(), 2u);
+  EXPECT_EQ(script.waits, (std::vector<unsigned> { 0 }));
+  ASSERT_EQ(context.reports.size(), 1u);
+  EXPECT_EQ(script.made[1]->launches, 1u);
+  EXPECT_NE(result.detail.find("attempt 1/3"), std::string::npos) << result.detail;
+  // Every attempt's process stays owned by the supervisor.
+  EXPECT_EQ(context.retained.size(), 2u);
+}
+
+TEST_F(ActorBody, AProcessThatMayExistIsNeverRetried) {
+  for (const int kind : { 0, 1, 2 }) {
+    SCOPED_TRACE(kind);
+    journal.events.clear();
+    context.reports.clear();
+    context.retained.clear();
+    unsigned made {};
+    unsigned waits {};
+    auto body = make_process_actor_body(
+      [&]() -> std::shared_ptr<actor_process_t> {
+        ++made;
+        auto next = std::make_shared<fake_process_t>(journal);
+        // Created then errored, created without a receipt, or created then unobservable.
+        if (kind == 0) next->launch_error = std::make_error_code(std::errc::io_error);
+        if (kind == 1) next->receipt_value.reset();
+        if (kind == 2) next->waits = { { actor_wait_e::failed, {}, "lost" } };
+        return next;
+      },
+      { 3, [&](unsigned) { ++waits; } });
+    const auto result = body(context);
+    EXPECT_NE(result.exit, actor_body_exit_e::not_launched);
+    EXPECT_EQ(made, 1u);
+    EXPECT_EQ(waits, 0u);
+  }
+}
+
+TEST_F(ActorBody, AThrowingBackoffEndsTheRetryAsADefiniteNonLaunch) {
+  unsigned made {};
+  auto body = make_process_actor_body(
+    [&]() -> std::shared_ptr<actor_process_t> {
+      ++made;
+      auto next = std::make_shared<fake_process_t>(journal);
+      next->creates = false;
+      return next;
+    },
+    { 3, [](unsigned) { throw std::runtime_error("sleep failed"); } });
+  const auto result = body(context);
+  EXPECT_EQ(result.exit, actor_body_exit_e::not_launched);
+  EXPECT_EQ(made, 1u);
+  EXPECT_NE(result.detail.find("sleep failed"), std::string::npos) << result.detail;
+}
+
+TEST_F(ActorBody, EveryKindOfDefiniteNonCreationIsRetried) {
+  for (const int kind : { 0, 1, 2 }) {
+    SCOPED_TRACE(kind);
+    context.reports.clear();
+    context.retained.clear();
+    unsigned made {};
+    auto body = make_process_actor_body(
+      [&]() -> std::shared_ptr<actor_process_t> {
+        if (made++ == 0) {
+          // A null factory result, a throwing factory, or a launch that throws before creation.
+          if (kind == 0) return {};
+          if (kind == 1) throw std::runtime_error("factory threw");
+          auto refused = std::make_shared<fake_process_t>(journal);
+          refused->creates = false;
+          refused->launch_throws = true;
+          return refused;
+        }
+        return std::make_shared<fake_process_t>(journal);
+      },
+      { 3, [](unsigned) {} });
+    const auto result = body(context);
+    EXPECT_EQ(result.exit, actor_body_exit_e::exited) << result.detail;
+    EXPECT_EQ(made, 2u);
+    EXPECT_EQ(context.reports.size(), 1u);
+  }
+}
+
+TEST_F(ActorBody, ZeroAttemptsStillTriesOnce) {
+  retry_script_t script { { false } };
+  EXPECT_EQ(retrying_body(journal, script, 0)(context).exit, actor_body_exit_e::not_launched);
+  EXPECT_EQ(script.made.size(), 1u);
+  EXPECT_TRUE(script.waits.empty());
+}
+
+namespace {
   class memory_store_t final: public actor_record_store_t {
   public:
     actor_load_t

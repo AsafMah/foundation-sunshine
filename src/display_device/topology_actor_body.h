@@ -65,8 +65,20 @@ namespace display_device::topology {
 
   using actor_process_factory_t = std::function<std::shared_ptr<actor_process_t>()>;
 
-  /** `make` runs on the body thread; a null result is a definite non-launch. */
+  /**
+   * Bounded retry of a creation that definitely failed. Every attempt runs inside
+   * the same body, so under the one durable intent and the held exclusion. Once a
+   * process may exist (`started()`), the result is final and never retried.
+   */
+  struct actor_launch_retry_t {
+    /** Total creation attempts; values below one mean one. */
+    unsigned attempts { 1 };
+    /** Runs between attempts with the zero-based index of the attempt that failed. */
+    std::function<void(unsigned)> wait;
+  };
+
+  /** `make` runs on the body thread, once per attempt; a null result is a definite non-launch. */
   actor_body_t
-  make_process_actor_body(actor_process_factory_t make);
+  make_process_actor_body(actor_process_factory_t make, actor_launch_retry_t retry = {});
 
 }  // namespace display_device::topology

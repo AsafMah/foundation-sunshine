@@ -1,6 +1,8 @@
 #include "topology_actor_body.h"
 
+#include <algorithm>
 #include <exception>
+#include <string>
 #include <utility>
 
 namespace display_device::topology {
@@ -67,9 +69,27 @@ namespace display_device::topology {
   }  // namespace
 
   actor_body_t
-  make_process_actor_body(actor_process_factory_t make) {
-    return [make = std::move(make)](actor_body_context_t &context) {
-      return run_process(context, make);
+  make_process_actor_body(actor_process_factory_t make, actor_launch_retry_t retry) {
+    return [make = std::move(make), retry = std::move(retry)](actor_body_context_t &context) {
+      const unsigned attempts = std::max(retry.attempts, 1u);
+      if (attempts == 1) return run_process(context, make);
+      std::string history;
+      for (unsigned attempt = 0;; ++attempt) {
+        auto result = run_process(context, make);
+        if (result.exit != actor_body_exit_e::not_launched) {
+          if (!history.empty()) result.detail = history + "; " + result.detail;
+          return result;
+        }
+        if (!history.empty()) history += "; ";
+        history += "attempt " + std::to_string(attempt + 1) + '/' + std::to_string(attempts) + ": " + result.detail;
+        if (attempt + 1 == attempts) return actor_body_result_t { actor_body_exit_e::not_launched, history };
+        try {
+          if (retry.wait) retry.wait(attempt);
+        }
+        catch (...) {
+          return actor_body_result_t { actor_body_exit_e::not_launched, history + "; backoff: " + exception_detail(std::current_exception()) };
+        }
+      }
     };
   }
 

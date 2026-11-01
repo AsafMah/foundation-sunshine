@@ -2,8 +2,10 @@
  * @file src/display_device/topology_adapter_restart.h
  * @brief Last-resort adapter restart run as one supervised external actor.
  *
- * The restart is launched once. It is never retried, because a launch whose
- * creation is uncertain may already be running. The caller's restoration is
+ * The restart runs as one actor under one durable intent. Inside it, a creation
+ * that definitely failed is retried up to `retry.attempts` times, matching the
+ * legacy bounded retry. Once a process may exist the result is final, because a
+ * launch whose creation is uncertain may already be running. The caller's restoration is
  * not run inline. It is handed to the coordinator, which runs it ahead of all
  * pending work only after the restart has durably settled. Until then the
  * coordinator stays fenced.
@@ -28,6 +30,8 @@ namespace display_device::topology {
     std::optional<std::string> boot;
     /** Runs on the supervisor's body thread. */
     actor_process_factory_t process;
+    /** Bounded retry of definite creation failures, inside the one supervised actor. */
+    actor_launch_retry_t retry;
     /** `cleanup_sink` is replaced. */
     actor_supervisor_options_t options;
   };

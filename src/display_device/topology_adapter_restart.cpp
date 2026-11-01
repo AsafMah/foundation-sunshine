@@ -72,7 +72,7 @@ namespace display_device::topology {
     auto options = std::move(plan.options);
     options.cleanup_sink = sink;
     auto started = actor_supervisor_t::start(plan.store, std::move(*intent), relay->exclusion(), publish,
-      make_process_actor_body(std::move(plan.process)), std::move(options));
+      make_process_actor_body(std::move(plan.process), std::move(plan.retry)), std::move(options));
     if (!started) {
       return restore_without_actor(*obligation, std::move(restore), started.error().detail);
     }
