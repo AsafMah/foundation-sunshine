@@ -1112,7 +1112,7 @@ TEST_F(NativeExecutor, ADisplayThatDisturbedOtherDisplaysIsRolledBack) {
   EXPECT_FALSE(store.bytes);
 }
 
-TEST_F(NativeExecutor, ARollbackThatLeavesOtherDisplaysChangedIsKeptUntilTheyReturn) {
+TEST_F(NativeExecutor, UnpersistedRollbackDoesNotProveAnAttemptIsSettled) {
   platform.on_create = [&](std::size_t) -> dt::result_t<void> {
     platform.add_head();
     find(platform.host, "os-B").info.device_state = state_e::inactive;
@@ -1124,13 +1124,16 @@ TEST_F(NativeExecutor, ARollbackThatLeavesOtherDisplaysChangedIsKeptUntilTheyRet
   EXPECT_EQ(platform.head_count(), 0u);
   EXPECT_TRUE(store.bytes);
 
-  // Nothing is left to remove, but the journal stays while other displays differ.
+  // The durable image still says attempted; it cannot prove that rollback completed.
   EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
   EXPECT_TRUE(store.bytes);
   find(platform.host, "os-B").info.device_state = state_e::active;
-  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
+  EXPECT_TRUE(store.bytes);
+  EXPECT_TRUE(healthy(reset_with(executor)));
   EXPECT_FALSE(store.bytes);
   EXPECT_TRUE(healthy(executor.health()));
+  EXPECT_EQ(log.host_writes(), 2u);
 }
 
 TEST_F(NativeExecutor, AFailedOrUnconfirmedRollbackIsInConflict) {
@@ -1425,9 +1428,74 @@ TEST_F(NativeExecutor, AnUnresolvedMarkerThatCannotBeSavedIsReported) {
   EXPECT_TRUE(mentions(outcome.reason, "accepted the request"));
   EXPECT_TRUE(mentions(outcome.reason, "could not record it: disk full"));
   EXPECT_TRUE(in_conflict(executor.health()));
+  const auto record = store.record();
+  ASSERT_TRUE(record);
+  ASSERT_EQ(record->steps.size(), 1u);
+  EXPECT_EQ(record->steps.front().state, step_e::attempted);
+  const auto bytes = store.bytes;
+  const auto reads = platform.reads;
+  auto restarted = make_executor();
+  EXPECT_TRUE(in_conflict(recover_with(restarted)));
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
+  EXPECT_TRUE(verdict_is(restore_with(restarted), native_verdict_e::conflict));
+  EXPECT_TRUE(verdict_is(prepare_with(restarted, physical_profile("os-B")), native_verdict_e::conflict));
+  EXPECT_TRUE(verdict_is(prepare_with(restarted, virtual_profile()), native_verdict_e::conflict));
+  EXPECT_EQ(store.bytes, bytes);
+  EXPECT_EQ(platform.reads, reads);
+  EXPECT_EQ(log.host_writes(), 1u);
+  EXPECT_FALSE(log.contains("clear"));
+
+  platform.add_head();
+  EXPECT_TRUE(in_conflict(recover_with(restarted)));
+  EXPECT_TRUE(verdict_is(restore_with(restarted), native_verdict_e::conflict));
+  EXPECT_EQ(platform.head_count(), 1u);
+  EXPECT_EQ(store.bytes, bytes);
+  EXPECT_EQ(log.host_writes(), 1u);
+  EXPECT_TRUE(healthy(reset_with(restarted)));
+  EXPECT_FALSE(store.bytes);
+  EXPECT_EQ(platform.head_count(), 1u);
+  EXPECT_EQ(log.host_writes(), 1u);
 }
 
 // --- Startup recovery ---------------------------------------------------------------
+
+TEST_F(NativeExecutor, RecoveryKeepsUnconfirmedCreateEvenWhenNoHeadIsListed) {
+  store.put(head_journal(step_e::attempted));
+  const auto bytes = store.bytes;
+  const auto health = recover_with(executor);
+  EXPECT_TRUE(in_conflict(health));
+  EXPECT_TRUE(mentions(health.reason, "unresolved"));
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
+  EXPECT_EQ(store.bytes, bytes);
+  EXPECT_EQ(platform.reads, 0);
+  EXPECT_TRUE(log.events.empty());
+
+  // A crash before dispatch and a crash after acceptance have the same durable image.
+  platform.add_head();
+  EXPECT_TRUE(in_conflict(recover_with(executor)));
+  EXPECT_EQ(platform.head_count(), 1u);
+  EXPECT_EQ(store.bytes, bytes);
+  EXPECT_TRUE(log.events.empty());
+  EXPECT_TRUE(healthy(reset_with(executor)));
+  EXPECT_FALSE(store.bytes);
+  EXPECT_EQ(log.host_writes(), 0u);
+}
+
+TEST_F(NativeExecutor, UnconfirmedCreateAlsoBlocksOtherwiseRestorableFields) {
+  auto record = field_journal({ managed("os-B", moved) }, { { "os-B", step_e::attempted } });
+  auto create = head_journal(step_e::attempted).steps.front();
+  create.sequence = 2;
+  record.steps.push_back(create);
+  store.put(record);
+  find(platform.host, "os-B").layout->position = *moved.position;
+  const auto bytes = store.bytes;
+  EXPECT_TRUE(in_conflict(recover_with(executor)));
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
+  EXPECT_EQ(find(platform.host, "os-B").layout->position, *moved.position);
+  EXPECT_EQ(store.bytes, bytes);
+  EXPECT_EQ(platform.reads, 0);
+  EXPECT_EQ(log.host_writes(), 0u);
+}
 
 TEST_F(NativeExecutor, RecoveryWithoutAJournalIsHealthyAndReadsNothing) {
   EXPECT_TRUE(healthy(recover_with(executor)));
@@ -1453,10 +1521,10 @@ TEST_F(NativeExecutor, RecoveryNeverRemovesADisplayFromAnEarlierRun) {
   EXPECT_EQ(log.host_writes(), 0u);
 }
 
-TEST_F(NativeExecutor, RecoveryClearsAnAttemptThatLeftNothingBehind) {
+TEST_F(NativeExecutor, RecoveryClearsSettledOrUnstartedCreationWithoutAHead) {
   // The OS may list the same displays in another order.
   std::reverse(platform.host.displays.begin(), platform.host.displays.end());
-  for (const auto state : { step_e::planned, step_e::attempted, step_e::failed }) {
+  for (const auto state : { step_e::planned, step_e::observed, step_e::failed }) {
     store.put(head_journal(state));
     EXPECT_TRUE(healthy(recover_with(executor))) << static_cast<int>(state);
     EXPECT_FALSE(store.bytes) << static_cast<int>(state);
@@ -1474,9 +1542,9 @@ TEST_F(NativeExecutor, AVirtualDisplayStepThatNeverStartedClaimsNothing) {
   EXPECT_EQ(log.host_writes(), 0u);
 }
 
-TEST_F(NativeExecutor, RecoveryKeepsAnAttemptThatMayHaveLeftSomething) {
+TEST_F(NativeExecutor, RecoveryKeepsAnObservedCreationWhoseBaselineIsNotRestored) {
   // A display is present: it may be the attempt's, so it is neither removed nor adopted.
-  store.put(head_journal(step_e::attempted));
+  store.put(head_journal(step_e::observed));
   platform.add_head();
   auto health = recover_with(executor);
   EXPECT_TRUE(in_conflict(health));
@@ -1539,7 +1607,7 @@ TEST_F(NativeExecutor, AnUnusableJournalIsKeptAndNothingIsRead) {
 
 TEST_F(NativeExecutor, AnyExceptionDuringRecoveryOrRestoreKeepsTheJournal) {
   // The journal would be cleared, but clearing throws something that is not a std::exception.
-  store.put(head_journal(step_e::attempted));
+  store.put(head_journal(step_e::planned));
   store.throw_on_clear = true;
   const auto health = recover_with(executor);
   EXPECT_TRUE(in_conflict(health));
@@ -1897,8 +1965,11 @@ TEST_F(NativeExecutor, ARestoreThatFailsOrDoesNotTakeIsInConflict) {
 
 TEST_F(NativeExecutor, AForeignDisplayStopsFieldRestoresToo) {
   auto record = field_journal({ managed("os-B", moved) }, { { "os-B", step_e::attempted } });
-  record.steps.push_back({ 2, dt::journal_operation_e::create_head, std::nullopt, id<dt::head_guid_t>(0x54), step_e::attempted,
-    std::nullopt, {} });
+  const auto head = head_journal(step_e::observed);
+  auto created = head.steps.front();
+  created.sequence = 2;
+  record.steps.push_back(created);
+  record.owned_heads = head.owned_heads;
   store.put(record);
   find(platform.host, "os-B").layout->position = { 2560, 0 };
   platform.add_head();

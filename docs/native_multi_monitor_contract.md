@@ -342,7 +342,18 @@ creation, rollback, restore and recovery, without changing ownership proofs.
 Four fake-backed fixtures cover all 18 command kinds, three mutation surfaces
 and both modes, off-worker rejection, absence of ungated public overloads and
 actual executor forwarding. They fail against the former ungated interface and
-under 13 deliberate faults; all 85 native-suite cases pass after restoration.
+under 13 deliberate faults.
+
+An attempted native create remains unresolved even when inventory is empty:
+the write-ahead image also survives a crash or failure to persist the result,
+and a head may still appear later. Recovery and restoration preserve that
+journal and block field writes until explicit reset. Settled or unstarted
+creation without a head can still clear; interrupted field-only writes still
+replay selectively. An incompletely persisted rollback likewise cannot be
+settled merely by seeing the other displays return to their baseline. Three
+regressions fail on the former recovery path; five deliberate mutations cover
+restart, mixed-step journals and the clearable/replay boundaries. All 87 native
+suite cases pass after byte-for-byte restoration.
 The concrete Windows native backend and shared raw-setter gates remain pending.
 
 Posted commands now offer individual completion receipts, including eager

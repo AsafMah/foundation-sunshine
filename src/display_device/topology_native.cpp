@@ -224,7 +224,10 @@ namespace display_device::topology {
     const journal_step_t *
     unresolved_step(const journal_record_t &record) {
       const auto it = std::find_if(record.steps.begin(), record.steps.end(), [](const journal_step_t &step) {
-        return step.state == journal_step_state_e::conflict;
+        // A crash or failed result save leaves the same write-ahead image as an
+        // accepted request whose head can still appear. Empty inventory cannot settle it.
+        return step.state == journal_step_state_e::conflict ||
+               (step.operation == journal_operation_e::create_head && step.state == journal_step_state_e::attempted);
       });
       return it == record.steps.end() ? nullptr : &*it;
     }
@@ -579,7 +582,8 @@ namespace display_device::topology {
       return conflict("The native journal cannot be reconciled: " + *problem);
     }
     if (const auto *step = unresolved_step(record)) {
-      return conflict("An earlier native operation was left unresolved (" + step->detail + "); check the host, then reset");
+      const auto detail = step->detail.empty() ? "unconfirmed virtual display creation" : step->detail;
+      return conflict("An earlier native operation was left unresolved (" + detail + "); check the host, then reset");
     }
     const auto current = platform_.inventory();
     if (!current.available) {

@@ -138,6 +138,7 @@ namespace display_device::topology {
     /**
      * @brief Startup reconciliation. Nothing found on the host is provably ours after a
      *        restart, so a surviving virtual head is In conflict and never removed.
+     *        An unconfirmed create remains unresolved even when no head is listed.
      */
     native_health_t
     recover(const mutation_capability_t &capability);
