@@ -311,47 +311,45 @@ namespace display_device::vdd_ioctl {
     return query_adapter_status().present;
   }
 
-  result
-  send_command(const std::wstring &command) {
-    if (command.empty()) {
-      return result::failed;
-    }
+  namespace detail {
+    result
+    send_command_buffer(const std::wstring &command) {
+      device_handle dev;
+      switch (dev.open()) {
+        case device_handle::open_result::success:
+          break;
+        case device_handle::open_result::interface_missing:
+          return result::interface_missing;
+        case device_handle::open_result::failed:
+          return result::failed;
+      }
 
-    device_handle dev;
-    switch (dev.open()) {
-      case device_handle::open_result::success:
-        break;
-      case device_handle::open_result::interface_missing:
-        return result::interface_missing;
-      case device_handle::open_result::failed:
+      // Send the buffer including its terminating L'\0' so the driver-side
+      // dispatcher (DispatchVddCommandBuffer) can treat it as a NUL-terminated
+      // string without further bookkeeping.
+      const DWORD bytes_to_send = static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t));
+      DWORD bytes_returned = 0;
+
+      const BOOL ok = DeviceIoControl(
+        dev.get(),
+        IOCTL_VDD_COMMAND,
+        const_cast<wchar_t *>(command.c_str()),
+        bytes_to_send,
+        nullptr,
+        0,
+        &bytes_returned,
+        nullptr);
+
+      if (!ok) {
+        // The driver answered the IRP with an error status. Surface it to
+        // the caller without retrying a potentially state-changing command.
+        BOOST_LOG(warning) << "vdd_ioctl: DeviceIoControl(IOCTL_VDD_COMMAND) failed (err=" << GetLastError() << ")";
         return result::failed;
+      }
+
+      return result::success;
     }
-
-    // Send the buffer including its terminating L'\0' so the driver-side
-    // dispatcher (DispatchVddCommandBuffer) can treat it as a NUL-terminated
-    // string without further bookkeeping.
-    const DWORD bytes_to_send = static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t));
-    DWORD bytes_returned = 0;
-
-    const BOOL ok = DeviceIoControl(
-      dev.get(),
-      IOCTL_VDD_COMMAND,
-      const_cast<wchar_t *>(command.c_str()),
-      bytes_to_send,
-      nullptr,
-      0,
-      &bytes_returned,
-      nullptr);
-
-    if (!ok) {
-      // The driver answered the IRP with an error status. Surface it to
-      // the caller without retrying a potentially state-changing command.
-      BOOST_LOG(warning) << "vdd_ioctl: DeviceIoControl(IOCTL_VDD_COMMAND) failed (err=" << GetLastError() << ")";
-      return result::failed;
-    }
-
-    return result::success;
-  }
+  }  // namespace detail
 
   bool
   ping() {

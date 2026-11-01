@@ -366,7 +366,8 @@ The first cleanup obligation remains registered throughout; a sticky record of
 any started mutation survives later steps that never start. Abort/expiry enqueue
 that cleanup before releasing ownership. Sealing and ticket binding also refuse
 active probe/admission fences. These orchestration fixtures use fake mutations
-and probes; the production launch helper has not yet been converted.
+and probes; the optional real-helper adapter below is not yet enabled by its
+production callers.
 
 The standalone `nvhttp_stream_start_unit_tests` target now exercises the actual
 legacy startup helper with link-time fakes for display configuration, inventory
@@ -438,6 +439,23 @@ display/driver operation is executed by these children. This establishes the
 termination seam, not production timeout routing or service-restart evidence;
 Windows can still wait for outstanding kernel I/O during process termination.
 
+The host VDD mutation entrypoint now accepts only closed create, destroy,
+mode-list and hardware-cursor requests. All five existing send sites use these
+types. Validation and serialization run before the private raw transport opens
+the driver: missing requests, malformed/embedded-NUL GUIDs, nonfinite supplied
+display fields, zero mode fields and excessive mode count/buffer length are
+rejected explicitly. Bare creation retains its unused-parameter behavior.
+Valid payloads retain the existing command syntax and result propagation;
+numeric formatting is independent of the process locale. Mode order still
+comes from the existing planner/formatter.
+
+Seven actual-encoder fixtures use a link-time fake transport, with no native
+driver implementation linked. Sixteen mutations fail the intended assertions,
+including exact 2047-character acceptance and 2048-character rejection. This
+closes the arbitrary-string API, not topology ownership: capability propagation
+through VDD helpers/transport, cursor persistence and every other raw setter is
+still pending. No new driver protocol or hardware operation was introduced.
+
 The ticket manager also supports a short binding check before publication or
 replacement, under its mutex and after capacity checks. A refused or throwing
 bind leaves the existing ticket untouched; concurrent claim/liveness readers
@@ -473,7 +491,8 @@ join watchdogs still need to retain and await these receipts.
 
 Production `session_t`, launch/RTSP lifecycle, Windows mutation paths and the
 administrator profile/status surface do not yet call the coordinator.
-No production display behavior has changed. G1 software evidence remains
+Coordinator routing is not enabled; invalid driver requests now fail before
+transport while valid requests retain their protocol. G1 software evidence remains
 incomplete, and its manual N=1 hardware check remains blocked on GH consent.
 The user has authorized continuing safe software work after recording G1
 evidence without waiting for synchronous review; this does not waive GH, GD,

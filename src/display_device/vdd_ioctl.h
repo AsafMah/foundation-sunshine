@@ -9,7 +9,10 @@
 
 #include <cstdint>
 #include <string>
+#include <variant>
 #include <vector>
+
+#include "vdd_mode_list.h"
 
 namespace display_device::vdd_ioctl {
 
@@ -22,7 +25,7 @@ namespace display_device::vdd_ioctl {
   enum class result {
     success,           ///< IOCTL completed with STATUS_SUCCESS.
     interface_missing, ///< No registered device interface (driver too old / not installed).
-    failed,            ///< Driver was reached but rejected the IOCTL or returned an error.
+    failed,            ///< Invalid request, rejected IOCTL, or transport error.
   };
 
   /**
@@ -114,18 +117,40 @@ namespace display_device::vdd_ioctl {
    */
   bool adapter_present();
 
+  struct create_monitor_t {
+    std::string guid;
+    float max_nits { 1000.0f };
+    float min_nits { 0.001f };
+    float max_full_nits { 1000.0f };
+    float width_cm {};
+    float height_cm {};
+  };
+
+  struct destroy_monitors_t {};
+
+  struct set_modes_t {
+    std::vector<vdd_mode_list::vdd_mode_t> modes;
+  };
+
+  struct hardware_cursor_t {
+    bool enabled {};
+  };
+
+  using command_t = std::variant<std::monostate, create_monitor_t, destroy_monitors_t, set_modes_t, hardware_cursor_t>;
+
   /**
-   * @brief Send a UTF-16 command buffer to the VDD driver via IOCTL.
+   * @brief Validate and encode a closed mutation request before opening the driver.
    *
    * Performs `SetupDiGetClassDevsW` on `GUID_DEVINTERFACE_ZAKO_VDD_CONTROL`,
    * opens the first interface instance with `CreateFileW`, and issues
    * `IOCTL_VDD_COMMAND`.
    *
-   * @param command UTF-16 VDD command string (e.g. `L"RELOAD_DRIVER"`,
-   *                `L"CREATEMONITOR {GUID}:[..]"`, `L"DESTROYMONITOR"`).
+   * @param command A supported typed request. Arbitrary command strings are not accepted.
+   * Invalid payloads are logged and fail without opening or writing the device.
    * @return tri-state result; see `enum class result`.
    */
-  result send_command(const std::wstring &command);
+  result
+  send_command(const command_t &command);
 
   /**
    * @brief Cheap liveness probe used to decide whether the IOCTL transport

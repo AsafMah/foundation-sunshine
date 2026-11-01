@@ -93,6 +93,20 @@ target_link_libraries(vdd_mode_list_unit_tests PRIVATE gtest_main nlohmann_json:
 set_target_properties(vdd_mode_list_unit_tests PROPERTIES CXX_STANDARD 23)
 add_test(NAME vdd_mode_list_unit_tests COMMAND vdd_mode_list_unit_tests)
 
+add_executable(vdd_commands_unit_tests
+        ${CMAKE_SOURCE_DIR}/src/display_device/vdd_commands.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_vdd_commands.cpp)
+target_include_directories(vdd_commands_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(vdd_commands_unit_tests PRIVATE gtest_main sunshine::host_headers
+        Boost::log sunshine_project_options sunshine_coverage)
+target_compile_definitions(vdd_commands_unit_tests PRIVATE ${SUNSHINE_DEFINITIONS})
+set_target_properties(vdd_commands_unit_tests PROPERTIES CXX_STANDARD 23)
+if (WIN32)
+    set_target_properties(vdd_commands_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
+endif ()
+add_test(NAME vdd_commands_unit_tests COMMAND vdd_commands_unit_tests)
+set_tests_properties(vdd_commands_unit_tests PROPERTIES TIMEOUT 10)
+
 add_executable(current_capture_target_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_current_capture_target.cpp)
 target_include_directories(current_capture_target_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(current_capture_target_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
@@ -709,6 +723,7 @@ list(REMOVE_ITEM TEST_SOURCES
         ${CMAKE_SOURCE_DIR}/tests/unit/test_sunshinesvc_state.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_tray_state.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_video_probe.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_vdd_commands.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_virtual_touchscreen_device.cpp)
 
 set(ABR_TEST_STUB_SOURCE ${CMAKE_SOURCE_DIR}/tests/unit/abr_test_stubs.cpp)

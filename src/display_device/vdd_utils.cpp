@@ -182,9 +182,7 @@ namespace display_device {
 
     bool
     set_hardware_cursor_enabled(bool enabled) {
-      const wchar_t *command = enabled ? L"HARDWARECURSOR true" : L"HARDWARECURSOR false";
-
-      switch (vdd_ioctl::send_command(command)) {
+      switch (vdd_ioctl::send_command(vdd_ioctl::hardware_cursor_t { enabled })) {
         case vdd_ioctl::result::success:
           BOOST_LOG(info) << "VDD hardware cursor " << (enabled ? "enabled" : "disabled") << " (IOCTL)";
           return true;
@@ -423,9 +421,8 @@ namespace display_device {
       // mode always fits, configured modes are left out by priority.
       const vdd_mode_list::vdd_mode_t requested { *config.resolution, *session_refresh_hz };
       const auto plan = vdd_mode_list::plan_modes(settings.resolution_modes, settings.refresh_rates_hz, *session_refresh_hz, &requested);
-      const auto command_string = vdd_mode_list::format_setmodes_command(plan.modes);
       const auto mode_count = plan.modes.size();
-      if (command_string.empty()) {
+      if (plan.modes.empty()) {
         BOOST_LOG(warning) << "SETMODES skipped: full VDD mode list is empty";
         return set_vdd_result::invalid_config;
       }
@@ -435,7 +432,7 @@ namespace display_device {
                         << vdd_mode_list::kMaxTotalModes << " modes)";
       }
 
-      switch (vdd_ioctl::send_command(command_string)) {
+      switch (vdd_ioctl::send_command(vdd_ioctl::set_modes_t { plan.modes })) {
         case vdd_ioctl::result::success:
           BOOST_LOG(info) << "VDD live mode list updated via SETMODES: " << mode_count
                           << " modes; requested " << to_string(*config.resolution)
@@ -514,8 +511,6 @@ namespace display_device {
         return false;
       }
 
-      std::wstring command = L"CREATEMONITOR";
-
       // 如果没有提供UUID，使用上一次的UUID
       std::string identifier_to_use = client_identifier.empty() && !last_used_client_uuid.empty() ? last_used_client_uuid : client_identifier;
 
@@ -526,25 +521,6 @@ namespace display_device {
       // 生成GUID并构建命令
       std::string guid_str = generate_client_guid(identifier_to_use);
       if (!guid_str.empty()) {
-        // 构建完整参数: {GUID}:[max_nits,min_nits,maxFALL][widthCm,heightCm]
-        std::ostringstream param_stream;
-        param_stream << guid_str << ":[" << hdr_brightness.max_nits << "," << hdr_brightness.min_nits << "," << hdr_brightness.max_full_nits << "]";
-
-        // 如果提供了物理尺寸，添加到参数中
-        if (physical_size.width_cm > 0.0f && physical_size.height_cm > 0.0f) {
-          param_stream << "[" << physical_size.width_cm << "," << physical_size.height_cm << "]";
-        }
-
-        std::string param_str = param_stream.str();
-
-        // 转换为宽字符并添加到命令
-        int size_needed = MultiByteToWideChar(CP_UTF8, 0, param_str.c_str(), -1, NULL, 0);
-        if (size_needed > 0) {
-          std::vector<wchar_t> param_wide(size_needed);
-          MultiByteToWideChar(CP_UTF8, 0, param_str.c_str(), -1, param_wide.data(), size_needed);
-          command += L" " + std::wstring(param_wide.data());
-        }
-
         std::ostringstream log_stream;
         log_stream << "创建虚拟显示器，客户端标识符: " << identifier_to_use
                    << ", GUID: " << guid_str
@@ -561,7 +537,9 @@ namespace display_device {
       }
 
       // 尝试通过 IOCTL 发送命令（带 GUID 或不带 GUID）
-      switch (vdd_ioctl::send_command(command)) {
+      switch (vdd_ioctl::send_command(vdd_ioctl::create_monitor_t {
+        guid_str, hdr_brightness.max_nits, hdr_brightness.min_nits, hdr_brightness.max_full_nits,
+        physical_size.width_cm, physical_size.height_cm })) {
         case vdd_ioctl::result::success:
           tray_state::set_vdd_state(true, config::video.vdd_keep_enabled, config::video.vdd_headless_create_enabled, false);
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
@@ -587,7 +565,7 @@ namespace display_device {
         return true;
       }
 
-      switch (vdd_ioctl::send_command(L"DESTROYMONITOR")) {
+      switch (vdd_ioctl::send_command(vdd_ioctl::destroy_monitors_t {})) {
         case vdd_ioctl::result::success:
           BOOST_LOG(info) << "销毁虚拟显示器完成 (IOCTL)";
           break;
@@ -612,7 +590,7 @@ namespace display_device {
 
     void
     destroy_vdd_monitor_nolog() {
-      (void) vdd_ioctl::send_command(L"DESTROYMONITOR");
+      (void) vdd_ioctl::send_command(vdd_ioctl::destroy_monitors_t {});
     }
 
     void
