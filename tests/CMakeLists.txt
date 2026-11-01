@@ -775,6 +775,11 @@ target_link_options(${PROJECT_NAME} PRIVATE)
 add_test(NAME ${PROJECT_NAME} COMMAND ${PROJECT_NAME})
 set_tests_properties(${PROJECT_NAME} PROPERTIES TIMEOUT 600)
 
+add_test(NAME lifetime_termination_unit_tests COMMAND ${PROJECT_NAME}
+        --gtest_filter=LifetimeDeathTest.*
+        --gtest_death_test_style=threadsafe)
+set_tests_properties(lifetime_termination_unit_tests PROPERTIES TIMEOUT 20)
+
 add_executable(abr_unit_tests
         ${CMAKE_SOURCE_DIR}/src/streaming/abr.cpp
         ${ABR_TEST_STUB_SOURCE})

@@ -83,6 +83,12 @@ namespace lifetime {
   char **argv;
   std::atomic_int desired_exit_code;
 
+#if defined(SUNSHINE_TESTS) && defined(_WIN32)
+  namespace testing {
+    decltype(&TerminateProcess) terminate_process = ::TerminateProcess;
+  }
+#endif
+
   void
   exit_sunshine(int exit_code, bool async) {
     // Store the exit code of the first exit_sunshine() call
@@ -107,13 +113,22 @@ namespace lifetime {
 #endif
   }
 
-  void
-  force_terminate() {
+  [[noreturn]] void
+  force_terminate(int exit_code) {
 #ifdef _WIN32
-    TerminateProcess(GetCurrentProcess(), static_cast<UINT>(desired_exit_code.load()));
-#else
-    std::_Exit(desired_exit_code.load());
+  #ifdef SUNSHINE_TESTS
+    testing::terminate_process(GetCurrentProcess(), static_cast<UINT>(exit_code));
+  #else
+    TerminateProcess(GetCurrentProcess(), static_cast<UINT>(exit_code));
+  #endif
 #endif
+    // A failed native termination must not return to potentially stuck cleanup.
+    std::_Exit(exit_code);
+  }
+
+  [[noreturn]] void
+  force_terminate() {
+    force_terminate(desired_exit_code.load());
   }
 
   void

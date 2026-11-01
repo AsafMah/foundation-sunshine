@@ -105,10 +105,18 @@ namespace lifetime {
    * @brief Unconditionally terminates Sunshine immediately.
    *
    * Bypasses user-mode exception dispatch and preserves the requested exit code.
+   * If native termination fails, exits without cleanup rather than returning.
    * Windows may still wait for pending kernel I/O to complete or be canceled.
    */
-  void
+  [[noreturn]] void
   force_terminate();
+
+  /**
+   * @brief Immediately terminate with an explicit code, independently of graceful shutdown.
+   * Fatal watchdogs pass EXIT_FAILURE; this path never logs, flushes or runs cleanup.
+   */
+  [[noreturn]] void
+  force_terminate(int exit_code);
 
   /**
    * @brief Starts the independent ten-second deadline for process shutdown.

@@ -428,6 +428,16 @@ checks, not hardware qualification. Production callers still omit the optional
 adapter: enabling it also requires replacing their old restore guards and
 completing runtime, ticket, raw-capability and shutdown wiring.
 
+The lifetime layer now supplies a nonreturning explicit-exit-code termination
+overload for the future fatal probe hook. It attempts native termination and,
+if that returns, exits without cleanup; the existing no-argument shutdown path
+preserves its selected code, including zero. Four isolated child-process tests
+exercise the actual functions, including a test-only rejected native attempt,
+with seven assertion-killed mutations. No Sunshine application entrypoint or
+display/driver operation is executed by these children. This establishes the
+termination seam, not production timeout routing or service-restart evidence;
+Windows can still wait for outstanding kernel I/O during process termination.
+
 The ticket manager also supports a short binding check before publication or
 replacement, under its mutex and after capacity checks. A refused or throwing
 bind leaves the existing ticket untouched; concurrent claim/liveness readers
