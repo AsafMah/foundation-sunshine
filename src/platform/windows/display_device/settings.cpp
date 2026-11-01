@@ -583,7 +583,7 @@ namespace display_device {
      * bool data_modified { false };
      * settings_t::persistent_data_t data;
      *
-     * if (!try_revert_settings(data, data_modified)) {
+     * if (!try_revert_settings(data, data_modified, automatic_vdd_policy_e::allow)) {
      *   if (data_modified) {
      *     // Update the persistent file
      *   }
@@ -591,7 +591,7 @@ namespace display_device {
      * ```
      */
     bool
-    try_revert_settings(settings_t::persistent_data_t &data, bool &data_modified, bool skip_vdd_destroy = false) {
+    try_revert_settings(settings_t::persistent_data_t &data, bool &data_modified, automatic_vdd_policy_e vdd_policy) {
       try {
         nlohmann::json json_data = data;
         BOOST_LOG(debug) << "Reverting persistent display settings from:\n"
@@ -664,8 +664,8 @@ namespace display_device {
         }
       }
       
-      if (skip_vdd_destroy) {
-        BOOST_LOG(debug) << "VDD已由调用方销毁，跳过try_revert_settings中的VDD销毁逻辑";
+      if (vdd_policy != automatic_vdd_policy_e::allow) {
+        BOOST_LOG(debug) << "Automatic VDD destruction is suppressed by the caller";
       }
       else if (config::video.vdd_keep_enabled) {
         BOOST_LOG(debug) << "VDD保持启用模式已开启，保留VDD";
@@ -938,6 +938,7 @@ namespace display_device {
   settings_t::apply_config(
     const parsed_config_t &config,
     const rtsp_stream::launch_session_t &session,
+    automatic_vdd_policy_e vdd_policy,
     const boost::optional<active_topology_t> &pre_saved_initial_topology) {
     auto profile_setting = color_profile::resolve_client_hdr_profile(
       config::get_clients_config(), session.client_cert_uuid, session.client_name);
@@ -950,7 +951,7 @@ namespace display_device {
     }
 
     const bool client_hdr_enabled = session.enable_hdr;
-    const auto do_apply_config { [this, &pre_saved_initial_topology, &profile_setting, client_hdr_enabled](const parsed_config_t &config) -> settings_t::apply_result_t {
+    const auto do_apply_config { [this, &pre_saved_initial_topology, &profile_setting, client_hdr_enabled, vdd_policy](const parsed_config_t &config) -> settings_t::apply_result_t {
       // 检测是否为VDD模式
       const bool is_vdd_mode = config.use_vdd && *config.use_vdd;
 
@@ -988,7 +989,7 @@ namespace display_device {
         // to the topology we want to modify before we actually start applying settings.
         topology_result = handle_device_topology_configuration(config, previously_configured_topology, [&]() {
           const bool audio_sink_was_captured { audio_data != nullptr };
-          if (!revert_settings(revert_reason_e::topology_switch)) {
+          if (!revert_settings(revert_reason_e::topology_switch, vdd_policy)) {
             failed_while_reverting_settings = true;
             return false;
           }
@@ -1044,7 +1045,7 @@ namespace display_device {
           }
         }
         else if (persistent_data) {
-          if (!revert_settings(revert_reason_e::config_cleanup)) {
+          if (!revert_settings(revert_reason_e::config_cleanup, vdd_policy)) {
             // Sanity check, as the revert_settings should always pass
             // at this point since our settings contain no modifications.
             return { apply_result_t::result_e::revert_fail };
@@ -1180,7 +1181,7 @@ namespace display_device {
   }
 
   bool
-  settings_t::revert_settings(revert_reason_e reason, bool skip_vdd_destroy) {
+  settings_t::revert_settings(revert_reason_e reason, automatic_vdd_policy_e vdd_policy) {
     static const char *reason_strs[] = { "串流结束", "拓扑切换", "配置清理", "重置持久化" };
     const char *reason_str = reason_strs[static_cast<int>(reason)];
     BOOST_LOG(info) << "正在恢复显示设备设置 (原因: " << reason_str << ")";
@@ -1195,7 +1196,7 @@ namespace display_device {
     if (persistent_data) {
       // 尝试恢复设置
       bool data_updated { false };
-      bool success = try_revert_settings(*persistent_data, data_updated, skip_vdd_destroy);
+      bool success = try_revert_settings(*persistent_data, data_updated, vdd_policy);
       if (!success) {
         if (data_updated) {
           save_settings(filepath, *persistent_data);  // Best effort; retain remaining restore state for retry.
@@ -1219,9 +1220,9 @@ namespace display_device {
   }
 
   void
-  settings_t::reset_persistence() {
+  settings_t::reset_persistence(automatic_vdd_policy_e vdd_policy) {
     BOOST_LOG(info) << "Purging persistent display device data (trying to reset settings one last time).";
-    if (persistent_data && !revert_settings(revert_reason_e::persistence_reset)) {
+    if (persistent_data && !revert_settings(revert_reason_e::persistence_reset, vdd_policy)) {
       BOOST_LOG(info) << "Failed to revert settings - proceeding to reset persistence.";
     }
 

@@ -470,14 +470,23 @@ still pending. No new driver protocol or hardware operation was introduced.
 
 The standalone Windows settings-policy target compiles the actual settings and
 topology policy against fake display, session, audio and color-profile edges.
-Five fixtures cover nested topology rollback, explicit VDD-destroy suppression,
+Nine fixtures cover nested topology rollback, explicit VDD-destroy suppression,
 failed restoration retaining its baseline for retry, final restoration before
-legacy persistence reset, and no-modification configuration cleanup. Eight
+legacy persistence reset, and no-modification configuration cleanup. Sixteen
 deliberate faults fail the intended assertions. Failure evidence checks the
 requested topology and failed write as well as retained persistence; destruction
-of a fake head alone must not masquerade as successful restoration. These are
-legacy compatibility fixtures, not proof that nested suppression is propagated
-from the future runtime, that raw setters are capability-gated, or that hardware
+of a fake head alone must not masquerade as successful restoration.
+
+Settings apply, revert and reset now require an explicit typed automatic-VDD
+policy, with no permissive default or boolean overload. The same policy reaches
+nested topology-switch rollback, no-modification cleanup and final legacy reset
+restoration. Suppression prevents automatic head destruction, not topology or
+field restoration; managed reset must still bypass legacy restoration completely.
+Existing session callers explicitly retain their former allow/suppress choices.
+The new suppression fixtures fail before propagation is added, including the
+nested-error path, and the API fixture detects restored permissive defaults.
+These are real-policy software checks, not proof that the future runtime selects
+the restrictive policy, that raw setters are capability-gated, or that hardware
 recovery works.
 
 The ticket manager also supports a short binding check before publication or

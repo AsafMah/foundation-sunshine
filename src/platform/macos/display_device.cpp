@@ -98,21 +98,22 @@ namespace display_device {
   }
 
   settings_t::apply_result_t
-  settings_t::apply_config(const parsed_config_t &) {
+  settings_t::apply_config(const parsed_config_t &, const rtsp_stream::launch_session_t &,
+    automatic_vdd_policy_e, const boost::optional<active_topology_t> &) {
     // Not implemented
     return { apply_result_t::result_e::success };
   }
 
   bool
-  settings_t::revert_settings(revert_reason_e reason, bool skip_vdd_destroy) {
+  settings_t::revert_settings(revert_reason_e reason, automatic_vdd_policy_e vdd_policy) {
     // Not implemented
     (void)reason;  // Unused parameter
-    (void)skip_vdd_destroy;  // Unused parameter
+    (void)vdd_policy;  // Unused parameter
     return true;
   }
 
   void
-  settings_t::reset_persistence() {
+  settings_t::reset_persistence(automatic_vdd_policy_e) {
     // Not implemented
   }
 

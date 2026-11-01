@@ -18,6 +18,7 @@
 #include <stdexcept>
 
 namespace dd = display_device;
+using vdd_policy = dd::automatic_vdd_policy_e;
 
 namespace {
   struct host_t {
@@ -49,7 +50,7 @@ namespace {
 
     void
     prepare_virtual() {
-      const auto result = settings.apply_config(configuration(true), launch, dd::active_topology_t { { "physical" } });
+      const auto result = settings.apply_config(configuration(true), launch, vdd_policy::allow, dd::active_topology_t { { "physical" } });
       ASSERT_TRUE(result) << result.get_error_message();
       ASSERT_TRUE(settings.has_persistent_data());
       host.writes.clear();
@@ -200,9 +201,28 @@ namespace display_device {
 }  // namespace display_device
 
 namespace {
+  template <class Settings>
+  void
+  expect_explicit_policy() {
+    constexpr bool implicit_apply = requires(Settings &settings, const dd::parsed_config_t &config, const rtsp_stream::launch_session_t &launch) {
+      settings.apply_config(config, launch);
+    };
+    constexpr bool implicit_revert = requires(Settings &settings) { settings.revert_settings(); };
+    constexpr bool implicit_reset = requires(Settings &settings) { settings.reset_persistence(); };
+    constexpr bool boolean_revert = requires(Settings &settings) { settings.revert_settings(dd::revert_reason_e::stream_ended, true); };
+    EXPECT_FALSE(implicit_apply);
+    EXPECT_FALSE(implicit_revert);
+    EXPECT_FALSE(implicit_reset);
+    EXPECT_FALSE(boolean_revert);
+  }
+
+  TEST_F(DisplaySettingsPolicy, EveryMutationRequiresAnExplicitTypedVddPolicy) {
+    expect_explicit_policy<dd::settings_t>();
+  }
+
   TEST_F(DisplaySettingsPolicy, NestedTopologyRollbackRunsLegacyVddCleanup) {
     ASSERT_NO_FATAL_FAILURE(prepare_virtual());
-    const auto result = settings.apply_config(configuration(false), launch);
+    const auto result = settings.apply_config(configuration(false), launch, vdd_policy::allow);
     ASSERT_TRUE(result) << result.get_error_message();
     EXPECT_EQ(std::count(host.writes.begin(), host.writes.end(), "destroy"), 1);
     EXPECT_FALSE(host.vdd_present);
@@ -214,7 +234,7 @@ namespace {
 
   TEST_F(DisplaySettingsPolicy, CallerHandledVddRestoreNeverDestroysTheHeadAgain) {
     ASSERT_NO_FATAL_FAILURE(prepare_virtual());
-    ASSERT_TRUE(settings.revert_settings(dd::revert_reason_e::stream_ended, true));
+    ASSERT_TRUE(settings.revert_settings(dd::revert_reason_e::stream_ended, vdd_policy::suppress));
     EXPECT_EQ(std::count(host.writes.begin(), host.writes.end(), "destroy"), 0);
     EXPECT_TRUE(host.vdd_present);
     EXPECT_EQ(host.topology, (dd::active_topology_t { { "physical" } }));
@@ -225,7 +245,7 @@ namespace {
     host.topology = { { "vdd" } };
     ASSERT_NO_FATAL_FAILURE(prepare_virtual());
     host.fail_topology = true;
-    EXPECT_FALSE(settings.revert_settings());
+    EXPECT_FALSE(settings.revert_settings(dd::revert_reason_e::stream_ended, vdd_policy::allow));
     EXPECT_TRUE(settings.has_persistent_data());
     ASSERT_EQ(host.topology_writes.size(), 1u);
     EXPECT_EQ(host.topology_writes.front().first, (dd::active_topology_t { { "physical" } }));
@@ -233,7 +253,7 @@ namespace {
     EXPECT_TRUE(host.topology.empty());
 
     host.fail_topology = false;
-    EXPECT_TRUE(settings.revert_settings());
+    EXPECT_TRUE(settings.revert_settings(dd::revert_reason_e::stream_ended, vdd_policy::allow));
     EXPECT_FALSE(settings.has_persistent_data());
     EXPECT_EQ(host.topology, (dd::active_topology_t { { "physical" } }));
     EXPECT_EQ(std::count(host.writes.begin(), host.writes.end(), "destroy"), 1);
@@ -243,7 +263,7 @@ namespace {
     host.topology = { { "vdd" } };
     ASSERT_NO_FATAL_FAILURE(prepare_virtual());
     host.fail_topology = true;
-    settings.reset_persistence();
+    settings.reset_persistence(vdd_policy::allow);
     EXPECT_EQ(std::count(host.writes.begin(), host.writes.end(), "destroy"), 1);
     ASSERT_EQ(host.topology_writes.size(), 1u);
     EXPECT_EQ(host.topology_writes.front().first, (dd::active_topology_t { { "physical" } }));
@@ -251,7 +271,7 @@ namespace {
     EXPECT_TRUE(host.topology.empty());
     EXPECT_FALSE(settings.has_persistent_data());
     host.writes.clear();
-    EXPECT_TRUE(settings.revert_settings());
+    EXPECT_TRUE(settings.revert_settings(dd::revert_reason_e::stream_ended, vdd_policy::allow));
     EXPECT_TRUE(host.writes.empty());
   }
 
@@ -260,15 +280,48 @@ namespace {
     host.topology = { { "physical" } };
     auto config = configuration(false);
     config.resolution = dd::resolution_t { 1280, 720 };
-    ASSERT_TRUE(settings.apply_config(config, launch));
+    ASSERT_TRUE(settings.apply_config(config, launch, vdd_policy::allow));
     ASSERT_TRUE(settings.has_persistent_data());
     ASSERT_EQ(host.physical_mode.resolution.width, 1280u);
     config.resolution.reset();
     host.writes.clear();
-    ASSERT_TRUE(settings.apply_config(config, launch));
+    ASSERT_TRUE(settings.apply_config(config, launch, vdd_policy::allow));
     EXPECT_EQ(host.physical_mode.resolution.width, 1920u);
     EXPECT_EQ(host.physical_mode.resolution.height, 1080u);
     EXPECT_EQ(host.writes, (std::vector<std::string> { "modes" }));
     EXPECT_FALSE(settings.has_persistent_data());
+  }
+
+  TEST_F(DisplaySettingsPolicy, NestedTopologyRollbackPreservesVddSuppression) {
+    ASSERT_NO_FATAL_FAILURE(prepare_virtual());
+    const auto result = settings.apply_config(configuration(false), launch, vdd_policy::suppress);
+    ASSERT_TRUE(result) << result.get_error_message();
+    EXPECT_EQ(std::count(host.writes.begin(), host.writes.end(), "destroy"), 0);
+    EXPECT_TRUE(host.vdd_present);
+    EXPECT_EQ(host.topology, (dd::active_topology_t { { "physical" } }));
+    EXPECT_FALSE(settings.has_persistent_data());
+  }
+
+  TEST_F(DisplaySettingsPolicy, FailedNestedRollbackPreservesVddSuppressionAndItsError) {
+    ASSERT_NO_FATAL_FAILURE(prepare_virtual());
+    host.fail_topology = true;
+    const auto result = settings.apply_config(configuration(false), launch, vdd_policy::suppress);
+    EXPECT_EQ(result.result, dd::settings_t::apply_result_t::result_e::revert_fail);
+    EXPECT_EQ(std::count(host.writes.begin(), host.writes.end(), "destroy"), 0);
+    EXPECT_TRUE(host.vdd_present);
+    EXPECT_EQ(host.topology, (dd::active_topology_t { { "physical" }, { "vdd" } }));
+    EXPECT_TRUE(settings.has_persistent_data());
+  }
+
+  TEST_F(DisplaySettingsPolicy, FinalLegacyResetRestorePreservesVddSuppression) {
+    ASSERT_NO_FATAL_FAILURE(prepare_virtual());
+    settings.reset_persistence(vdd_policy::suppress);
+    EXPECT_EQ(std::count(host.writes.begin(), host.writes.end(), "destroy"), 0);
+    EXPECT_TRUE(host.vdd_present);
+    EXPECT_EQ(host.topology, (dd::active_topology_t { { "physical" } }));
+    EXPECT_FALSE(settings.has_persistent_data());
+    ASSERT_EQ(host.topology_writes.size(), 1u);
+    EXPECT_EQ(host.topology_writes.front().first, (dd::active_topology_t { { "physical" } }));
+    EXPECT_TRUE(host.topology_writes.front().second);
   }
 }  // namespace

@@ -568,7 +568,7 @@ namespace display_device {
           retry_session.env["SUNSHINE_CLIENT_CERT_UUID"] = client_cert_uuid;
         }
         retry_session.hdr_capabilities = hdr_capabilities;
-        if (!settings.apply_config(config_copy, retry_session, pre_saved_initial_topology)) {
+        if (!settings.apply_config(config_copy, retry_session, automatic_vdd_policy_e::allow, pre_saved_initial_topology)) {
           BOOST_LOG(warning) << "[Display Deferred Retry] Applying display settings failed; stopping retries while allowing the stream to continue";
           // WARNING! After call to the method below, this lambda function is no longer valid!
           // DO NOT access anything from the capture list!
@@ -623,7 +623,7 @@ namespace display_device {
       }
     }
 
-    const auto apply_result = settings.apply_config(*parsed_config, session, pre_saved_initial_topology);
+    const auto apply_result = settings.apply_config(*parsed_config, session, automatic_vdd_policy_e::allow, pre_saved_initial_topology);
     if (apply_result) {
       timer->setup_timer(nullptr);
       pending_vdd_.reset();
@@ -910,7 +910,7 @@ namespace display_device {
   void
   session_t::reset_persistence() {
     std::lock_guard lock { mutex };
-    settings.reset_persistence();
+    settings.reset_persistence(automatic_vdd_policy_e::allow);
     stop_timer_and_clear_vdd_state();
     current_vdd_client_id.clear();
   }
@@ -1046,9 +1046,9 @@ namespace display_device {
     BOOST_LOG(debug) << "Checking if reverting settings will fail: " << settings_will_fail;
     
     // VDD生命周期已在上面的逻辑中决定（销毁或保留），通知revert_settings不要再处理VDD销毁
-    const bool vdd_already_handled = true;
+    constexpr auto vdd_policy = automatic_vdd_policy_e::suppress;
     
-    if (!settings_will_fail && settings.revert_settings(reason, vdd_already_handled)) {
+    if (!settings_will_fail && settings.revert_settings(reason, vdd_policy)) {
       stop_timer_and_clear_vdd_state();
     }
     else {
@@ -1078,7 +1078,7 @@ namespace display_device {
         }
         
         // 执行恢复
-        auto result = settings.revert_settings(reason, true);
+        auto result = settings.revert_settings(reason, automatic_vdd_policy_e::suppress);
         BOOST_LOG(info) << "恢复显示设置" << (result ? "成功" : "失败");
         
         // 恢复完成后清除标志和状态
@@ -1116,7 +1116,7 @@ namespace display_device {
       }
 
       // VDD生命周期已由restore_state_impl决定，跳过revert_settings中的VDD销毁
-      auto result = settings.revert_settings(reason, true);
+      auto result = settings.revert_settings(reason, automatic_vdd_policy_e::suppress);
       BOOST_LOG(info) << "轮询恢复显示设置" << (result ? "成功" : "失败") << "，不再重试";
       pending_restore_ = false;
       clear_vdd_state();

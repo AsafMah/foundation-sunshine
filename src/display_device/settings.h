@@ -20,6 +20,12 @@ namespace display_device {
     persistence_reset  /**< Resetting persistence data. */
   };
 
+  /** Restricts automatic head destruction; this is not mutation authority or ownership proof. */
+  enum class automatic_vdd_policy_e {
+    suppress,
+    allow
+  };
+
   /**
    * @brief A platform specific class that can apply configuration to the display device and later revert it.
    *
@@ -155,6 +161,7 @@ namespace display_device {
     /**
      * @brief Apply the parsed configuration.
      * @param config A parsed and validated configuration.
+     * @param vdd_policy Whether nested legacy rollback may automatically destroy VDD heads.
      * @returns The apply result value.
      * @see apply_result_t
      * @see parsed_config_t
@@ -162,64 +169,69 @@ namespace display_device {
      * EXAMPLES:
      * ```cpp
      * const parsed_config_t config;
+     * const std::shared_ptr<rtsp_stream::launch_session_t> launch_session; // Assuming ptr is properly initialized
      *
      * settings_t settings;
-     * const auto result = settings.apply_config(config);
+     * const auto result = settings.apply_config(config, *launch_session, automatic_vdd_policy_e::allow);
      * ```
      */
     apply_result_t
     apply_config(
       const parsed_config_t &config,
       const rtsp_stream::launch_session_t &session,
+      automatic_vdd_policy_e vdd_policy,
       const boost::optional<active_topology_t> &pre_saved_initial_topology = boost::none);
 
     /**
      * @brief Revert the applied configuration and restore the previous settings.
      * @param reason The reason for reverting settings, used to determine appropriate cleanup behavior.
+     * @param vdd_policy Restricts automatic VDD destruction, not topology or field restoration.
      * @note It automatically loads the settings from persistence file if cached settings do not exist.
      * @returns True if settings were reverted or there was nothing to revert, false otherwise.
      *
      * EXAMPLES:
      * ```cpp
      * const std::shared_ptr<rtsp_stream::launch_session_t> launch_session; // Assuming ptr is properly initialized
-     * const config::video_t &video_config { config::video };
+     * const parsed_config_t config; // Assuming config is already parsed
      *
      * settings_t settings;
-     * const auto result = settings.apply_config(video_config, *launch_session);
+     * const auto result = settings.apply_config(config, *launch_session, automatic_vdd_policy_e::allow);
      * if (result) {
      *   // Wait for some time
-     *   settings.revert_settings(revert_reason_e::stream_ended);
+     *   settings.revert_settings(revert_reason_e::stream_ended, automatic_vdd_policy_e::allow);
      * }
      * ```
      */
     bool
-    revert_settings(revert_reason_e reason = revert_reason_e::stream_ended, bool skip_vdd_destroy = false);
+    revert_settings(revert_reason_e reason, automatic_vdd_policy_e vdd_policy);
 
     /**
      * @brief Reset the persistence and currently held initial display state.
+     * @param vdd_policy Restricts automatic VDD destruction during the final legacy restoration attempt.
+     * @note This still restores legacy settings. Managed reset must not use this method.
      * @see session_t::reset_persistence for more details.
      *
      * EXAMPLES:
      * ```cpp
      * const std::shared_ptr<rtsp_stream::launch_session_t> launch_session; // Assuming ptr is properly initialized
-     * const config::video_t &video_config { config::video };
+     * const parsed_config_t config; // Assuming config is already parsed
      *
      * settings_t settings;
-     * const auto result = settings.apply_config(video_config, *launch_session);
+     * const auto result = settings.apply_config(config, *launch_session, automatic_vdd_policy_e::allow);
      * if (result) {
      *   // Wait for some time
-     *   if (settings.revert_settings()) {
+     *   if (settings.revert_settings(revert_reason_e::stream_ended, automatic_vdd_policy_e::allow)) {
      *     // Wait for user input
      *     const bool user_wants_reset { true };
      *     if (user_wants_reset) {
-     *       settings.reset_persistence();
+     *       settings.reset_persistence(automatic_vdd_policy_e::allow);
      *     }
      *   }
      * }
      * ```
      */
-   void
-    reset_persistence();
+    void
+    reset_persistence(automatic_vdd_policy_e vdd_policy);
 
     /**
      * @brief Check if there is saved persistent data.
