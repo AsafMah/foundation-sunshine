@@ -238,6 +238,10 @@ add_test(NAME video_probe_unit_tests COMMAND video_probe_unit_tests)
 # Real startup policy, but every platform/driver/encoder edge is linked from the fixture.
 add_executable(nvhttp_stream_start_unit_tests
         ${CMAKE_SOURCE_DIR}/src/nvhttp_stream_start.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_capability.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_command_queue.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_coordinator.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_routes.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_nvhttp_stream_start.cpp)
 target_include_directories(nvhttp_stream_start_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(nvhttp_stream_start_unit_tests PRIVATE gtest_main sunshine::host_headers

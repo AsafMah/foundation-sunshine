@@ -630,7 +630,7 @@ namespace nvhttp {
       // The display should be restored by the fail guard in case something happens.
       need_to_restore_display_state = true;
 
-      if (!stream_start::prepare_display_and_probe_encoders(tree, *launch_session, true)) {
+      if (!stream_start::prepare_display_and_probe_encoders(tree, launch_session, true)) {
         tree.put("root.gamesession", 0);
 
         return;
@@ -812,7 +812,7 @@ namespace nvhttp {
     if (no_active_sessions) {
       // Prepare before publishing the ticket so the handshake expiration
       // window starts only when the host is ready to accept RTSP.
-      if (!stream_start::prepare_display_and_probe_encoders(tree, *launch_session, false)) {
+      if (!stream_start::prepare_display_and_probe_encoders(tree, launch_session, false)) {
         tree.put("root.resume", 0);
         return;
       }

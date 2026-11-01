@@ -27,6 +27,7 @@
 namespace nvhttp::stream_start {
 
   namespace pt = boost::property_tree;
+  namespace topology = display_device::topology;
 
   namespace {
 
@@ -85,6 +86,137 @@ namespace nvhttp::stream_start {
 
     private:
       config::video_t original_config;
+    };
+
+    class preparation_error_t: public std::runtime_error {
+    public:
+      explicit preparation_error_t(const topology::command_result_t &result):
+          std::runtime_error { std::string { "Display setup " } + std::string { topology::to_string(result.outcome) } +
+                               ": " + std::string { topology::to_string(result.reason) } } {}
+    };
+
+    class preparation_context_t {
+    public:
+      explicit preparation_context_t(const launch_coordination_t *coordination):
+          coordination_ { coordination } {
+        if (coordination_ && (coordination_->coordinator.managed_mode() ||
+                               coordination_->token.flavor != topology::launch_flavor_e::legacy ||
+                               !coordination_->legacy_cleanup || !coordination_->fatal_probe_timeout)) {
+          throw std::invalid_argument { "Legacy preparation requires legacy ownership, cleanup and fatal supervision" };
+        }
+      }
+
+      std::chrono::steady_clock::time_point
+      deadline() const {
+        if (!coordination_) return std::chrono::steady_clock::time_point::max();
+        const auto value = coordination_->coordinator.launch_setup_deadline(coordination_->token);
+        if (!value) {
+          throw preparation_error_t { { topology::outcome_e::rejected, topology::reject_reason_e::stale_transaction } };
+        }
+        return std::chrono::steady_clock::time_point { *value };
+      }
+
+      display_device::session_t::configure_result_t
+      configure(std::shared_ptr<rtsp_stream::launch_session_t> session, bool reconfigure) {
+        if (!coordination_) return display_device::session_t::get().configure_display(config::video, *session, reconfigure);
+        auto output = std::make_shared<std::optional<display_device::session_t::configure_result_t>>();
+        step([session = std::move(session), output, reconfigure](const auto &cap, const auto &) {
+          cap.require(topology::operation_e::configure_display);
+          *output = display_device::session_t::get().configure_display(config::video, *session, reconfigure);
+        });
+        return std::move(output->value());
+      }
+
+      void
+      restore() {
+        if (!coordination_) {
+          display_device::session_t::get().restore_state();
+          return;
+        }
+        step([](const auto &cap, const auto &) {
+          cap.require(topology::operation_e::restore_state);
+          display_device::session_t::get().restore_state();
+        });
+      }
+
+      int
+      probe(video::probe_target_t target, std::optional<config::video_t> temporary = {}) {
+        auto output = std::make_shared<std::optional<int>>();
+        auto *coordinator = coordination_ ? &coordination_->coordinator : nullptr;
+        const auto token = coordination_ ? coordination_->token : topology::launch_token_t {};
+        auto work = [coordinator, token, output, target = std::move(target), temporary = std::move(temporary)]() mutable {
+          if (coordinator && !coordinator->launch_setup_deadline(token)) {
+            throw preparation_error_t { { topology::outcome_e::rejected, topology::reject_reason_e::stale_transaction } };
+          }
+          if (temporary) {
+            temporary_video_config_t config { std::move(*temporary) };
+            *output = video::probe_encoders(target);
+          }
+          else {
+            *output = video::probe_encoders(target);
+          }
+        };
+        if (coordination_) {
+          topology::run_supervised_probe(deadline(), fence_, std::move(work),
+            coordination_->fatal_probe_timeout, coordination_->spawn_probe);
+        }
+        else {
+          work();
+        }
+        return output->value();
+      }
+
+      void
+      wait(std::chrono::milliseconds delay) const {
+        const auto until = std::min(std::chrono::steady_clock::now() + delay, deadline());
+        std::this_thread::sleep_until(until);
+        deadline();
+      }
+
+      void
+      finish() {
+        if (!coordination_) return;
+        fence_.reset();
+        if (!coordination_->coordinator.finish_launch_prepare(coordination_->token)) {
+          throw preparation_error_t { { topology::outcome_e::rejected, topology::reject_reason_e::stale_transaction } };
+        }
+      }
+
+      void
+      abort() {
+        if (coordination_) coordination_->coordinator.abort_launch(coordination_->token, {});
+        fence_.reset();
+      }
+
+    private:
+      void
+      step(topology::command_body_t body) {
+        fence_.reset();
+        auto handoff = std::make_shared<topology::probe_handoff_t>();
+        auto *coordinator = &coordination_->coordinator;
+        try {
+          auto cleanup = first_ ? coordination_->legacy_cleanup : topology::command_body_t {};
+          first_ = false;
+          const auto result = coordinator->run_launch_step(coordination_->token, [coordinator, handoff, body = std::move(body)](const auto &cap, const auto &command) {
+              if (!command.may_continue()) return;
+              body(cap, command);
+              if (command.may_continue()) handoff->publish(coordinator->hold_probe_fence()); }, std::move(cleanup));
+          if (!result.completed()) {
+            if (result.exception) std::rethrow_exception(result.exception);
+            throw preparation_error_t { result };
+          }
+          fence_ = handoff->take();
+        }
+        catch (...) {
+          auto unpublished = handoff->abandon();
+          coordinator->abort_launch(coordination_->token, {});
+          throw;
+        }
+      }
+
+      const launch_coordination_t *coordination_;
+      std::shared_ptr<const topology::probe_fence_t> fence_;
+      bool first_ { true };
     };
 
     void
@@ -194,7 +326,8 @@ namespace nvhttp::stream_start {
 
     bool
     retry_deferred_display_config(
-      rtsp_stream::launch_session_t &launch_session,
+      preparation_context_t &preparation,
+      const std::shared_ptr<rtsp_stream::launch_session_t> &launch_session,
       bool is_reconfigure,
       display_device::session_t::configure_result_t &display_result,
       auto_recovery_result_t &recovery_result,
@@ -220,9 +353,9 @@ namespace nvhttp::stream_start {
       };
 
       for (const auto delay : retry_delays) {
-        std::this_thread::sleep_for(delay);
+        preparation.wait(delay);
         probe_matches_display_state = false;
-        display_result = display_device::session_t::get().configure_display(config::video, launch_session, is_reconfigure);
+        display_result = preparation.configure(launch_session, is_reconfigure);
 
         if (display_result.result == result_e::deferred_retry) {
           continue;
@@ -232,10 +365,10 @@ namespace nvhttp::stream_start {
           return false;
         }
 
-        hdr::adopt_vdd_calibration_if_needed(launch_session);
+        hdr::adopt_vdd_calibration_if_needed(*launch_session);
 
         const auto target = refresh_vdd_probe_target ? make_vdd_probe_target() : probe_target;
-        const auto probe_result = video::probe_encoders(target);
+        const auto probe_result = preparation.probe(target);
         probe_matches_display_state = true;
         if (!probe_result) {
           recovery_result.succeeded = true;
@@ -441,6 +574,7 @@ namespace nvhttp::stream_start {
      */
     bool
     try_current_display(
+      preparation_context_t &preparation,
       const display_device::session_t::configure_result_t &display_result,
       auto_recovery_result_t &recovery_result,
       const video::probe_target_t &probe_target) {
@@ -452,7 +586,7 @@ namespace nvhttp::stream_start {
       };
 
       BOOST_LOG(warning) << "Display configuration failed; continuing with current display settings if encoder probing succeeds";
-      if (!video::probe_encoders(probe_target)) {
+      if (!preparation.probe(probe_target)) {
         recovery_result.succeeded = true;
         recovery_result.detail = "Encoder probing succeeded with the current display settings.";
         return true;
@@ -460,7 +594,7 @@ namespace nvhttp::stream_start {
 
       recovery_result.detail = "The current display settings were kept, but encoder probing still failed.";
       if (display_result.cleanup_on_failure) {
-        display_device::session_t::get().restore_state();
+        preparation.restore();
       }
       return false;
     }
@@ -472,7 +606,8 @@ namespace nvhttp::stream_start {
      */
     bool
     try_vdd_display(
-      rtsp_stream::launch_session_t &launch_session,
+      preparation_context_t &preparation,
+      const std::shared_ptr<rtsp_stream::launch_session_t> &launch_session,
       bool is_reconfigure,
       display_device::session_t::configure_result_t &display_result,
       auto_recovery_result_t &recovery_result) {
@@ -485,14 +620,15 @@ namespace nvhttp::stream_start {
 
       const auto original_display_result = display_result;
       const auto original_probe_result = video::last_encoder_probe_result;
-      rtsp_stream::launch_session_t recovery_session {};
-      fill_vdd_recovery_session(recovery_session, launch_session);
+      auto recovery_session = std::make_shared<rtsp_stream::launch_session_t>();
+      fill_vdd_recovery_session(*recovery_session, *launch_session);
 
-      display_result = display_device::session_t::get().configure_display(config::video, recovery_session, is_reconfigure);
+      display_result = preparation.configure(recovery_session, is_reconfigure);
       if (display_result.result == display_device::session_t::configure_result_t::result_e::deferred_retry) {
         auto deferred_recovery_result = auto_recovery_result_t {};
         bool probe_matches_display_state = false;
         if (retry_deferred_display_config(
+              preparation,
               recovery_session,
               is_reconfigure,
               display_result,
@@ -500,7 +636,7 @@ namespace nvhttp::stream_start {
               make_vdd_probe_target(),
               probe_matches_display_state,
               true)) {
-          commit_vdd_recovery_to_launch_session(launch_session, recovery_session);
+          commit_vdd_recovery_to_launch_session(*launch_session, *recovery_session);
           recovery_result.succeeded = true;
           recovery_result.detail = "A VDD-backed display became available after a short retry and encoder probing succeeded.";
           BOOST_LOG(info) << "Recovered stream startup by preparing a VDD-backed display after a deferred retry";
@@ -509,7 +645,7 @@ namespace nvhttp::stream_start {
 
         // A deferred attempt owns a retry timer and may already have created a
         // VDD, so undo it before trying physical-display recovery.
-        display_device::session_t::get().restore_state();
+        preparation.restore();
         display_result = original_display_result;
         video::last_encoder_probe_result = original_probe_result;
         recovery_result.detail = "VDD-backed display recovery remained deferred and was rolled back.";
@@ -521,7 +657,7 @@ namespace nvhttp::stream_start {
         // failures, which it hands to the caller. This attempt was ours, so there
         // is no caller to hand it to - drop the half-configured VDD here.
         if (display_result.cleanup_on_failure) {
-          display_device::session_t::get().restore_state();
+          preparation.restore();
         }
 
         // Keep the failure the caller has to report: the VDD attempt was ours, not
@@ -531,10 +667,10 @@ namespace nvhttp::stream_start {
         recovery_result.detail = "VDD-backed display recovery was attempted, but the VDD display configuration failed.";
         return false;
       }
-      hdr::adopt_vdd_calibration_if_needed(recovery_session);
+      hdr::adopt_vdd_calibration_if_needed(*recovery_session);
 
-      if (!video::probe_encoders(make_vdd_probe_target())) {
-        commit_vdd_recovery_to_launch_session(launch_session, recovery_session);
+      if (!preparation.probe(make_vdd_probe_target())) {
+        commit_vdd_recovery_to_launch_session(*launch_session, *recovery_session);
         recovery_result.succeeded = true;
         recovery_result.detail = "A VDD-backed display became available and encoder probing succeeded.";
         BOOST_LOG(info) << "Recovered stream startup by preparing a VDD-backed display";
@@ -544,7 +680,7 @@ namespace nvhttp::stream_start {
       display_result = original_display_result;
       // The VDD is live at this point but useless, and a later fallback may still
       // want the physical display, so undo the switch we made.
-      display_device::session_t::get().restore_state();
+      preparation.restore();
       video::last_encoder_probe_result = original_probe_result;
       recovery_result.detail = "VDD-backed display recovery was attempted, but encoder probing still failed.";
       return false;
@@ -555,10 +691,11 @@ namespace nvhttp::stream_start {
      */
     bool
     recover_display(
+      preparation_context_t &preparation,
       const display_device::display_intent_t &intent,
       configure_outcome_e outcome,
       bool no_display_to_capture,
-      rtsp_stream::launch_session_t &launch_session,
+      const std::shared_ptr<rtsp_stream::launch_session_t> &launch_session,
       bool is_reconfigure,
       display_device::session_t::configure_result_t &display_result,
       auto_recovery_result_t &recovery_result,
@@ -566,6 +703,7 @@ namespace nvhttp::stream_start {
       const auto try_current = [&] {
         display_recovery_attempted = true;
         return try_current_display(
+          preparation,
           display_result,
           recovery_result,
           make_configured_probe_target(intent, make_probe_target(intent)));
@@ -575,7 +713,7 @@ namespace nvhttp::stream_start {
           return false;
         }
         display_recovery_attempted = true;
-        return try_vdd_display(launch_session, is_reconfigure, display_result, recovery_result);
+        return try_vdd_display(preparation, launch_session, is_reconfigure, display_result, recovery_result);
       };
 
       if (no_display_to_capture) {
@@ -602,6 +740,7 @@ namespace nvhttp::stream_start {
 
     bool
     recover_with_temporary_encoder_config(
+      preparation_context_t &preparation,
       auto_recovery_result_t &recovery_result,
       const video::probe_target_t &probe_target) {
       const auto probe_error = video::last_encoder_probe_result.error;
@@ -633,8 +772,7 @@ namespace nvhttp::stream_start {
       }
 
       {
-        temporary_video_config_t temporary_config { std::move(fallback_config) };
-        if (!video::probe_encoders(probe_target)) {
+        if (!preparation.probe(probe_target, std::move(fallback_config))) {
           recovery_result.succeeded = true;
           recovery_result.detail = "Temporary encoder fallback succeeded without changing the saved configuration.";
           BOOST_LOG(info) << "Recovered stream startup using " << recovery_result.action;
@@ -676,22 +814,23 @@ namespace nvhttp::stream_start {
     tree.put("root.sunshine_recoverable", recoverable ? 1 : 0);
   }
 
-  bool
-  prepare_display_and_probe_encoders(
+  static bool
+  prepare_display(
+    preparation_context_t &preparation,
     pt::ptree &tree,
-    rtsp_stream::launch_session_t &launch_session,
+    const std::shared_ptr<rtsp_stream::launch_session_t> &launch_session,
     bool is_reconfigure) {
-    const auto intent = display_device::resolve_display_intent(config::video, launch_session);
+    const auto intent = display_device::resolve_display_intent(config::video, *launch_session);
     if (!validate_display_intent(tree, intent)) {
       return false;
     }
 
     // Display configuration can change the active capture target, so probe
     // encoders only after the display stack has settled.
-    auto display_result = display_device::session_t::get().configure_display(config::video, launch_session, is_reconfigure);
+    auto display_result = preparation.configure(launch_session, is_reconfigure);
     auto outcome = classify_configure_result(display_result.result);
     if (display_result) {
-      hdr::adopt_vdd_calibration_if_needed(launch_session);
+      hdr::adopt_vdd_calibration_if_needed(*launch_session);
     }
 
 #ifdef _WIN32
@@ -701,11 +840,11 @@ namespace nvhttp::stream_start {
     // remote-software virtual digitizer); failures degrade to a log line.
     {
       bool touch_effective = false;
-      if (launch_session.touch_keyboard < 0) {
-        touch_effective = config::get_client_touch_keyboard_enabled(launch_session.client_cert_uuid);
+      if (launch_session->touch_keyboard < 0) {
+        touch_effective = config::get_client_touch_keyboard_enabled(launch_session->client_cert_uuid);
       }
       else {
-        touch_effective = launch_session.touch_keyboard == 1;
+        touch_effective = launch_session->touch_keyboard == 1;
       }
       touch_kb::start_session(touch_effective);
     }
@@ -725,13 +864,14 @@ namespace nvhttp::stream_start {
       outcome == configure_outcome_e::ok || outcome == configure_outcome_e::retry_later;
     if (initial_state_can_be_probed) {
       const auto configured_probe_target = make_configured_probe_target(intent, probe_target);
-      const auto probe_result = video::probe_encoders(configured_probe_target);
+      const auto probe_result = preparation.probe(configured_probe_target);
       probe_matches_display_state = true;
       if (!probe_result) {
         return true;
       }
 
       if (retry_deferred_display_config(
+            preparation,
             launch_session,
             is_reconfigure,
             display_result,
@@ -760,6 +900,7 @@ namespace nvhttp::stream_start {
     bool display_recovery_attempted = false;
 
     if (recover_display(
+          preparation,
           intent,
           outcome,
           no_display_to_capture,
@@ -775,6 +916,7 @@ namespace nvhttp::stream_start {
     auto_recovery_result_t encoder_recovery_result;
     if (!display_recovery_attempted && probe_matches_display_state &&
         recover_with_temporary_encoder_config(
+          preparation,
           encoder_recovery_result,
           make_configured_probe_target(intent, probe_target))) {
       set_auto_recovery_status(tree, encoder_recovery_result);
@@ -800,6 +942,36 @@ namespace nvhttp::stream_start {
     }
 
     return false;
+  }
+
+  bool
+  prepare_display_and_probe_encoders(
+    pt::ptree &tree,
+    std::shared_ptr<rtsp_stream::launch_session_t> launch_session,
+    bool is_reconfigure,
+    const launch_coordination_t *coordination) {
+    if (!launch_session) throw std::invalid_argument { "Display preparation requires a launch session" };
+    preparation_context_t preparation { coordination };
+    try {
+      preparation.deadline();
+      if (!prepare_display(preparation, tree, launch_session, is_reconfigure)) {
+        preparation.abort();
+        return false;
+      }
+      preparation.finish();
+      return true;
+    }
+    catch (const preparation_error_t &error) {
+      preparation.abort();
+      set_sunshine_error(tree, 503, error.what(), "DISPLAY_SETUP_ABORTED",
+        "Retry after the current display operation completes.", "retry_launch",
+        "display", "display_configuration", true);
+      return false;
+    }
+    catch (...) {
+      preparation.abort();
+      throw;
+    }
   }
 
 }  // namespace nvhttp::stream_start

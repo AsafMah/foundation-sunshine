@@ -32,8 +32,9 @@ command queue with generation invalidation, per-command cancellation handles,
 and deadlines, plus standalone fake-clock tests. Per-command handles let launch
 expiry cancel only its associated monitor operation. The queue is not yet wired
 into production and does not authorize platform operations. There are no changes
-to production session/video/stream/RTSP/HTTP/tray/config/UI paths. Cross-GPU
-transfer is excluded, not an automatic fallback.
+to active display routing: the launch helper now accepts shared requests and an
+optional staged adapter, but its production callers still use the direct path.
+Cross-GPU transfer is excluded, not an automatic fallback.
 
 ## Code and existing-type adoption
 
@@ -399,10 +400,33 @@ that exceeds the deadline invokes the fatal hook. Returning/throwing fake hooks
 still join the driver and cannot convert timeout into success. Supervision on
 the mutation worker is forbidden. A shared handoff transfers a fence exactly
 once and rejects abandoned late publication, so stale results cannot strand
-cleanup. These fixtures use no hardware. The production launch helper, startup
-probe and nonreturning fatal hook remain unwired; this is not a streaming claim.
+cleanup. These fixtures use no hardware. The process runtime, startup probe and
+nonreturning fatal hook remain unwired; this is not a streaming claim.
 Callers must still retain the fence through teardown and enqueue cleanup before
 releasing admission.
+
+The real launch helper now supports optional coordinated legacy preparation.
+Configure, restore and fallback steps use one owner and its original deadline;
+the worker publishes a probe fence before completion. Queued work owns its
+request and result, including a separate shared VDD-recovery request, so HTTP
+expiry cannot leave references to handler-local storage. Probes run on supervised
+threads, recheck ownership at entry, and restore temporary encoder configuration
+before rollback can execute. A failed stage queues abort before releasing its
+fence. Successful preparation explicitly seals readiness for later ticket bind.
+Cleanup eligibility remains supplied by the caller, preserving launch/resume's
+different failure obligations. Invalid bundles are programming errors before
+ownership adoption; their caller still owns the admission.
+
+The actual-helper fake-platform target now exercises nine policy fixtures in
+both direct and coordinated modes, plus seven lifetime/interleaving fixtures
+(25 cases). SP1-SP14 were rechecked in both modes; SA1-SA12 exercise staged
+ownership, threading, deadlines, sealing and cleanup. All deliberate faults
+failed their intended cases, with failure messages inspected. The missing-fence
+mutant is rejected by supervisor validation before probe entry; it is not
+evidence that an unfenced graphics operation was allowed. These are software
+checks, not hardware qualification. Production callers still omit the optional
+adapter: enabling it also requires replacing their old restore guards and
+completing runtime, ticket, raw-capability and shutdown wiring.
 
 The ticket manager also supports a short binding check before publication or
 replacement, under its mutex and after capacity checks. A refused or throwing

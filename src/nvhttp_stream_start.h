@@ -4,12 +4,26 @@
  */
 #pragma once
 
+#include "display_device/topology_routes.h"
 #include "rtsp.h"
 
 #include <boost/property_tree/ptree.hpp>
 #include <string>
 
 namespace nvhttp::stream_start {
+
+  /**
+   * Legacy staged preparation. The coordinator and cleanup captures must outlive
+   * late mutations; the bundle itself is borrowed only for this synchronous call.
+   * fatal_probe_timeout must terminate production nonzero without blocking.
+   */
+  struct launch_coordination_t {
+    display_device::topology::coordinator_t &coordinator;
+    display_device::topology::launch_token_t token;
+    display_device::topology::command_body_t legacy_cleanup;
+    std::function<void()> fatal_probe_timeout;
+    display_device::topology::probe_thread_factory_t spawn_probe;
+  };
 
   void
   set_sunshine_error(
@@ -23,10 +37,16 @@ namespace nvhttp::stream_start {
     const std::string &stage,
     bool recoverable);
 
+  /**
+   * A coordinated success seals preparation, not ticket publication. The caller
+   * still owns abort/bind and any application it starts. Invalid bundles throw
+   * before ownership is adopted. Omitting coordination preserves the direct path.
+   */
   bool
   prepare_display_and_probe_encoders(
     boost::property_tree::ptree &tree,
-    rtsp_stream::launch_session_t &launch_session,
-    bool is_reconfigure);
+    std::shared_ptr<rtsp_stream::launch_session_t> launch_session,
+    bool is_reconfigure,
+    const launch_coordination_t *coordination = nullptr);
 
 }  // namespace nvhttp::stream_start
