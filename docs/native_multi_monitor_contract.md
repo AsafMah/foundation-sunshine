@@ -352,9 +352,22 @@ creation without a head can still clear; interrupted field-only writes still
 replay selectively. An incompletely persisted rollback likewise cannot be
 settled merely by seeing the other displays return to their baseline. Three
 regressions fail on the former recovery path; five deliberate mutations cover
-restart, mixed-step journals and the clearable/replay boundaries. All 87 native
-suite cases pass after byte-for-byte restoration.
-The concrete Windows native backend and shared raw-setter gates remain pending.
+restart, mixed-step journals and the clearable/replay boundaries. That 87-case
+checkpoint passed after byte-for-byte restoration.
+
+Native creation now distinguishes acknowledged and uncertain delivery; errors
+are reserved for definite refusal. Default construction means uncertain, and
+expected truthiness is not treated as acknowledgement. Uncertain delivery with
+no head retains the journal without retry or later adoption. With exactly one
+head, the approved immediate same-run rollback remains possible, but creation
+is not reported successful. A definite refusal cannot own an appearing head.
+Before rollback, and before removal after field restoration, the current sole
+head must match the observed OS ID, adapter, source incarnation and available
+head identity. Changed or unavailable evidence prevents global removal. This
+detects observable interference, not arbitrary concurrent external writers.
+Six additional fake-platform cases and seventeen assertion-killed mutations
+cover these branches; all 93 native cases pass after restoration. The concrete
+Windows delivery mapping/backend and production routing remain pending.
 
 Posted commands now offer individual completion receipts, including eager
 rejection, worker-side rejection, failure and shutdown cancellation before a

@@ -49,6 +49,11 @@ namespace display_device::topology {
   result_t<std::optional<native_profile_t>>
   parse_native_profile(std::string_view text);
 
+  enum class creation_delivery_e : std::uint8_t {
+    uncertain = 0,
+    accepted,
+  };
+
   class native_platform_t {
   public:
     virtual ~native_platform_t() = default;
@@ -67,9 +72,11 @@ namespace display_device::topology {
     /**
      * Ask the virtual display driver for one more head, then wait (bounded) for it to be
      * listed. An error means the driver refused, so no head of this request can appear;
-     * success means it accepted, even if the head is not listed yet.
+     * an accepted value confirms delivery, even if the head is not listed yet.
+     * An uncertain value is not an acknowledgement or a refusal. In particular,
+     * expected truthiness alone does not mean that delivery was accepted.
      */
-    virtual result_t<void>
+    virtual result_t<creation_delivery_e>
     create_head(const mutation_capability_t &capability, const head_guid_t &intent) final;
 
     /** Remove every virtual head, then wait (bounded) for them to be unlisted. The driver offers no per-head removal. */
@@ -83,7 +90,7 @@ namespace display_device::topology {
   protected:
     // Keep concrete hooks nonpublic and carry the capability through to raw setters.
     // The entry guards check authority, not proof that a head belongs to this request.
-    virtual result_t<void>
+    virtual result_t<creation_delivery_e>
     do_create_head(const mutation_capability_t &capability, const head_guid_t &intent) = 0;
 
     virtual result_t<void>
@@ -175,7 +182,8 @@ namespace display_device::topology {
     prepare_virtual(const mutation_capability_t &capability);
 
     native_outcome_t
-    roll_back_head(const mutation_capability_t &capability, const journal_record_t &record, const std::string &why);
+    roll_back_head(const mutation_capability_t &capability, const journal_record_t &record,
+      const observed_display_t &expected, const std::string &why);
 
     /** In conflict: the journal is kept. */
     native_outcome_t

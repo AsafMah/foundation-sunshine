@@ -144,6 +144,19 @@ namespace display_device::topology {
       return heads;
     }
 
+    bool
+    sole_matching_head(const native_platform_t &platform, const inventory_t &inventory, const observed_display_t &expected) {
+      if (!inventory.available) {
+        return false;
+      }
+      const auto heads = virtual_heads(platform, inventory);
+      if (heads.size() != 1 || heads.front()->id != expected.id) {
+        return false;
+      }
+      const auto &head = *heads.front();
+      return head.adapter == expected.adapter && head.incarnation == expected.incarnation && head.head == expected.head;
+    }
+
     using signature_t = std::vector<std::pair<std::string, device_state_e>>;
 
     /**
@@ -321,7 +334,7 @@ namespace display_device::topology {
       os_display_id_t { monitor.at("display").get<std::string>() } } };
   }
 
-  result_t<void>
+  result_t<creation_delivery_e>
   native_platform_t::create_head(const mutation_capability_t &capability, const head_guid_t &intent) {
     capability.require(operation_e::native_apply);
     return do_create_head(capability, intent);
@@ -477,7 +490,9 @@ namespace display_device::topology {
       }
       if (heads.empty()) {
         if (created) {
-          return unresolved("The driver accepted the request but no virtual display appeared");
+          return unresolved(*created == creation_delivery_e::accepted ?
+                              "The driver accepted the request but no virtual display appeared" :
+                              "The driver delivery is uncertain and no virtual display appeared");
         }
         // The driver refused the request, so no display of it can appear later.
         failure = created.error().detail.empty() ? std::string { "the driver reported an error" } : created.error().detail;
@@ -492,10 +507,13 @@ namespace display_device::topology {
 
       const auto &head = *heads.front();
       if (!created) {
-        return roll_back_head(capability, record, "The driver reported an error but a virtual display appeared: " + created.error().detail);
+        return unresolved("The driver refused the request but a virtual display appeared: " + created.error().detail);
+      }
+      if (*created != creation_delivery_e::accepted) {
+        return roll_back_head(capability, record, head, "The driver delivery is uncertain");
       }
       if (unmanaged_signature(platform_, after, record) != expected) {
-        return roll_back_head(capability, record, "Creating the virtual display changed other displays");
+        return roll_back_head(capability, record, head, "Creating the virtual display changed other displays");
       }
       auto &step = record.steps.back();
       step.state = journal_step_state_e::observed;
@@ -504,7 +522,7 @@ namespace display_device::topology {
       record.owned_heads.push_back({ head_identity_t { options_.driver, intent, head_incarnation_t { 1 } }, owner_,
         head.adapter.value_or(adapter_luid_t {}), 0 });
       if (const auto saved = store_.save(record); !saved) {
-        return roll_back_head(capability, record, "The native journal could not record the new virtual display: " + saved.error().detail);
+        return roll_back_head(capability, record, head, "The native journal could not record the new virtual display: " + saved.error().detail);
       }
       created_in_this_run_ = record.transaction;
       health_ = { true, false, {} };
@@ -514,9 +532,13 @@ namespace display_device::topology {
   }
 
   native_outcome_t
-  native_executor_t::roll_back_head(const mutation_capability_t &capability, const journal_record_t &record, const std::string &why) {
+  native_executor_t::roll_back_head(const mutation_capability_t &capability, const journal_record_t &record,
+    const observed_display_t &expected, const std::string &why) {
     // Same-run proof: no virtual display existed before, exactly one exists now, and
     // the coordinator serializes every other virtual display operation.
+    if (!sole_matching_head(platform_, platform_.inventory(), expected)) {
+      return conflict(why + "; the virtual display could not be proven to be this host's before rollback");
+    }
     if (const auto removed = platform_.remove_all_heads(capability); !removed) {
       return conflict(why + "; removing it failed: " + removed.error().detail);
     }
@@ -623,7 +645,7 @@ namespace display_device::topology {
       }
     }
 
-    std::optional<os_display_id_t> owned_display;
+    const observed_display_t *owned_display = nullptr;
     if (attempted(record, journal_operation_e::create_head, nullptr)) {
       const auto heads = virtual_heads(platform_, current);
       if (!heads.empty()) {
@@ -631,10 +653,11 @@ namespace display_device::topology {
           return conflict("A virtual display from an earlier run cannot be proven to be this host's, so it is left in place");
         }
         const auto *created = observed_create(record);
-        if (record.owned_heads.size() != 1 || heads.size() != 1 || !created || created->display != heads.front()->id) {
+        const auto *expected = created && created->display && created->observed ? find_unique(*created->observed, *created->display) : nullptr;
+        if (record.owned_heads.size() != 1 || !expected || !sole_matching_head(platform_, current, *expected)) {
           return conflict("The virtual displays present no longer match the one this host created, so none is removed");
         }
-        owned_display = heads.front()->id;
+        owned_display = expected;
       }
     }
 
@@ -647,8 +670,7 @@ namespace display_device::topology {
       if (!restores.empty()) {
         // The restores changed the topology, so the proof is repeated before removing.
         const auto before = platform_.inventory();
-        const auto heads = before.available ? virtual_heads(platform_, before) : std::vector<const observed_display_t *> {};
-        if (heads.size() != 1 || heads.front()->id != *owned_display) {
+        if (!sole_matching_head(platform_, before, *owned_display)) {
           return conflict("The virtual display could not be proven to be this host's after restoring fields, so it is left in place");
         }
       }

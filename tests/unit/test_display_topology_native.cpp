@@ -31,6 +31,7 @@ namespace {
   using display_topology_test::error_is;
   using display_topology_test::id;
   using dt::native_verdict_e;
+  using delivery_e = dt::creation_delivery_e;
   using state_e = display_device::device_state_e;
   using step_e = dt::journal_step_state_e;
 
@@ -130,6 +131,21 @@ namespace {
       }
     }
     throw std::runtime_error { "fixture has no display " + name };
+  }
+
+  using inventory_change_t = std::pair<std::string, std::function<void(dt::inventory_t &)>>;
+
+  std::vector<inventory_change_t>
+  changed_head_identities() {
+    return {
+      { "OS identity", [](auto &inventory) { find(inventory, "vdd-1").id = dt::os_display_id_t { "replacement" }; } },
+      { "adapter", [](auto &inventory) { find(inventory, "vdd-1").adapter = dt::adapter_luid_t { 8 }; } },
+      { "missing adapter", [](auto &inventory) { find(inventory, "vdd-1").adapter.reset(); } },
+      { "incarnation", [](auto &inventory) { find(inventory, "vdd-1").incarnation = dt::source_incarnation_t { 2 }; } },
+      { "head identity", [](auto &inventory) {
+         find(inventory, "vdd-1").head = dt::head_identity_t { driver(), id<dt::head_guid_t>(0x76), dt::head_incarnation_t { 2 } };
+       } },
+    };
   }
 
   struct event_log_t {
@@ -245,7 +261,7 @@ namespace {
     event_log_t &log_;
   };
 
-  dt::result_t<void>
+  std::unexpected<dt::error_t>
   failure(const std::string &detail) {
     return std::unexpected(dt::error_t { dt::error_code_e::resource_unavailable, detail, {} });
   }
@@ -277,7 +293,7 @@ namespace {
     }
 
   private:
-    dt::result_t<void>
+    dt::result_t<delivery_e>
     do_create_head(const dt::mutation_capability_t &capability, const dt::head_guid_t &intent) override {
       if (on_mutation) on_mutation(&capability);
       log_.add("create_head");
@@ -286,7 +302,7 @@ namespace {
         return on_create(intents.size());
       }
       add_head();
-      return {};
+      return delivery_e::accepted;
     }
 
     dt::result_t<void>
@@ -349,7 +365,7 @@ namespace {
     std::vector<dt::head_guid_t> intents;
     std::vector<std::pair<dt::os_display_id_t, dt::managed_values_t>> applied;
     /** Replaces the default create (one new head, success); receives the 1-based attempt. */
-    std::function<dt::result_t<void>(std::size_t)> on_create;
+    std::function<dt::result_t<delivery_e>(std::size_t)> on_create;
     /** Replaces the default removal (every head goes, success). */
     std::function<dt::result_t<void>()> on_remove;
     std::function<void()> after_apply;
@@ -420,7 +436,7 @@ namespace {
     }
   }
 
-  dt::result_t<void>
+  dt::result_t<delivery_e>
   platform_create(dt::native_platform_t &platform, const dt::mutation_capability_t &capability) {
     return platform.create_head(capability, id<dt::head_guid_t>(0x71));
   }
@@ -757,6 +773,19 @@ TEST_F(NativeExecutor, PlatformBoundaryRejectsOffWorkerUseBeforeEnteringTheBacke
   EXPECT_EQ(log.host_writes(), 0);
 }
 
+TEST_F(NativeExecutor, PlatformBoundaryPreservesCreationDelivery) {
+  with_capability(dt::command_kind_e::launch_prepare, [&](const auto &capability) {
+    for (const auto delivery : { delivery_e {}, delivery_e::accepted }) {
+      platform.on_create = [=](std::size_t) { return delivery; };
+      const auto result = platform_create(platform, capability);
+      ASSERT_TRUE(result);
+      EXPECT_EQ(*result, delivery);
+    }
+  }, true);
+  EXPECT_EQ(delivery_e {}, delivery_e::uncertain);
+  EXPECT_EQ(log.host_writes(), 2u);
+}
+
 TEST_F(NativeExecutor, PlatformBoundaryExposesNoUngatedMutationOverload) {
   EXPECT_FALSE(ungated_create<dt::native_platform_t>);
   EXPECT_FALSE(ungated_remove<dt::native_platform_t>);
@@ -788,7 +817,7 @@ TEST_F(NativeExecutor, PlatformCallsRetainTheOriginalCapabilityThroughRollbackAn
 
   platform.on_create = [&](std::size_t) {
     platform.add_head();
-    return failure("driver refused after creation");
+    return delivery_e::uncertain;
   };
   run(dt::command_kind_e::launch_prepare, [&](const auto &capability) {
     EXPECT_TRUE(verdict_is(executor.prepare(capability, virtual_profile()), native_verdict_e::refused));
@@ -887,13 +916,13 @@ TEST_F(NativeExecutor, PrepareFailsClosedWhileAnyJournalExists) {
 
 TEST_F(NativeExecutor, VirtualDisplayIsJournaledBeforeItIsCreated) {
   bool journaled_first = false;
-  platform.on_create = [&](std::size_t) -> dt::result_t<void> {
+  platform.on_create = [&](std::size_t) -> dt::result_t<delivery_e> {
     const auto record = store.record();
     journaled_first = record && record->steps.size() == 1 && record->steps[0].operation == dt::journal_operation_e::create_head &&
                       record->steps[0].state == step_e::attempted && record->steps[0].head_intent == platform.intents.back() &&
                       record->owned_heads.empty() && record->baseline.displays == host_inventory().displays;
     platform.add_head();
-    return {};
+    return delivery_e::accepted;
   };
   const auto outcome = prepare_with(executor, virtual_profile());
   ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok));
@@ -944,12 +973,12 @@ TEST_F(NativeExecutor, AnUnknownInventoryCreatesNothing) {
 }
 
 TEST_F(NativeExecutor, RetriesKeepTheFirstBaselineAndUseFreshIdentities) {
-  platform.on_create = [&](std::size_t attempt) -> dt::result_t<void> {
+  platform.on_create = [&](std::size_t attempt) -> dt::result_t<delivery_e> {
     if (attempt == 1) {
       return failure("driver busy");
     }
     platform.add_head();
-    return {};
+    return delivery_e::accepted;
   };
   // Geometry is outside the "other displays" check, so a moved display does not stop the
   // retry; it must not leak into the journaled baseline either.
@@ -1015,8 +1044,89 @@ TEST_F(NativeExecutor, ARefusedRequestThatDisturbedOtherDisplaysIsNotRetried) {
   EXPECT_FALSE(store.bytes);
 }
 
+TEST_F(NativeExecutor, UncertainCreationWithoutAHeadCannotBeRetriedOrAdopted) {
+  for (const bool fail_result_save : { false, true }) {
+    SCOPED_TRACE(fail_result_save);
+    ASSERT_TRUE(healthy(reset_with(executor)));
+    store.saves = 0;
+    store.fail_save_call = fail_result_save ? 2 : 0;
+    platform.host = host_inventory();
+    platform.intents.clear();
+    platform.on_create = [](std::size_t) { return dt::result_t<delivery_e> {}; };
+    log.events.clear();
+    const auto outcome = prepare_with(executor, virtual_profile());
+    EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
+    EXPECT_TRUE(mentions(outcome.reason, "uncertain"));
+    EXPECT_FALSE(outcome.target);
+    EXPECT_EQ(platform.intents.size(), 1u);
+    ASSERT_TRUE(store.bytes);
+    const auto record = store.record();
+    ASSERT_TRUE(record);
+    EXPECT_TRUE(record->owned_heads.empty());
+    EXPECT_EQ(record->steps.front().state, fail_result_save ? step_e::attempted : step_e::conflict);
+    const auto bytes = store.bytes;
+    const auto reads = platform.reads;
+    auto restarted = make_executor();
+    EXPECT_TRUE(in_conflict(recover_with(restarted)));
+    EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
+    platform.add_head();
+    EXPECT_TRUE(verdict_is(restore_with(restarted), native_verdict_e::conflict));
+    EXPECT_TRUE(verdict_is(prepare_with(restarted, physical_profile("os-B")), native_verdict_e::conflict));
+    EXPECT_TRUE(verdict_is(prepare_with(restarted, virtual_profile()), native_verdict_e::conflict));
+    EXPECT_EQ(store.bytes, bytes);
+    EXPECT_EQ(platform.reads, reads);
+    EXPECT_EQ(log.host_writes(), 1u);
+    EXPECT_EQ(platform.head_count(), 1u);
+  }
+}
+
+TEST_F(NativeExecutor, ARefusedCreationDoesNotOwnAnAppearingHead) {
+  platform.on_create = [&](std::size_t) {
+    platform.add_head();
+    return failure("definite refusal");
+  };
+  const auto outcome = prepare_with(executor, virtual_profile());
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
+  EXPECT_TRUE(mentions(outcome.reason, "definite refusal"));
+  EXPECT_FALSE(outcome.target);
+  EXPECT_EQ(platform.intents.size(), 1u);
+  EXPECT_EQ(platform.head_count(), 1u);
+  EXPECT_EQ(log.host_writes(), 1u);
+  ASSERT_TRUE(store.bytes);
+  EXPECT_TRUE(store.record()->owned_heads.empty());
+  const auto bytes = store.bytes;
+  platform.drop_heads();
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
+  auto restarted = make_executor();
+  EXPECT_TRUE(in_conflict(recover_with(restarted)));
+  EXPECT_EQ(store.bytes, bytes);
+  EXPECT_EQ(log.host_writes(), 1u);
+}
+
+TEST_F(NativeExecutor, UncertainCreationCannotRemoveAHeadAfterItsProofChanges) {
+  platform.on_create = [&](std::size_t) {
+    platform.add_head();
+    return delivery_e::uncertain;
+  };
+  platform.tamper = [&](int read, auto &) {
+    if (read == 2) {
+      find(platform.host, "vdd-1").incarnation = dt::source_incarnation_t { 2 };
+    }
+  };
+  const auto outcome = prepare_with(executor, virtual_profile());
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
+  EXPECT_TRUE(mentions(outcome.reason, "uncertain"));
+  EXPECT_TRUE(mentions(outcome.reason, "could not be proven"));
+  EXPECT_FALSE(outcome.target);
+  EXPECT_EQ(log.host_writes(), 1u);
+  EXPECT_EQ(platform.head_count(), 1u);
+  ASSERT_TRUE(store.bytes);
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
+  EXPECT_EQ(log.host_writes(), 1u);
+}
+
 TEST_F(NativeExecutor, AnAcceptedRequestWithoutADisplayStaysUnresolvedUntilReset) {
-  platform.on_create = [](std::size_t) -> dt::result_t<void> { return {}; };
+  platform.on_create = [](std::size_t) { return delivery_e::accepted; };
   const auto outcome = prepare_with(executor, virtual_profile());
   EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
   EXPECT_TRUE(mentions(outcome.reason, "accepted the request"));
@@ -1068,10 +1178,10 @@ TEST_F(NativeExecutor, AnUnknownInventoryAfterCreatingIsUnresolved) {
 }
 
 TEST_F(NativeExecutor, TwoNewVirtualDisplaysAreLeftInPlace) {
-  platform.on_create = [&](std::size_t) -> dt::result_t<void> {
+  platform.on_create = [&](std::size_t) {
     platform.add_head();
     platform.add_head();
-    return {};
+    return delivery_e::accepted;
   };
   EXPECT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::conflict));
   EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
@@ -1080,14 +1190,14 @@ TEST_F(NativeExecutor, TwoNewVirtualDisplaysAreLeftInPlace) {
   EXPECT_TRUE(store.bytes);
 }
 
-TEST_F(NativeExecutor, ADisplayDespiteADriverErrorIsRolledBack) {
+TEST_F(NativeExecutor, AnUncertainCreateWithSameRunProofIsRolledBack) {
   platform.on_create = [&](std::size_t) {
     platform.add_head();
-    return failure("timed out");
+    return delivery_e::uncertain;
   };
   const auto outcome = prepare_with(executor, virtual_profile());
   EXPECT_TRUE(verdict_is(outcome, native_verdict_e::refused));
-  EXPECT_TRUE(mentions(outcome.reason, "timed out"));
+  EXPECT_TRUE(mentions(outcome.reason, "uncertain"));
   EXPECT_EQ(log.events, (std::vector<std::string> { "save", "create_head", "remove_all_heads", "clear" }));
   EXPECT_EQ(platform.head_count(), 0u);
   EXPECT_FALSE(store.bytes);
@@ -1095,10 +1205,10 @@ TEST_F(NativeExecutor, ADisplayDespiteADriverErrorIsRolledBack) {
 }
 
 TEST_F(NativeExecutor, ADisplayThatDisturbedOtherDisplaysIsRolledBack) {
-  platform.on_create = [&](std::size_t) -> dt::result_t<void> {
+  platform.on_create = [&](std::size_t) {
     platform.add_head();
     find(platform.host, "os-B").info.device_state = state_e::inactive;
-    return {};
+    return delivery_e::accepted;
   };
   platform.on_remove = [&]() -> dt::result_t<void> {
     platform.drop_heads();
@@ -1113,10 +1223,10 @@ TEST_F(NativeExecutor, ADisplayThatDisturbedOtherDisplaysIsRolledBack) {
 }
 
 TEST_F(NativeExecutor, UnpersistedRollbackDoesNotProveAnAttemptIsSettled) {
-  platform.on_create = [&](std::size_t) -> dt::result_t<void> {
+  platform.on_create = [&](std::size_t) {
     platform.add_head();
     find(platform.host, "os-B").info.device_state = state_e::inactive;
-    return {};
+    return delivery_e::accepted;
   };
   const auto outcome = prepare_with(executor, virtual_profile());
   EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
@@ -1139,7 +1249,7 @@ TEST_F(NativeExecutor, UnpersistedRollbackDoesNotProveAnAttemptIsSettled) {
 TEST_F(NativeExecutor, AFailedOrUnconfirmedRollbackIsInConflict) {
   platform.on_create = [&](std::size_t) {
     platform.add_head();
-    return failure("timed out");
+    return delivery_e::uncertain;
   };
   platform.on_remove = [] { return failure("remove refused"); };
   auto outcome = prepare_with(executor, virtual_profile());
@@ -1188,8 +1298,39 @@ TEST_F(NativeExecutor, AnUnrecordedDisplayIsRolledBack) {
   EXPECT_FALSE(store.bytes);
 }
 
+TEST_F(NativeExecutor, RollbackRechecksTheObservedHeadBeforeGlobalRemoval) {
+  auto changes = changed_head_identities();
+  changes.emplace_back("unavailable", [](auto &inventory) { inventory.available = false; });
+  changes.emplace_back("absent", [](auto &inventory) {
+    std::erase_if(inventory.displays, [](const auto &display) { return display.info.friendly_name == "ZakoVDD"; });
+  });
+  changes.emplace_back("another head", [](auto &inventory) { inventory.displays.push_back(virtual_display("another", 7680)); });
+  for (const auto &[name, change] : changes) {
+    SCOPED_TRACE(name);
+    ASSERT_TRUE(healthy(reset_with(executor)));
+    store.saves = 0;
+    store.fail_save_call = 2;
+    platform.host = host_inventory();
+    platform.reads = 0;
+    platform.created = 0;
+    platform.tamper = [&](int read, auto &) {
+      if (read == 2) {
+        // The returned observation is already captured; the live host changes before rollback.
+        change(platform.host);
+      }
+    };
+    log.events.clear();
+    const auto outcome = prepare_with(executor, virtual_profile());
+    EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
+    EXPECT_TRUE(mentions(outcome.reason, "could not be proven"));
+    EXPECT_EQ(log.events, (std::vector<std::string> { "save", "create_head", "save" }));
+    ASSERT_TRUE(store.bytes);
+    EXPECT_EQ(store.record()->steps.front().state, step_e::attempted);
+  }
+}
+
 TEST_F(NativeExecutor, AnExceptionAfterJournalingKeepsTheJournal) {
-  platform.on_create = [](std::size_t) -> dt::result_t<void> { throw std::runtime_error { "driver crashed" }; };
+  platform.on_create = [](std::size_t) -> dt::result_t<delivery_e> { throw std::runtime_error { "driver crashed" }; };
   const auto outcome = prepare_with(executor, virtual_profile());
   EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
   EXPECT_TRUE(mentions(outcome.reason, "driver crashed"));
@@ -1197,7 +1338,7 @@ TEST_F(NativeExecutor, AnExceptionAfterJournalingKeepsTheJournal) {
   EXPECT_TRUE(in_conflict(executor.health()));
 
   ASSERT_TRUE(healthy(reset_with(executor)));
-  platform.on_create = [](std::size_t) -> dt::result_t<void> { throw not_a_std_exception_t {}; };
+  platform.on_create = [](std::size_t) -> dt::result_t<delivery_e> { throw not_a_std_exception_t {}; };
   const auto unknown = prepare_with(executor, virtual_profile());
   EXPECT_TRUE(verdict_is(unknown, native_verdict_e::conflict));
   EXPECT_EQ(unknown.reason, "Native prepare failed");
@@ -1421,7 +1562,7 @@ TEST_F(NativeExecutor, ARefusalWhoseJournalCannotBeRemovedIsInConflict) {
 }
 
 TEST_F(NativeExecutor, AnUnresolvedMarkerThatCannotBeSavedIsReported) {
-  platform.on_create = [](std::size_t) -> dt::result_t<void> { return {}; };
+  platform.on_create = [](std::size_t) { return delivery_e::accepted; };
   store.fail_save_call = 2;
   const auto outcome = prepare_with(executor, virtual_profile());
   EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
@@ -1990,6 +2131,34 @@ namespace {
     store.put(record);
   }
 }  // namespace
+
+TEST_F(NativeExecutor, RestoreChecksTheFullObservedHeadIdentityBeforeEveryRemoval) {
+  for (const bool restore_fields : { false, true }) {
+    for (const auto &[name, change] : changed_head_identities()) {
+      SCOPED_TRACE(name + (restore_fields ? " after field restore" : " before restore"));
+      ASSERT_TRUE(healthy(reset_with(executor)));
+      platform.host = host_inventory();
+      platform.created = 0;
+      platform.after_apply = {};
+      ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+      if (restore_fields) {
+        add_field_write(store);
+        find(platform.host, "os-B").layout->position = *moved.position;
+        platform.after_apply = [&] { change(platform.host); };
+      }
+      else {
+        change(platform.host);
+      }
+      log.events.clear();
+      const auto outcome = restore_with(executor);
+      EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
+      EXPECT_FALSE(log.contains("remove_all_heads"));
+      EXPECT_FALSE(log.contains("clear"));
+      EXPECT_EQ(log.host_writes(), restore_fields ? 1u : 0u);
+      EXPECT_TRUE(store.bytes);
+    }
+  }
+}
 
 TEST_F(NativeExecutor, SameRunFieldsAreRestoredBeforeItsDisplayIsRemoved) {
   ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
