@@ -210,8 +210,19 @@ namespace rtsp_stream {
   }
 
   bool
-  launch_session_manager_t::activate(std::uint32_t launch_session_id) {
-    return erase(launch_session_id);
+  launch_session_manager_t::activate(std::uint32_t launch_session_id, std::function<bool()> before_consume) {
+    std::lock_guard lock { _impl->mutex };
+    const auto matches = [launch_session_id](const auto &ticket) {
+      return ticket.session && ticket.session->id == launch_session_id;
+    };
+    if (std::none_of(_impl->tickets.begin(), _impl->tickets.end(), matches)) {
+      return false;
+    }
+    if (before_consume && !before_consume()) {
+      return false;
+    }
+    std::erase_if(_impl->tickets, matches);
+    return true;
   }
 
   bool

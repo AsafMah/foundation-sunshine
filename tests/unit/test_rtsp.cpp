@@ -8,6 +8,7 @@
 #include <future>
 #include <stdexcept>
 
+#include "src/display_device/topology_coordinator.h"
 #include "src/launch_session_manager.h"
 #include "src/rtsp.h"
 
@@ -166,6 +167,101 @@ TEST(LaunchSessionManager, ConcurrentClaimCannotObserveATicketBeforeBindingFinis
   const auto ticket = claim.get();
   ASSERT_TRUE(ticket);
   EXPECT_EQ(ticket->id, 113u);
+}
+
+TEST(LaunchSessionManager, RejectedActivationPreservesTheTicketAndAllClaims) {
+  rtsp_stream::launch_session_manager_t manager;
+  const auto now = rtsp_stream::launch_session_manager_t::clock_t::now();
+  ASSERT_EQ(manager.register_session(make_session(120, "cert", "192.0.2.20"), 1s, now),
+            rtsp_stream::launch_ticket_register_e::accepted);
+  ASSERT_TRUE(manager.claim_plaintext("192.0.2.20", now));
+  ASSERT_TRUE(manager.claim_plaintext("192.0.2.20", now));
+  EXPECT_FALSE(manager.activate(120, []() { return false; }));
+  EXPECT_TRUE(manager.contains(120, now + 5s));
+  EXPECT_TRUE(manager.release(120, 1s, now));
+  EXPECT_TRUE(manager.contains(120, now + 5s)) << "the second claim still protects the ticket";
+  EXPECT_TRUE(manager.release(120, 1s, now));
+  EXPECT_FALSE(manager.contains(120, now + 1s));
+}
+
+TEST(LaunchSessionManager, ActivationExceptionsLeaveTheTicketUntouched) {
+  rtsp_stream::launch_session_manager_t manager;
+  const auto now = rtsp_stream::launch_session_manager_t::clock_t::now();
+  ASSERT_EQ(manager.register_session(make_session(121, "cert", "192.0.2.21"), 1s, now),
+            rtsp_stream::launch_ticket_register_e::accepted);
+  ASSERT_TRUE(manager.claim_plaintext("192.0.2.21", now));
+  EXPECT_THROW(manager.activate(121, []() -> bool { throw std::runtime_error { "activation failed" }; }), std::runtime_error);
+  EXPECT_TRUE(manager.contains(121, now + 5s));
+  EXPECT_TRUE(manager.release(121, 1s, now));
+}
+
+TEST(LaunchSessionManager, ActivationHookRunsOnlyForAnExistingTicketAndBeforeConsumption) {
+  rtsp_stream::launch_session_manager_t manager;
+  const auto now = rtsp_stream::launch_session_manager_t::clock_t::now();
+  std::size_t activations {};
+  const auto activate = [&]() { ++activations; return true; };
+  EXPECT_FALSE(manager.activate(122, activate));
+  EXPECT_EQ(activations, 0u);
+  ASSERT_EQ(manager.register_session(make_session(122, "cert", "192.0.2.22"), 1s, now),
+            rtsp_stream::launch_ticket_register_e::accepted);
+  ASSERT_TRUE(manager.claim_plaintext("192.0.2.22", now));
+  EXPECT_TRUE(manager.activate(122, activate));
+  EXPECT_EQ(activations, 1u);
+  EXPECT_FALSE(manager.contains(122, now));
+  EXPECT_FALSE(manager.activate(122, activate));
+  EXPECT_EQ(activations, 1u);
+}
+
+TEST(LaunchSessionManager, CoordinatorCannotObserveTicketConsumptionBeforeActivation) {
+  using namespace display_device::topology;
+  rtsp_stream::launch_session_manager_t manager;
+  const auto now = rtsp_stream::launch_session_manager_t::clock_t::now();
+  std::promise<void> entered, released, probing;
+  auto entered_future = entered.get_future();
+  auto released_future = released.get_future().share();
+  auto probing_future = probing.get_future();
+  std::atomic_int restores {}, probes {};
+  coordinator_options_t options;
+  options.managed_mode = true;
+  options.probes.active_streams = []() { return 0u; };
+  options.probes.ticket_present = [&](auto id) {
+    if (++probes == 1) probing.set_value();
+    return manager.contains(id, now);
+  };
+  options.native_restore = [&](const auto &, const auto &) { ++restores; };
+  coordinator_t coordinator { std::move(options) };
+  ASSERT_TRUE(coordinator.start({}).get().completed());
+  const auto owner = coordinator.admit_launch({ 123, "cert" });
+  ASSERT_TRUE(owner);
+  ASSERT_TRUE(coordinator.run_launch_prepare(*owner.token, {}).completed());
+  ASSERT_EQ(manager.register_session(make_session(123, "cert", "192.0.2.23"), 10s, now,
+              [&]() { return coordinator.bind_launch(*owner.token); }),
+            rtsp_stream::launch_ticket_register_e::accepted);
+  ASSERT_TRUE(manager.claim_plaintext("192.0.2.23", now));
+  auto consuming = std::async(std::launch::async, [&]() {
+    return manager.activate(123, [&]() {
+      entered.set_value();
+      released_future.wait();
+      return coordinator.launch_activated(*owner.token);
+    });
+  });
+  if (entered_future.wait_for(2s) != std::future_status::ready) {
+    released.set_value();
+    FAIL() << "ticket consumption did not run the activation hook";
+  }
+  auto tick = std::async(std::launch::async, [&]() { coordinator.tick(); });
+  EXPECT_EQ(probing_future.wait_for(2s), std::future_status::ready);
+  EXPECT_EQ(tick.wait_for(20ms), std::future_status::timeout);
+  released.set_value();
+  EXPECT_TRUE(consuming.get());
+  tick.get();
+  ASSERT_TRUE(coordinator.status().lease);
+  EXPECT_EQ(coordinator.status().lease->stage, lease_stage_e::active);
+  EXPECT_EQ(coordinator.status().native_restores_posted, 0u);
+  EXPECT_FALSE(manager.contains(123, now));
+  EXPECT_TRUE(coordinator.end_managed_launch(*owner.token));
+  ASSERT_TRUE(coordinator.run(command_kind_e::stream_restore, {}).completed());
+  EXPECT_EQ(restores, 1);
 }
 
 TEST(LaunchSessionManager, ReplacesPendingRetryButDoesNotReplaceClaimedHandshake) {

@@ -373,6 +373,12 @@ the hook and keep their existing behavior. Launch/resume wiring still needs to
 pass the coordinator bind operation and roll back any request-owned application
 on failure.
 
+Ticket consumption has the corresponding pre-consumption activation hook.
+It runs under the ticket lock before erasure; rejection or an exception preserves
+the ticket and its claims. A real ticket-manager/coordinator interleaving fixture
+demonstrates that consumption cannot look like abandonment before activation.
+Production RTSP still needs to forward its full topology token through this hook.
+
 Managed leases now retain independent, bounded owner/join references. Full
 transaction/attachment tokens replace ID-only activation and broad lease-end
 callbacks; activation requires a bound reference. Preparing joins have their

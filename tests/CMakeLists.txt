@@ -789,6 +789,9 @@ add_test(NAME input_activity_unit_tests COMMAND input_activity_unit_tests)
 
 add_executable(launch_session_manager_unit_tests
         ${CMAKE_SOURCE_DIR}/tests/unit/test_rtsp.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_capability.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_command_queue.cpp
+        ${CMAKE_SOURCE_DIR}/src/display_device/topology_coordinator.cpp
         ${CMAKE_SOURCE_DIR}/src/launch_session_manager.cpp)
 target_include_directories(launch_session_manager_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(launch_session_manager_unit_tests

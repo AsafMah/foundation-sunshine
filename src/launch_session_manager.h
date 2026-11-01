@@ -81,8 +81,13 @@ namespace rtsp_stream {
                     crypto::aes_t iv,
                     clock_t::time_point now = clock_t::now());
 
+    /**
+     * Consume an existing ticket only after the optional activation hook succeeds
+     * under the ticket lock. Like before_publish, the hook must be a short leaf.
+     * A rejected/throwing hook leaves the ticket and its claims unchanged.
+     */
     bool
-    activate(std::uint32_t launch_session_id);
+    activate(std::uint32_t launch_session_id, std::function<bool()> before_consume = {});
 
     bool
     release(std::uint32_t launch_session_id,
