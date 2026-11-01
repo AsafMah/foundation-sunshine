@@ -155,6 +155,13 @@ namespace display_device::topology {
     std::atomic<stage_e> stage { stage_e::pending };
     std::atomic<reject_reason_e> reason { reject_reason_e::none };
     std::promise<command_result_t> posted_completion;
+    std::shared_future<command_result_t> posted_future { posted_completion.get_future().share() };
+    std::once_flag posted_once;
+
+    void
+    complete_posted(command_result_t result) {
+      std::call_once(posted_once, [&]() { posted_completion.set_value(std::move(result)); });
+    }
   };
 
   struct coordinator_t::startup_signal_t {
@@ -522,18 +529,20 @@ namespace display_device::topology {
         catch (...) {
           result = { outcome_e::failed, reject_reason_e::none, std::current_exception() };
         }
-        state->posted_completion.set_value(std::move(result));
+        state->complete_posted(std::move(result));
       };
     }
     return queue_->submit(queue_generation_, deadline, make_task(kind, state, std::move(body), transaction), std::move(completed));
   }
 
   posted_command_t
-  coordinator_t::submit_posted_locked(command_kind_e kind, command_body_t body) {
-    auto state = std::make_shared<command_state_t>();
-    auto completion = state->posted_completion.get_future().share();
+  coordinator_t::submit_posted_locked(command_kind_e kind, command_body_t body, std::shared_ptr<command_state_t> state) {
+    if (!state) {
+      state = std::make_shared<command_state_t>();
+    }
+    auto completion = state->posted_future;
     if (!queue_) {
-      state->posted_completion.set_value(outcome(outcome_e::stopped));
+      state->complete_posted(outcome(outcome_e::stopped));
       return { {}, reject_reason_e::stopped, std::move(completion) };
     }
     auto submission = submit_locked(kind, state, std::move(body), std::nullopt, no_deadline, true);
@@ -542,11 +551,16 @@ namespace display_device::topology {
 
   void
   coordinator_t::release_lease_locked(bool post_native_restore, command_kind_e restore_kind) {
-    lease_.reset();
+    const auto restore_state = lease_ ? lease_->restore_state : nullptr;
     if (post_native_restore && options_.native_restore && queue_) {
-      submit_posted_locked(restore_kind, guarded_native_restore());
+      // Retain the retiring lease if constructing or submitting the command throws.
+      submit_posted_locked(restore_kind, guarded_native_restore(), restore_state);
       ++native_restores_posted_;
     }
+    else if (restore_state) {
+      restore_state->complete_posted(outcome(post_native_restore || stopping_ ? outcome_e::stopped : outcome_e::completed));
+    }
+    lease_.reset();
   }
 
   bool
@@ -651,6 +665,7 @@ namespace display_device::topology {
     lease.client_key = request.client_key;
     lease.setup_deadline = now() + options_.setup_timeout;
     if (options_.managed_mode) {
+      lease.restore_state = std::make_shared<command_state_t>();
       lease.attachments.push_back({ 0, request.launch_session_id, lease_stage_e::preparing, lease.setup_deadline });
     }
     lease_ = lease;
@@ -760,7 +775,11 @@ namespace display_device::topology {
   }
 
   bool
-  coordinator_t::end_managed_launch(const launch_token_t &token, command_kind_e kind) {
+  coordinator_t::end_managed_launch(const launch_token_t &token, command_kind_e kind,
+    std::shared_future<command_result_t> *restoration) {
+    if (restoration) {
+      *restoration = {};
+    }
     if (!kind_allows(kind, operation_e::native_restore, true)) {
       throw std::invalid_argument { std::string { "Topology command " } + std::string { to_string(kind) } +
                                     " cannot end a managed launch" };
@@ -772,6 +791,9 @@ namespace display_device::topology {
         return false;
       }
       remove_attachment_locked(ref->serial, kind);
+      if (restoration && lease_->attachments.empty()) {
+        *restoration = lease_->restore_state->posted_future;
+      }
     }
     tick();
     return true;
@@ -998,6 +1020,9 @@ namespace display_device::topology {
       std::lock_guard lock { mutex_ };
       phase_ = coordinator_phase_e::stopped;
       stopping_ = true;
+      if (lease_ && lease_->restore_state) {
+        lease_->restore_state->complete_posted(outcome(outcome_e::stopped));
+      }
       queue = std::move(queue_);
     }
 

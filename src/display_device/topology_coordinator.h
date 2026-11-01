@@ -282,9 +282,14 @@ namespace display_device::topology {
      * its claimants, startup and streaming work. Preparing references use abort_launch.
      * Returns whether the reference ended, not whether restoration has completed.
      * The restore obligation survives remaining references and live-video probes.
+     * When supplied, restoration is cleared, then filled for the final reference
+     * before probing or queue submission (both may throw). It resolves with the
+     * actual restore/observer outcome or stopped, never merely with submission.
+     * A caller retaining it across an exception may retry tick, not this token.
      */
     bool
-    end_managed_launch(const launch_token_t &token, command_kind_e kind = command_kind_e::stream_restore);
+    end_managed_launch(const launch_token_t &token, command_kind_e kind = command_kind_e::stream_restore,
+      std::shared_future<command_result_t> *restoration = nullptr);
 
     /**
      * @brief Run the launch's prepare body with the setup deadline recorded at admission.
@@ -391,6 +396,7 @@ namespace display_device::topology {
       bool prepare_submitted {};
       std::optional<command_handle_t> prepare_handle;
       std::shared_ptr<command_state_t> prepare_state;
+      std::shared_ptr<command_state_t> restore_state;
       command_body_t legacy_expiry_cleanup;
       bool prepared {};
       std::optional<monotonic_time_t> idle_since;
@@ -430,7 +436,7 @@ namespace display_device::topology {
       std::optional<std::uint64_t> transaction, monotonic_time_t deadline, bool posted);
 
     posted_command_t
-    submit_posted_locked(command_kind_e kind, command_body_t body);
+    submit_posted_locked(command_kind_e kind, command_body_t body, std::shared_ptr<command_state_t> state = {});
 
     void
     release_lease_locked(bool post_native_restore, command_kind_e restore_kind);

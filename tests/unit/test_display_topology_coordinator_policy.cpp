@@ -2808,4 +2808,178 @@ namespace {
     EXPECT_FALSE(coordinator.status().lease);
     EXPECT_EQ(coordinator.status().native_restores_posted, 1u);
   }
+  TEST(DisplayTopologyCoordinator, ManagedEndReceiptFollowsTheDeferredActualRestore) {
+    fake_clock_t clock;
+    gate_t restore;
+    std::atomic<std::size_t> streams { 1 };
+    auto options = make_options(clock, true);
+    options.probes.active_streams = [&]() { return streams.load(); };
+    options.native_restore = restore.body();
+    coordinator_t coordinator { std::move(options) };
+    const finally_t release { [&]() { restore.release(); } };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 501, "a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    const auto join = coordinator.admit_managed_join({ 502, "b" });
+    ASSERT_TRUE(join);
+    ASSERT_TRUE(coordinator.bind_launch(*join.token));
+    std::promise<command_result_t> unrelated;
+    auto receipt = unrelated.get_future().share();
+    EXPECT_TRUE(coordinator.end_managed_launch(*owner.token, command_kind_e::stream_restore, &receipt));
+    ASSERT_FALSE(receipt.valid()) << "non-final teardown must not wait on other streams";
+    ASSERT_TRUE(coordinator.end_managed_launch(*join.token, command_kind_e::stream_restore, &receipt));
+    ASSERT_TRUE(receipt.valid());
+    EXPECT_EQ(receipt.wait_for(0ms), std::future_status::timeout);
+    coordinator.tick();
+    EXPECT_EQ(receipt.wait_for(0ms), std::future_status::timeout);
+    streams = 0;
+    coordinator.tick();
+    ASSERT_TRUE(restore.wait_started());
+    EXPECT_EQ(receipt.wait_for(0ms), std::future_status::timeout) << "submission is not restoration completion";
+    restore.release();
+    ASSERT_EQ(receipt.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_TRUE(receipt.get().completed());
+  }
+
+  TEST(DisplayTopologyCoordinator, ManagedEndProbeFailureStillHandsOffItsRestoreReceipt) {
+    fake_clock_t clock;
+    bool fail = true;
+    auto options = make_options(clock, true);
+    options.probes.active_streams = [&]() {
+      if (fail) throw std::runtime_error { "unavailable stream count" };
+      return 0u;
+    };
+    coordinator_t coordinator { std::move(options) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 501, "a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    std::shared_future<command_result_t> receipt;
+    EXPECT_THROW(coordinator.end_managed_launch(*owner.token, command_kind_e::stream_restore, &receipt), std::runtime_error);
+    ASSERT_TRUE(receipt.valid()) << "the consumed token cannot be retried to recover a lost receipt";
+    EXPECT_EQ(receipt.wait_for(0ms), std::future_status::timeout);
+    fail = false;
+    coordinator.tick();
+    ASSERT_EQ(receipt.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_TRUE(receipt.get().completed());
+  }
+
+  TEST(DisplayTopologyCoordinator, ManagedRestoreReceiptExposesBodyAndObserverFailures) {
+    for (const bool body_fails : { false, true }) {
+      fake_clock_t clock;
+      auto options = make_options(clock, true);
+      options.native_restore = [&](const auto &, const auto &) {
+        if (body_fails) throw std::runtime_error { "restore failed" };
+      };
+      options.posted_observer = [&](auto, const auto &) {
+        if (!body_fails) throw std::runtime_error { "observer failed" };
+      };
+      coordinator_t coordinator { std::move(options) };
+      ASSERT_TRUE(start_ready(coordinator).completed());
+      const auto owner = coordinator.admit_launch({ 501, "a" });
+      ASSERT_TRUE(owner);
+      ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+      std::shared_future<command_result_t> receipt;
+      ASSERT_TRUE(coordinator.end_managed_launch(*owner.token, command_kind_e::stream_restore, &receipt));
+      ASSERT_TRUE(receipt.valid());
+      ASSERT_EQ(receipt.wait_for(real_timeout), std::future_status::ready);
+      EXPECT_EQ(receipt.get().outcome, outcome_e::failed);
+      ASSERT_TRUE(receipt.get().exception);
+      EXPECT_THROW(std::rethrow_exception(receipt.get().exception), std::runtime_error);
+      EXPECT_EQ(coordinator.status().native.in_conflict, body_fails);
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, StopCompletesAnUnsubmittedManagedRestoreReceipt) {
+    fake_clock_t clock;
+    auto options = make_options(clock, true);
+    options.probes.active_streams = []() { return 1u; };
+    coordinator_t coordinator { std::move(options) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 501, "a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    std::shared_future<command_result_t> receipt;
+    ASSERT_TRUE(coordinator.end_managed_launch(*owner.token, command_kind_e::stream_restore, &receipt));
+    ASSERT_TRUE(receipt.valid());
+    EXPECT_EQ(receipt.wait_for(0ms), std::future_status::timeout);
+    coordinator.stop();
+    ASSERT_EQ(receipt.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_EQ(receipt.get().outcome, outcome_e::stopped);
+    EXPECT_EQ(coordinator.status().native_restores_posted, 0u);
+  }
+
+  TEST(DisplayTopologyCoordinator, StopSkippedManagedRestoreResolvesTheSameReceipt) {
+    fake_clock_t clock;
+    gate_t gate;
+    std::atomic_int restores {};
+    auto options = make_options(clock, true);
+    options.native_restore = counting(restores);
+    coordinator_t coordinator { std::move(options) };
+    std::future<void> stopping;
+    const finally_t release { [&]() { gate.release(); } };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 501, "a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    const auto blocker = coordinator.post_tracked(command_kind_e::stream_restore, gate.body());
+    ASSERT_TRUE(gate.wait_started());
+    std::shared_future<command_result_t> receipt;
+    ASSERT_TRUE(coordinator.end_managed_launch(*owner.token, command_kind_e::stream_restore, &receipt));
+    ASSERT_TRUE(receipt.valid());
+    stopping = std::async(std::launch::async, [&]() { coordinator.stop(); });
+    ASSERT_TRUE(wait_until([&]() { return coordinator.status().phase == coordinator_phase_e::stopped; }));
+    gate.release();
+    stopping.get();
+    ASSERT_EQ(receipt.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_EQ(receipt.get().outcome, outcome_e::stopped);
+    EXPECT_EQ(restores, 0);
+  }
+
+  TEST(DisplayTopologyCoordinator, StopCannotCompleteARunningManagedRestoreReceiptEarly) {
+    fake_clock_t clock;
+    gate_t gate;
+    auto options = make_options(clock, true);
+    options.native_restore = gate.body();
+    coordinator_t coordinator { std::move(options) };
+    std::future<void> stopping;
+    const finally_t release { [&]() { gate.release(); } };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 501, "a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    std::shared_future<command_result_t> receipt;
+    ASSERT_TRUE(coordinator.end_managed_launch(*owner.token, command_kind_e::stream_restore, &receipt));
+    ASSERT_TRUE(receipt.valid());
+    ASSERT_TRUE(gate.wait_started());
+    stopping = std::async(std::launch::async, [&]() { coordinator.stop(); });
+    ASSERT_TRUE(wait_until([&]() { return coordinator.status().phase == coordinator_phase_e::stopped; }));
+    EXPECT_EQ(receipt.wait_for(0ms), std::future_status::timeout);
+    gate.release();
+    stopping.get();
+    ASSERT_EQ(receipt.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_TRUE(receipt.get().body_started());
+  }
+
+  TEST(DisplayTopologyCoordinator, ManagedRestoreReceiptWaitsForItsObserver) {
+    fake_clock_t clock;
+    gate_t gate;
+    auto options = make_options(clock, true);
+    options.posted_observer = [hold = gate.hook()](auto, const auto &) { hold(); };
+    coordinator_t coordinator { std::move(options) };
+    const finally_t release { [&]() { gate.release(); } };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 501, "a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    std::shared_future<command_result_t> receipt;
+    ASSERT_TRUE(coordinator.end_managed_launch(*owner.token, command_kind_e::stream_restore, &receipt));
+    ASSERT_TRUE(receipt.valid());
+    ASSERT_TRUE(gate.wait_started());
+    EXPECT_EQ(receipt.wait_for(0ms), std::future_status::timeout);
+    gate.release();
+    ASSERT_EQ(receipt.wait_for(real_timeout), std::future_status::ready);
+    EXPECT_TRUE(receipt.get().completed());
+  }
 }  // namespace

@@ -391,6 +391,13 @@ and idle probes revalidate reference stage, serial and activity generation.
 Managed construction requires an explicit video-quiescence probe. These fake
 interleaving fixtures do not yet establish production RTSP lifecycle wiring.
 
+Final-reference teardown can hand off the actual native-restore receipt before
+quiescence probes run, retaining the handle even if a probe throws. It remains
+pending through deferred submission, restoration and observer processing;
+shutdown reports an unsubmitted/skipped restore as stopped. A non-final stream
+does not receive a receipt that would wait for other streams to end. Production
+join watchdogs still need to retain and await these receipts.
+
 Production `session_t`, launch/RTSP lifecycle, Windows mutation paths and the
 administrator profile/status surface do not yet call the coordinator.
 No production display behavior has changed. G1 software evidence remains
