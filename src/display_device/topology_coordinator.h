@@ -225,6 +225,14 @@ namespace display_device::topology {
     void
     settle();
 
+    /**
+     * Whether startup still waits for this settlement: false once settled and
+     * resumed, or once the coordinator is stopping or destroyed. A watcher stops
+     * polling when this turns false. Same locking rule as settle().
+     */
+    bool
+    waiting();
+
   private:
     friend class coordinator_t;
     friend class external_cleanup_t;
@@ -720,6 +728,10 @@ namespace display_device::topology {
     /** From external_recovery_t::settle(); the link mutex is held, mutex_ is not. */
     void
     settle_external_startup();
+
+    /** From external_recovery_t::waiting(); the link mutex is held, mutex_ is not. */
+    bool
+    external_startup_waiting();
 
     /**
      * Caller holds mutex_. Once settled and the suspended body returned, put the

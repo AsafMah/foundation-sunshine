@@ -1437,6 +1437,18 @@ namespace display_device::topology {
     }
   }
 
+  bool
+  external_recovery_t::waiting() {
+    std::lock_guard lock { link_->mutex };
+    return link_->owner && link_->owner->external_startup_waiting();
+  }
+
+  bool
+  coordinator_t::external_startup_waiting() {
+    std::lock_guard lock { mutex_ };
+    return external_startup_ && !external_startup_->submitted && !stopping_;
+  }
+
   std::shared_ptr<external_recovery_t>
   coordinator_t::suspend_startup_for_external_recovery(const mutation_capability_t &capability, command_body_t continuation) {
     capability.require(operation_e::native_recover);
