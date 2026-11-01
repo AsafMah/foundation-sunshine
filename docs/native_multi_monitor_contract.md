@@ -341,6 +341,16 @@ once, including commands whose body never ran. Observer failures are exposed
 through the receipt. A launch-ticket presence query and an active-only managed
 lease release are also implemented and tested.
 
+The coordinator enforces its recorded setup deadline through successful ticket
+bind, not merely through display preparation. Tick, bind and subsequent admission
+reap expired preparing leases and cancel only their command. Cleanup is enqueued
+before a replacement may mutate, and only if the expired prepare body started.
+Legacy callers can register their expiry cleanup with preparation; managed
+leases use native restore. A successful bind switches to ticket liveness rather
+than continuing to apply the setup deadline. Binding after draining/stop is
+refused. Bounding application prep and rolling back published tickets/apps are
+still production-wiring work, not established by these isolated tests.
+
 Production `session_t`, launch/RTSP lifecycle, Windows mutation paths and the
 administrator profile/status surface do not yet call the coordinator.
 No production display behavior has changed. G1 software evidence remains

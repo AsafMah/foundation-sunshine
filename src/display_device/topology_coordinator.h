@@ -255,13 +255,18 @@ namespace display_device::topology {
      *          abandoned (`expired_before_start`, its body never runs); a running command
      *          is cancelled (`expired_while_running`) and keeps running until it observes
      *          `may_continue()`, so cleanup posted by `abort_launch` runs after it.
+     * @param legacy_expiry_cleanup Cleanup used if tick/admission/bind expires this
+     *        transaction before its handler aborts it. Invoked only if the prepare body
+     *        started. Capture shared state, not handler stack references; the body may
+     *        outlive the handler. Managed launches always use the native restore.
      */
     command_result_t
-    run_launch_prepare(const launch_token_t &token, command_body_t body);
+    run_launch_prepare(const launch_token_t &token, command_body_t body, command_body_t legacy_expiry_cleanup = {});
 
     /**
      * @brief Mark the launch's ticket as registered. Called once the handler succeeded.
-     * @return false unless `token` is the current preparing launch and its prepare completed.
+     * @return false unless `token` is the current preparing launch, its prepare completed,
+     *         its recorded deadline has not expired, and the coordinator is running.
      */
     bool
     bind_launch(const launch_token_t &token);
@@ -297,7 +302,7 @@ namespace display_device::topology {
     end_managed_lease(command_kind_e kind, std::optional<std::uint32_t> launch_session_id = std::nullopt);
 
     /**
-     * @brief Re-check lease liveness (abandoned tickets, idle managed streams).
+     * @brief Re-check lease liveness (setup deadline, abandoned tickets, idle managed streams).
      */
     void
     tick();
@@ -349,6 +354,8 @@ namespace display_device::topology {
       monotonic_time_t setup_deadline {};
       bool prepare_submitted {};
       std::optional<command_handle_t> prepare_handle;
+      std::shared_ptr<command_state_t> prepare_state;
+      command_body_t legacy_expiry_cleanup;
       bool prepared {};
       bool activated_before_bind {};
       std::optional<monotonic_time_t> idle_since;
@@ -388,6 +395,10 @@ namespace display_device::topology {
 
     void
     release_lease_locked(bool post_native_restore, command_kind_e restore_kind);
+
+    /** Cancel and reap an expired preparing lease, enqueuing cleanup before admission. */
+    bool
+    expire_preparing_locked();
 
     /** `options_.native_restore`, marking native health In conflict if it throws. */
     command_body_t

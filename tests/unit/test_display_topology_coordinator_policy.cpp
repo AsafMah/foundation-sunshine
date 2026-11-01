@@ -818,6 +818,189 @@ namespace {
     EXPECT_EQ(prepares.load(), 1);
   }
 
+  TEST(DisplayTopologyCoordinator, BindRejectsExpiredPreparingLeaseEvenWhenTokenDeadlineIsForged) {
+    fake_clock_t clock;
+    std::atomic_int restored {};
+    auto options = make_options(clock, true);
+    options.native_restore = counting(restored);
+    coordinator_t coordinator { options };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto launch = coordinator.admit_launch({ 301, "client" });
+    ASSERT_TRUE(launch);
+    ASSERT_TRUE(coordinator.run_launch_prepare(*launch.token, {}).completed());
+    auto forged = *launch.token;
+    forged.setup_deadline = monotonic_time_t::max();
+    clock.advance(1000ms);
+    EXPECT_FALSE(coordinator.bind_launch(forged));
+    EXPECT_FALSE(coordinator.status().lease);
+    ASSERT_TRUE(flush(coordinator).completed());
+    EXPECT_EQ(restored, 1);
+  }
+
+  TEST(DisplayTopologyCoordinator, TickReapsUnboundPreparedManagedLeaseExactlyAtItsDeadline) {
+    fake_clock_t clock;
+    std::atomic_int restored {};
+    auto options = make_options(clock, true);
+    options.native_restore = counting(restored);
+    coordinator_t coordinator { options };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto launch = coordinator.admit_launch({ 302, "client" });
+    ASSERT_TRUE(launch);
+    ASSERT_TRUE(coordinator.run_launch_prepare(*launch.token, {}).completed());
+    clock.advance(999ms);
+    coordinator.tick();
+    EXPECT_TRUE(coordinator.status().lease);
+    EXPECT_EQ(restored, 0);
+    clock.advance(1ms);
+    coordinator.tick();
+    coordinator.tick();
+    EXPECT_FALSE(coordinator.status().lease);
+    EXPECT_FALSE(coordinator.bind_launch(*launch.token));
+    EXPECT_FALSE(coordinator.abort_launch(*launch.token, {}));
+    ASSERT_TRUE(flush(coordinator).completed());
+    EXPECT_EQ(restored, 1);
+  }
+
+  TEST(DisplayTopologyCoordinator, BindCannotPublishAfterDrainingOrStop) {
+    for (const bool stop : { false, true }) {
+      for (const bool early_activation : { false, true }) {
+        SCOPED_TRACE(stop ? "stopped" : "draining");
+        SCOPED_TRACE(early_activation ? "early activation" : "not activated");
+        fake_clock_t clock;
+        coordinator_t coordinator { make_options(clock) };
+        ASSERT_TRUE(start_ready(coordinator).completed());
+        const auto launch = coordinator.admit_launch({ 303, "client" });
+        ASSERT_TRUE(launch);
+        ASSERT_TRUE(coordinator.run_launch_prepare(*launch.token, {}).completed());
+        if (early_activation) coordinator.launch_activated(303);
+        if (stop)
+          coordinator.stop();
+        else
+          coordinator.begin_draining();
+        EXPECT_FALSE(coordinator.bind_launch(*launch.token));
+      }
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, AdmissionReapsExpiredPreparationBeforeItsReplacementCanMutate) {
+    fake_clock_t clock;
+    event_log_t log;
+    auto options = make_options(clock, true);
+    options.native_restore = logging(log, "restore");
+    coordinator_t coordinator { options };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto first = coordinator.admit_launch({ 304, "first" });
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(coordinator.run_launch_prepare(*first.token, logging(log, "first")).completed());
+    clock.advance(1000ms);
+    const auto second = coordinator.admit_launch({ 305, "second" });
+    ASSERT_TRUE(second);
+    EXPECT_FALSE(coordinator.abort_launch(*first.token, {}));
+    ASSERT_TRUE(coordinator.run_launch_prepare(*second.token, logging(log, "second")).completed());
+    EXPECT_EQ(log.events(), (std::vector<std::string> { "first", "restore", "second" }));
+  }
+
+  TEST(DisplayTopologyCoordinator, SetupExpiryCancelsOnlyItsRunningPrepareAndOrdersLegacyCleanup) {
+    fake_clock_t clock;
+    event_log_t log;
+    auto options = make_options(clock);
+    options.poll_interval = 5s;
+    coordinator_t coordinator { options };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    gate_t worker;
+    const auto first = coordinator.admit_launch({ 306, "first" });
+    ASSERT_TRUE(first);
+    std::atomic_bool cancelled {};
+    auto prepare = std::async(std::launch::async, [&]() {
+      return coordinator.run_launch_prepare(*first.token, [&](const mutation_capability_t &, const command_context_t &context) {
+          worker.hook()();
+          cancelled = context.cancellation_requested();
+          log.add("prepare"); }, logging(log, "cleanup"));
+    });
+    const finally_t release { [&]() { worker.release(); } };
+    ASSERT_TRUE(worker.wait_started());
+    const auto unrelated = coordinator.post_tracked(command_kind_e::rotate, logging(log, "unrelated"));
+    clock.advance(1000ms);
+    coordinator.tick();
+    EXPECT_FALSE(coordinator.status().lease);
+    EXPECT_FALSE(coordinator.abort_launch(*first.token, logging(log, "duplicate")));
+    const auto second = coordinator.admit_launch({ 307, "second" });
+    ASSERT_TRUE(second);
+    worker.release();
+    EXPECT_FALSE(prepare.get().completed());
+    EXPECT_TRUE(cancelled);
+    EXPECT_TRUE(unrelated.completion.get().completed());
+    ASSERT_TRUE(coordinator.run_launch_prepare(*second.token, logging(log, "second")).completed());
+    EXPECT_EQ(log.events(), (std::vector<std::string> { "prepare", "unrelated", "cleanup", "second" }));
+  }
+
+  TEST(DisplayTopologyCoordinator, SetupExpiryBeforeTheBodyStartsMakesNoBackendOrCleanupCalls) {
+    for (const bool managed : { false, true }) {
+      fake_clock_t clock;
+      std::atomic_int calls {};
+      auto options = make_options(clock, managed);
+      options.poll_interval = 5s;
+      if (managed) options.native_restore = counting(calls);
+      coordinator_t coordinator { options };
+      ASSERT_TRUE(start_ready(coordinator).completed());
+      const auto unsubmitted = coordinator.admit_launch({ 308, "unsubmitted" });
+      ASSERT_TRUE(unsubmitted);
+      clock.advance(1000ms);
+      coordinator.tick();
+      EXPECT_FALSE(coordinator.status().lease);
+      gate_t worker;
+      const auto blocker = coordinator.post_tracked(command_kind_e::rotate, worker.body());
+      ASSERT_TRUE(worker.wait_started());
+      const auto launch = coordinator.admit_launch({ 309, "queued" });
+      ASSERT_TRUE(launch);
+      const auto before = submitted(coordinator);
+      auto prepare = std::async(std::launch::async, [&]() {
+        return coordinator.run_launch_prepare(*launch.token, counting(calls), counting(calls));
+      });
+      const finally_t release { [&]() { worker.release(); } };
+      ASSERT_TRUE(wait_until([&]() { return submitted(coordinator) == before + 1; }));
+      clock.advance(1000ms);
+      coordinator.tick();
+      EXPECT_FALSE(coordinator.status().lease);
+      worker.release();
+      EXPECT_EQ(prepare.get().outcome, outcome_e::expired_before_start);
+      ASSERT_TRUE(flush(coordinator).completed());
+      EXPECT_EQ(calls, 0);
+    }
+  }
+
+  TEST(DisplayTopologyCoordinator, SuccessfulBindEndsSetupExpiryAndKeepsTheTicketWindow) {
+    fake_clock_t clock;
+    auto options = make_options(clock);
+    options.probes.ticket_present = [](std::uint32_t) { return true; };
+    coordinator_t coordinator { options };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto launch = coordinator.admit_launch({ 310, "client" });
+    ASSERT_TRUE(launch);
+    ASSERT_TRUE(coordinator.run_launch_prepare(*launch.token, {}).completed());
+    clock.advance(999ms);
+    ASSERT_TRUE(coordinator.bind_launch(*launch.token));
+    clock.advance(5000ms);
+    coordinator.tick();
+    EXPECT_EQ(coordinator.admit_launch({ 311, "another" }).reason, reject_reason_e::owner_busy);
+    ASSERT_TRUE(coordinator.status().lease);
+    EXPECT_EQ(coordinator.status().lease->stage, lease_stage_e::bound);
+  }
+
+  TEST(DisplayTopologyCoordinator, AbortAfterStopReleasesOnlyTheLeaseWithoutSubmittingCleanup) {
+    fake_clock_t clock;
+    std::atomic_int cleanup {};
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto launch = coordinator.admit_launch({ 312, "client" });
+    ASSERT_TRUE(launch);
+    ASSERT_TRUE(coordinator.run_launch_prepare(*launch.token, {}).completed());
+    coordinator.stop();
+    EXPECT_TRUE(coordinator.abort_launch(*launch.token, counting(cleanup)));
+    EXPECT_FALSE(coordinator.status().lease);
+    EXPECT_EQ(cleanup, 0);
+  }
+
   TEST(DisplayTopologyCoordinator, BindNeedsACompletedPrepare) {
     fake_clock_t clock;
     coordinator_t coordinator { make_options(clock) };

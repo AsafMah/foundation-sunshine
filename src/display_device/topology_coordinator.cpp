@@ -531,6 +531,10 @@ namespace display_device::topology {
   coordinator_t::submit_posted_locked(command_kind_e kind, command_body_t body) {
     auto state = std::make_shared<command_state_t>();
     auto completion = state->posted_completion.get_future().share();
+    if (!queue_) {
+      state->posted_completion.set_value(outcome(outcome_e::stopped));
+      return { {}, reject_reason_e::stopped, std::move(completion) };
+    }
     auto submission = submit_locked(kind, state, std::move(body), std::nullopt, no_deadline, true);
     return { submission.handle, reject_reason_e::none, std::move(completion) };
   }
@@ -542,6 +546,30 @@ namespace display_device::topology {
       submit_posted_locked(restore_kind, guarded_native_restore());
       ++native_restores_posted_;
     }
+  }
+
+  bool
+  coordinator_t::expire_preparing_locked() {
+    if (!lease_ || lease_->stage != lease_stage_e::preparing || now() < lease_->setup_deadline) {
+      return false;
+    }
+    bool body_started = false;
+    if (lease_->prepare_state) {
+      using stage_e = command_state_t::stage_e;
+      auto stage = stage_e::pending;
+      lease_->prepare_state->stage.compare_exchange_strong(stage, stage_e::abandoned, std::memory_order_acq_rel);
+      body_started = stage == stage_e::running;
+    }
+    if (lease_->prepare_handle && queue_) {
+      queue_->cancel(*lease_->prepare_handle);
+    }
+    const bool managed = lease_->flavor == launch_flavor_e::managed;
+    auto cleanup = std::move(lease_->legacy_expiry_cleanup);
+    release_lease_locked(managed && body_started, command_kind_e::launch_failed_restore);
+    if (!managed && body_started && cleanup) {
+      submit_posted_locked(command_kind_e::launch_failed_restore, std::move(cleanup));
+    }
+    return true;
   }
 
   command_body_t
@@ -569,6 +597,7 @@ namespace display_device::topology {
       if (const auto reason = admission_reason_locked(); reason != reject_reason_e::none) {
         return { std::nullopt, reason };
       }
+      expire_preparing_locked();
       held = lease_;
     }
 
@@ -584,6 +613,7 @@ namespace display_device::topology {
     if (const auto reason = admission_reason_locked(); reason != reject_reason_e::none) {
       return { std::nullopt, reason };
     }
+    expire_preparing_locked();
     if (ticket_gone && lease_ && held && lease_->transaction == held->transaction && lease_->stage == held->stage) {
       release_lease_locked(lease_->flavor == launch_flavor_e::managed, command_kind_e::native_restore);
     }
@@ -616,7 +646,7 @@ namespace display_device::topology {
   }
 
   command_result_t
-  coordinator_t::run_launch_prepare(const launch_token_t &token, command_body_t body) {
+  coordinator_t::run_launch_prepare(const launch_token_t &token, command_body_t body, command_body_t legacy_expiry_cleanup) {
     if (on_worker_thread()) {
       return outcome(outcome_e::reentrant);
     }
@@ -634,6 +664,8 @@ namespace display_device::topology {
         return rejected(reject_reason_e::stale_transaction);
       }
       lease_->prepare_submitted = true;
+      lease_->prepare_state = state;
+      lease_->legacy_expiry_cleanup = std::move(legacy_expiry_cleanup);
       deadline = lease_->setup_deadline;
       submission = submit_locked(command_kind_e::launch_prepare, state, std::move(body), token.transaction, deadline, false);
       lease_->prepare_handle = submission.handle;
@@ -652,6 +684,10 @@ namespace display_device::topology {
   bool
   coordinator_t::bind_launch(const launch_token_t &token) {
     std::lock_guard lock { mutex_ };
+    if (phase_ != coordinator_phase_e::running || stopping_) {
+      return false;
+    }
+    expire_preparing_locked();
     if (!lease_ || lease_->transaction != token.transaction || lease_->stage != lease_stage_e::preparing ||
         !lease_->prepared) {
       return false;
@@ -735,6 +771,7 @@ namespace display_device::topology {
       if (phase_ != coordinator_phase_e::running && phase_ != coordinator_phase_e::draining) {
         return;
       }
+      expire_preparing_locked();
       held = lease_;
     }
     if (!held) {
