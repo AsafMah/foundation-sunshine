@@ -93,6 +93,22 @@ namespace {
     operation_e::native_apply,
     operation_e::native_restore,
     operation_e::native_recover,
+    operation_e::write_topology,
+    operation_e::write_display_modes,
+    operation_e::write_primary,
+    operation_e::write_hdr,
+    operation_e::write_color_profile,
+    operation_e::vdd_set_modes,
+    operation_e::vdd_cursor,
+    operation_e::adapter_restart,
+  };
+
+  constexpr std::array restoration_leaves {
+    operation_e::write_topology,
+    operation_e::write_display_modes,
+    operation_e::write_primary,
+    operation_e::write_hdr,
+    operation_e::write_color_profile,
   };
 
   /** Spelled out independently of `is_cleanup_kind`, so a change there cannot make a test vacuous. */
@@ -337,46 +353,55 @@ namespace {
   TEST(DisplayTopologyCapability, KindTableMatchesTheAgreedOperationTable) {
     using kind = command_kind_e;
     using op = operation_e;
+    const auto with = [](std::set<op> operations, std::initializer_list<op> additions) {
+      operations.insert(additions);
+      return operations;
+    };
+    const std::set<op> restore { op::restore_state, op::write_topology, op::write_display_modes,
+      op::write_primary, op::write_hdr, op::write_color_profile };
+    const auto prepare = with(restore, { op::configure_display, op::vdd_create, op::vdd_destroy,
+                                         op::vdd_set_modes, op::vdd_cursor, op::adapter_restart });
+    const auto cleanup = with(restore, { op::vdd_create, op::vdd_destroy, op::native_restore });
     const std::map<kind, std::set<op>> legacy {
-      { kind::startup_recovery, { op::native_recover, op::restore_state } },
-      { kind::legacy_startup_restore, { op::restore_state } },
-      { kind::launch_prepare, { op::configure_display, op::restore_state, op::native_apply } },
-      { kind::launch_failed_restore, { op::restore_state, op::native_restore } },
-      { kind::reconfigure, { op::configure_display } },
-      { kind::stream_restore, { op::restore_state, op::native_restore } },
-      { kind::shutdown_restore, { op::restore_state, op::native_restore } },
+      { kind::startup_recovery, with(restore, { op::native_recover, op::vdd_create, op::vdd_destroy }) },
+      { kind::legacy_startup_restore, restore },
+      { kind::launch_prepare, with(prepare, { op::native_apply }) },
+      { kind::launch_failed_restore, cleanup },
+      { kind::reconfigure, prepare },
+      { kind::stream_restore, cleanup },
+      { kind::shutdown_restore, cleanup },
       { kind::shutdown_vdd_destroy, { op::vdd_destroy } },
       { kind::rotate, { op::rotate } },
       { kind::scale, { op::scale } },
       { kind::vdd_toggle, { op::vdd_create, op::vdd_destroy } },
-      { kind::vdd_toggle_followup, { op::vdd_extended_mode, op::vdd_destroy } },
-      { kind::vdd_create, { op::vdd_create } },
+      { kind::vdd_toggle_followup, { op::vdd_extended_mode, op::write_topology, op::vdd_destroy } },
+      { kind::vdd_create, { op::vdd_create, op::vdd_extended_mode, op::write_topology } },
       { kind::vdd_destroy, { op::vdd_destroy } },
-      { kind::reset_persistence, { op::reset_persistence } },
-      { kind::legacy_retry_tick, { op::legacy_deferred } },
-      { kind::legacy_unlock_restore, { op::legacy_deferred } },
-      { kind::native_restore, { op::native_restore } },
+      { kind::reset_persistence, with(restore, { op::reset_persistence, op::vdd_destroy }) },
+      { kind::legacy_retry_tick, with(restore, { op::configure_display, op::legacy_deferred, op::vdd_destroy }) },
+      { kind::legacy_unlock_restore, with(restore, { op::legacy_deferred }) },
+      { kind::native_restore, { op::native_restore, op::vdd_destroy } },
     };
     // Managed mode: whole-state restore survives only for startup and its registered continuation.
     const std::map<kind, std::set<op>> managed {
-      { kind::startup_recovery, { op::native_recover, op::restore_state } },
-      { kind::legacy_startup_restore, { op::restore_state } },
-      { kind::launch_prepare, { op::native_apply } },
-      { kind::launch_failed_restore, { op::native_restore } },
+      { kind::startup_recovery, with(restore, { op::native_recover }) },
+      { kind::legacy_startup_restore, restore },
+      { kind::launch_prepare, { op::native_apply, op::vdd_create, op::vdd_destroy } },
+      { kind::launch_failed_restore, { op::native_restore, op::vdd_destroy } },
       { kind::reconfigure, {} },
-      { kind::stream_restore, { op::native_restore } },
-      { kind::shutdown_restore, { op::native_restore } },
-      { kind::shutdown_vdd_destroy, { op::vdd_destroy } },
+      { kind::stream_restore, { op::native_restore, op::vdd_destroy } },
+      { kind::shutdown_restore, { op::native_restore, op::vdd_destroy } },
+      { kind::shutdown_vdd_destroy, {} },
       { kind::rotate, { op::rotate } },
       { kind::scale, { op::scale } },
-      { kind::vdd_toggle, { op::vdd_create, op::vdd_destroy } },
-      { kind::vdd_toggle_followup, { op::vdd_extended_mode, op::vdd_destroy } },
-      { kind::vdd_create, { op::vdd_create } },
-      { kind::vdd_destroy, { op::vdd_destroy } },
+      { kind::vdd_toggle, {} },
+      { kind::vdd_toggle_followup, {} },
+      { kind::vdd_create, {} },
+      { kind::vdd_destroy, {} },
       { kind::reset_persistence, { op::reset_persistence } },
       { kind::legacy_retry_tick, { op::legacy_deferred } },
       { kind::legacy_unlock_restore, { op::legacy_deferred } },
-      { kind::native_restore, { op::native_restore } },
+      { kind::native_restore, { op::native_restore, op::vdd_destroy } },
     };
     ASSERT_EQ(legacy.size(), all_kinds.size());
     ASSERT_EQ(managed.size(), all_kinds.size());
@@ -388,6 +413,108 @@ namespace {
         EXPECT_EQ(kind_allows(command, operation, true), managed.at(command).contains(operation))
           << to_string(command) << " / " << to_string(operation) << " (managed)";
       }
+    }
+  }
+
+  TEST(DisplayTopologyCapability, RestoreOnlyWorkersReachRestorationLeavesButNeverDriverMutators) {
+    for (const bool managed : { false, true }) {
+      for (const auto kind : { command_kind_e::startup_recovery, command_kind_e::legacy_startup_restore,
+             command_kind_e::legacy_unlock_restore }) {
+        if ((!managed && kind == command_kind_e::startup_recovery) ||
+            (managed && kind == command_kind_e::legacy_unlock_restore)) {
+          continue;
+        }
+        fake_clock_t clock;
+        auto options = make_options(clock, managed);
+        options.probes.startup_restore_quiescent = [] { return true; };
+        coordinator_t coordinator { std::move(options) };
+        std::atomic_int calls {};
+        const command_body_t body = [&](const auto &capability, const auto &) {
+          SCOPED_TRACE(std::string { to_string(kind) } + (managed ? "/managed" : "/legacy"));
+          EXPECT_NO_THROW(capability.require(operation_e::restore_state));
+          for (const auto operation : restoration_leaves) {
+            SCOPED_TRACE(to_string(operation));
+            EXPECT_NO_THROW(capability.require(operation));
+            auto elsewhere = std::async(std::launch::async, [&] { capability.require(operation); });
+            EXPECT_THROW(elsewhere.get(), capability_error_t);
+          }
+          for (const auto operation : { operation_e::configure_display, operation_e::vdd_create,
+                 operation_e::vdd_destroy, operation_e::vdd_set_modes, operation_e::vdd_cursor,
+                 operation_e::adapter_restart }) {
+            SCOPED_TRACE(to_string(operation));
+            EXPECT_THROW(capability.require(operation), capability_error_t);
+          }
+          ++calls;
+        };
+        if (kind == command_kind_e::startup_recovery) {
+          EXPECT_TRUE(coordinator.start(body).get().completed());
+        }
+        else if (kind == command_kind_e::legacy_startup_restore) {
+          ASSERT_TRUE(coordinator.start([&](const auto &capability, const auto &) {
+                                   coordinator.defer_startup_restore(capability, body);
+                                 })
+              .get()
+              .completed());
+          EXPECT_TRUE(coordinator.retry_startup_restore().completion.get().completed());
+        }
+        else {
+          ASSERT_TRUE(start_ready(coordinator).completed());
+          EXPECT_TRUE(coordinator.run(kind, body).completed());
+        }
+        EXPECT_EQ(calls.load(), 1);
+      }
+    }
+  }
+
+  TEST(DisplayTopologyCapability, NativePreparationAndLegacyRetryHaveDifferentDriverAuthority) {
+    for (const bool managed : { false, true }) {
+      fake_clock_t clock;
+      std::atomic_int prepared {};
+      std::atomic_int retried {};
+      coordinator_t coordinator { make_options(clock, managed) };
+      ASSERT_TRUE(start_ready(coordinator).completed());
+      const auto launch = coordinator.admit_launch({ 709, "driver-authority" });
+      ASSERT_TRUE(launch);
+      EXPECT_TRUE(coordinator.run_launch_prepare(*launch.token, [&](const auto &capability, const auto &) {
+                               SCOPED_TRACE(managed);
+                               EXPECT_NO_THROW(capability.require(operation_e::vdd_create));
+                               EXPECT_NO_THROW(capability.require(operation_e::vdd_destroy));
+                               for (const auto operation : { operation_e::vdd_set_modes, operation_e::vdd_cursor,
+                                      operation_e::adapter_restart, operation_e::write_topology }) {
+                                 SCOPED_TRACE(to_string(operation));
+                                 if (managed) {
+                                   EXPECT_THROW(capability.require(operation), capability_error_t);
+                                 }
+                                 else {
+                                   EXPECT_NO_THROW(capability.require(operation));
+                                 }
+                               }
+                               ++prepared;
+                             })
+          .completed());
+      EXPECT_EQ(prepared.load(), 1);
+      ASSERT_TRUE(coordinator.abort_launch(*launch.token, {}));
+      EXPECT_TRUE(coordinator.run(command_kind_e::legacy_retry_tick, [&](const auto &capability, const auto &) {
+                               SCOPED_TRACE(managed);
+                               for (const auto operation : { operation_e::configure_display, operation_e::restore_state,
+                                      operation_e::vdd_destroy, operation_e::write_topology, operation_e::write_hdr }) {
+                                 SCOPED_TRACE(to_string(operation));
+                                 if (managed) {
+                                   EXPECT_THROW(capability.require(operation), capability_error_t);
+                                 }
+                                 else {
+                                   EXPECT_NO_THROW(capability.require(operation));
+                                 }
+                               }
+                               for (const auto operation : { operation_e::vdd_create, operation_e::vdd_set_modes,
+                                      operation_e::vdd_cursor, operation_e::adapter_restart }) {
+                                 SCOPED_TRACE(to_string(operation));
+                                 EXPECT_THROW(capability.require(operation), capability_error_t);
+                               }
+                               ++retried;
+                             })
+          .completed());
+      EXPECT_EQ(retried.load(), 1);
     }
   }
 
@@ -591,7 +718,8 @@ namespace {
                                EXPECT_EQ(restore_capability.kind(), command_kind_e::legacy_startup_restore);
                                for (const auto operation : all_operations) {
                                  SCOPED_TRACE(to_string(operation));
-                                 if (operation == operation_e::restore_state) {
+                                 if (operation == operation_e::restore_state ||
+                                     std::find(restoration_leaves.begin(), restoration_leaves.end(), operation) != restoration_leaves.end()) {
                                    EXPECT_NO_THROW(restore_capability.require(operation));
                                  }
                                  else {

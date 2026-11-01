@@ -78,68 +78,92 @@ namespace display_device::topology {
         return "native_restore";
       case operation_e::native_recover:
         return "native_recover";
+      case operation_e::write_topology:
+        return "write_topology";
+      case operation_e::write_display_modes:
+        return "write_display_modes";
+      case operation_e::write_primary:
+        return "write_primary";
+      case operation_e::write_hdr:
+        return "write_hdr";
+      case operation_e::write_color_profile:
+        return "write_color_profile";
+      case operation_e::vdd_set_modes:
+        return "vdd_set_modes";
+      case operation_e::vdd_cursor:
+        return "vdd_cursor";
+      case operation_e::adapter_restart:
+        return "adapter_restart";
     }
     return "unknown";
   }
 
   namespace {
     bool
-    table_allows(command_kind_e kind, operation_e operation) noexcept {
+    legacy_restore_operation(operation_e operation) noexcept {
+      using enum operation_e;
+      return operation == restore_state || operation == write_topology || operation == write_display_modes ||
+             operation == write_primary || operation == write_hdr || operation == write_color_profile;
+    }
+
+    bool
+    legacy_prepare_operation(operation_e operation) noexcept {
+      using enum operation_e;
+      return operation == configure_display || legacy_restore_operation(operation) ||
+             operation == vdd_create || operation == vdd_destroy || operation == vdd_set_modes ||
+             operation == vdd_cursor || operation == adapter_restart;
+    }
+
+    bool
+    table_allows(command_kind_e kind, operation_e operation, bool managed_mode) noexcept {
       using enum operation_e;
       switch (kind) {
         case command_kind_e::startup_recovery:
-          return operation == native_recover || operation == restore_state;
+          return operation == native_recover || legacy_restore_operation(operation) ||
+                 (!managed_mode && (operation == vdd_create || operation == vdd_destroy));
         case command_kind_e::legacy_startup_restore:
-          return operation == restore_state;
+          return legacy_restore_operation(operation);
         case command_kind_e::launch_prepare:
-          return operation == configure_display || operation == restore_state || operation == native_apply;
+          return operation == native_apply ||
+                 (managed_mode ? operation == vdd_create || operation == vdd_destroy : legacy_prepare_operation(operation));
         case command_kind_e::launch_failed_restore:
         case command_kind_e::stream_restore:
         case command_kind_e::shutdown_restore:
-          return operation == restore_state || operation == native_restore;
+          return operation == native_restore || operation == vdd_destroy ||
+                 (!managed_mode && (legacy_restore_operation(operation) || operation == vdd_create));
         case command_kind_e::reconfigure:
-          return operation == configure_display;
+          return !managed_mode && legacy_prepare_operation(operation);
         case command_kind_e::shutdown_vdd_destroy:
-          return operation == vdd_destroy;
+          return !managed_mode && operation == vdd_destroy;
         case command_kind_e::rotate:
           return operation == rotate;
         case command_kind_e::scale:
           return operation == scale;
         case command_kind_e::vdd_toggle:
-          return operation == vdd_create || operation == vdd_destroy;
+          return !managed_mode && (operation == vdd_create || operation == vdd_destroy);
         case command_kind_e::vdd_toggle_followup:
-          return operation == vdd_extended_mode || operation == vdd_destroy;
+          return !managed_mode && (operation == vdd_extended_mode || operation == write_topology || operation == vdd_destroy);
         case command_kind_e::vdd_create:
-          return operation == vdd_create;
+          return !managed_mode && (operation == vdd_create || operation == vdd_extended_mode || operation == write_topology);
         case command_kind_e::vdd_destroy:
-          return operation == vdd_destroy;
+          return !managed_mode && operation == vdd_destroy;
         case command_kind_e::reset_persistence:
-          return operation == reset_persistence;
+          return operation == reset_persistence || (!managed_mode && (legacy_restore_operation(operation) || operation == vdd_destroy));
         case command_kind_e::legacy_retry_tick:
+          return operation == legacy_deferred ||
+                 (!managed_mode && (operation == configure_display || legacy_restore_operation(operation) || operation == vdd_destroy));
         case command_kind_e::legacy_unlock_restore:
-          return operation == legacy_deferred;
+          return operation == legacy_deferred || (!managed_mode && legacy_restore_operation(operation));
         case command_kind_e::native_restore:
-          return operation == native_restore;
+          return operation == native_restore || operation == vdd_destroy;
       }
       return false;
-    }
-
-    bool
-    legacy_whole_state(operation_e operation) noexcept {
-      return operation == operation_e::configure_display || operation == operation_e::restore_state;
     }
   }  // namespace
 
   bool
   kind_allows(command_kind_e kind, operation_e operation, bool managed_mode) noexcept {
-    if (!table_allows(kind, operation)) {
-      return false;
-    }
-    if (managed_mode && legacy_whole_state(operation) &&
-        kind != command_kind_e::startup_recovery && kind != command_kind_e::legacy_startup_restore) {
-      return false;
-    }
-    return true;
+    return table_allows(kind, operation, managed_mode);
   }
 
   bool

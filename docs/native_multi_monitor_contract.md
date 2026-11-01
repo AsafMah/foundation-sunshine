@@ -374,6 +374,17 @@ authority. These checks do not wire production startup recovery or its retry
 timer: the runtime must supply the complete activity probe and preserve the
 teardown fence from slot removal through cleanup submission.
 
+The transitive authority table now distinguishes topology, mode, primary, HDR,
+color association, SETMODES, cursor and adapter-restart writes. Its independent
+matrix covers 18 command kinds, 20 operations and both modes. Actual-worker
+fixtures verify restore-only authority and thread confinement, and distinguish
+native creation from legacy preparation and narrower deferred retry. Eighteen
+deliberate faults fail the intended assertions; the coordinator suite now has
+140 cases. Managed legacy VDD routes and restoring reset are denied without
+blocking native journal-first creation or proven owned removal. The table does
+not yet gate the production raw signatures; journal suppression and ownership
+remain separate runtime obligations.
+
 The neutral retry scheduler now pairs each attempt with a distinct generation,
 waits for its receipt, and re-arms failed/rejected work unless shutdown prevents
 another attempt. Replacing or disabling a timer invalidates old completions.

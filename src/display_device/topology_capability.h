@@ -52,6 +52,14 @@ namespace display_device::topology {
     native_apply,
     native_restore,
     native_recover,
+    write_topology,
+    write_display_modes,
+    write_primary,
+    write_hdr,
+    write_color_profile,
+    vdd_set_modes,
+    vdd_cursor,
+    adapter_restart,
   };
 
   std::string_view
@@ -65,7 +73,10 @@ namespace display_device::topology {
    * @details In managed mode the legacy whole-state operations (`configure_display`,
    *          `restore_state`) are refused for every kind except startup recovery,
    *          and its registered `legacy_startup_restore` continuation, which recover
-   *          legacy state persisted by an earlier legacy run.
+   *          legacy state persisted by an earlier legacy run. Shared raw VDD
+   *          permissions survive only on native preparation/restoration paths,
+   *          not legacy VDD routes. Authority never proves ownership or replaces
+   *          runtime suppression of automatic destruction under a native journal.
    */
   bool
   kind_allows(command_kind_e kind, operation_e operation, bool managed_mode) noexcept;
