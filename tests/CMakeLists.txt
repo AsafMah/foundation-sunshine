@@ -235,6 +235,22 @@ if (WIN32)
 endif ()
 add_test(NAME video_probe_unit_tests COMMAND video_probe_unit_tests)
 
+# Real startup policy, but every platform/driver/encoder edge is linked from the fixture.
+add_executable(nvhttp_stream_start_unit_tests
+        ${CMAKE_SOURCE_DIR}/src/nvhttp_stream_start.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_nvhttp_stream_start.cpp)
+target_include_directories(nvhttp_stream_start_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(nvhttp_stream_start_unit_tests PRIVATE gtest_main sunshine::host_headers
+        Boost::log OpenSSL::Crypto sunshine_project_options sunshine_coverage)
+target_compile_definitions(nvhttp_stream_start_unit_tests PRIVATE ${SUNSHINE_DEFINITIONS})
+target_compile_options(nvhttp_stream_start_unit_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>)
+set_target_properties(nvhttp_stream_start_unit_tests PROPERTIES CXX_STANDARD 23)
+if (WIN32)
+    set_target_properties(nvhttp_stream_start_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
+endif ()
+add_test(NAME nvhttp_stream_start_unit_tests COMMAND nvhttp_stream_start_unit_tests)
+set_tests_properties(nvhttp_stream_start_unit_tests PROPERTIES TIMEOUT 30)
+
 add_executable(frame_contract_unit_tests
         ${CMAKE_SOURCE_DIR}/src/platform/frame_contract.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_frame_contract.cpp)
@@ -680,6 +696,7 @@ list(REMOVE_ITEM TEST_SOURCES
         ${CMAKE_SOURCE_DIR}/tests/unit/test_http_util.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_input_activity.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_loopback_usbip_bridge.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_nvhttp_stream_start.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_pen_barrel_roll.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_perf_frame_rates.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_pyrowave.cpp

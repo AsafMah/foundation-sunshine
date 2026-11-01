@@ -367,6 +367,15 @@ that cleanup before releasing ownership. Sealing and ticket binding also refuse
 active probe/admission fences. These orchestration fixtures use fake mutations
 and probes; the production launch helper has not yet been converted.
 
+The standalone `nvhttp_stream_start_unit_tests` target now exercises the actual
+legacy startup helper with link-time fakes for display configuration, inventory
+intent, VDD readiness, encoder probing, HDR adoption and touch-keyboard effects.
+It preserves preflight refusals, exact/current/VDD probe targets, rich errors,
+bounded deferred retries, fallback ordering, cleanup ownership, recovery-session
+field propagation and temporary encoder-setting restoration. This is a
+production-policy regression baseline, not evidence that launch admission,
+asynchronous request lifetime or coordinator routing is connected.
+
 Independent fences now compose instead of replacing one another. A shared
 teardown token can block admission from registry removal through cleanup
 submission, including asynchronous app-cancel callbacks. Releasing one holder
