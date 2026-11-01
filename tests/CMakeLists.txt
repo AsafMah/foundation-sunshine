@@ -904,6 +904,7 @@ if (WIN32)
             ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_ds5_sidecar_client.cpp
             ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_microphone_client.cpp
             ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_nvprefs.cpp
+            ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_owned_process.cpp
             ${CMAKE_SOURCE_DIR}/tests/unit/test_credential_store.cpp
             ${CMAKE_SOURCE_DIR}/tests/unit/test_sunshinesvc_log.cpp
             ${CMAKE_SOURCE_DIR}/tests/unit/test_vdd_prerequisite.cpp
