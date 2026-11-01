@@ -1249,15 +1249,34 @@ namespace display_device::topology {
   std::shared_ptr<const external_mutation_fence_t>
   coordinator_t::hold_external_mutation(const mutation_capability_t &capability) {
     capability.require(operation_e::adapter_restart);
+    return hold_external_actor(capability, false);
+  }
+
+  std::shared_ptr<const external_mutation_fence_t>
+  coordinator_t::hold_external_recovery(const mutation_capability_t &capability) {
+    capability.require(operation_e::native_recover);
+    if (capability.kind() != command_kind_e::startup_recovery) {
+      throw capability_error_t { "External recovery exclusion requires the startup command" };
+    }
+    return hold_external_actor(capability, true);
+  }
+
+  std::shared_ptr<const external_mutation_fence_t>
+  coordinator_t::hold_external_actor(const mutation_capability_t &capability, bool recovering) {
     if (!on_worker_thread() || capability.external_mutation_ != external_mutation_) {
       throw std::logic_error { "External mutation exclusion needs its coordinator's worker capability" };
     }
     std::lock_guard lock { mutex_ };
-    if (!queue_ || stopping_ || phase_ == coordinator_phase_e::draining) {
+    if (!recovering && (!queue_ || stopping_ || phase_ == coordinator_phase_e::draining)) {
       throw std::logic_error { "An external topology mutation cannot start while draining or stopped" };
     }
+    if (!queue_ && !(recovering && stopping_ && phase_ == coordinator_phase_e::stopped)) {
+      throw std::logic_error { "External recovery cannot adopt an actor without a running or stopping worker" };
+    }
+    // Stop may already own the queue. Its preflight rejects queued bodies; only
+    // this still-running startup body needs raw exclusion before the worker joins.
     auto token = std::shared_ptr<external_mutation_fence_t> {
-      new external_mutation_fence_t { external_mutation_, queue_->hold_dispatch() }
+      new external_mutation_fence_t { external_mutation_, queue_ ? queue_->hold_dispatch() : nullptr }
     };
     fences_.push_back([weak = std::weak_ptr { token }]() { return weak.expired(); });
     external_mutation_->store(true, std::memory_order_release);

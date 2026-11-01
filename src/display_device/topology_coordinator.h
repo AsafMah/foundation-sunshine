@@ -450,6 +450,16 @@ namespace display_device::topology {
     hold_external_mutation(const mutation_capability_t &capability);
 
     /**
+     * Adopt an existing or possibly existing actor during startup recovery.
+     * Requires this worker's exact startup kind and native-recovery permission;
+     * it never grants permission to launch another actor. Adoption may occur
+     * while draining or after stop moved the queue but is still joining startup.
+     * Retain through settlement; durable recovery and cleanup belong to the caller.
+     */
+    std::shared_ptr<const external_mutation_fence_t>
+    hold_external_recovery(const mutation_capability_t &capability);
+
+    /**
      * @brief Hold an admission fence until every copy of the returned token is released.
      * @details For teardown, acquire before removing a session from the visible registry;
      *          keep it through join and submission of all stream/app cleanup. Cleanup may
@@ -538,6 +548,9 @@ namespace display_device::topology {
 
     bool
     external_fence_active_locked();
+
+    std::shared_ptr<const external_mutation_fence_t>
+    hold_external_actor(const mutation_capability_t &capability, bool recovering);
 
     topology_command_queue_t::task_t
     make_task(command_kind_e kind, std::shared_ptr<command_state_t> state, command_body_t body,

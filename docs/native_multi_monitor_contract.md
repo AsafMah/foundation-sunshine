@@ -472,6 +472,18 @@ coordinator suite has 146 cases. Stop cancels the queue; it does not prove an
 external process settled. The actual adapter-process supervisor and retained
 cleanup/restart-recovery obligations remain unwired.
 
+Recovery-only acquisition separately requires the exact startup command and
+native-recovery authority. It may adopt an existing or possibly existing actor
+while draining, or after stop moved the queue but is still joining startup.
+That stopped-worker case uses shared raw exclusion without touching the moved
+queue; pending bodies must still fail stopped preflight before cancellation.
+Normal new-actor acquisition retains its draining/stopped refusal. Six more
+fake-backed cases pass (152 coordinator cases total), with ER1-ER15
+assertion-killed. The foreign-owner fixture was strengthened after ER9 initially
+survived a lower dispatch guard. The acquisition token is not durable recovery
+or coordinator-owned startup suspension: strong publication before fallible
+inspection, resumable startup, process supervision and cleanup remain unwired.
+
 The Windows launcher now has an opt-in, thread-confined original-handle owner.
 It shares the existing token, environment and command-resolution policy while
 retaining both creation handles before post-create scopes can fail. The legacy
