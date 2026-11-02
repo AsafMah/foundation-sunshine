@@ -3444,3 +3444,271 @@ TEST_F(NativeExecutor, ALegacyPrepareCannotAddAVirtualDisplayToTheDesktop) {
   EXPECT_TRUE(platform.activations.empty());
   EXPECT_FALSE(log.contains("activate_head:vdd-1"));
 }
+// --- Several virtual heads (G2-B, provisional pending G1 hardware) -------------------
+
+namespace {
+  dt::native_profile_t
+  heads_profile(std::uint8_t count) {
+    auto profile = virtual_profile();
+    profile.virtual_heads = count;
+    return profile;
+  }
+
+  dt::native_outcome_t
+  prepare_heads(dt::native_executor_t &executor, std::uint8_t count = 2) {
+    dt::native_outcome_t outcome;
+    with_capability(dt::command_kind_e::launch_prepare, [&](const auto &capability) { outcome = executor.prepare(capability, heads_profile(count)); }, true);
+    return outcome;
+  }
+
+  /** Makes vdd-1 look re-created: a new arrival for the same request identity. */
+  void
+  re_arrive_first(fake_platform_t &platform) {
+    auto &first = find(platform.host, "vdd-1");
+    first.incarnation = dt::source_incarnation_t { first.incarnation.value + 1 };
+    first.head->incarnation = dt::head_incarnation_t { first.head->incarnation.value + 1 };
+  }
+}  // namespace
+
+TEST_F(NativeExecutor, TwoHeadsAreEachJournaledBeforeCreationActivatedAndBothTargeted) {
+  platform.create_inactive = true;
+  bool journaled_first = true;
+  platform.on_create = [&](std::size_t call) -> dt::result_t<delivery_e> {
+    const auto record = store.record();
+    journaled_first = journaled_first && record && record->steps.back().state == step_e::attempted &&
+                      record->steps.back().head_intent == platform.intents.back() && record->owned_heads.size() == call - 1;
+    platform.add_head();
+    return delivery_e::accepted;
+  };
+  const auto outcome = prepare_heads(executor);
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok));
+  EXPECT_TRUE(journaled_first);
+  ASSERT_TRUE(outcome.target);
+  EXPECT_TRUE((*outcome.target == dt::native_target_t { dt::os_display_id_t { "vdd-1" }, true }));
+  EXPECT_TRUE((outcome.targets == std::vector<dt::native_target_t> {
+                { dt::os_display_id_t { "vdd-1" }, true }, { dt::os_display_id_t { "vdd-2" }, true } }));
+  EXPECT_EQ(log.events, (std::vector<std::string> { "save", "create_head", "save", "activate_head:vdd-1", "save",
+                          "save", "create_head", "save", "activate_head:vdd-2", "save" }));
+  EXPECT_EQ(platform.head_count(), 2u);
+  for (const auto &display : platform.host.displays) {
+    if (platform.is_virtual_head(display)) {
+      EXPECT_EQ(display.info.device_state, state_e::active) << display.id.value;
+    }
+  }
+
+  const auto record = store.record();
+  ASSERT_TRUE(record);
+  ASSERT_EQ(record->owned_heads.size(), 2u);
+  ASSERT_EQ(platform.intents.size(), 2u);
+  EXPECT_TRUE(record->owned_heads[0].identity.guid == platform.intents[0]);
+  EXPECT_TRUE(record->owned_heads[1].identity.guid == platform.intents[1]);
+  EXPECT_FALSE(record->owned_heads[0].identity.guid == record->owned_heads[1].identity.guid);
+  ASSERT_EQ(record->steps.size(), 2u);
+  EXPECT_TRUE(record->steps[0].display == dt::os_display_id_t { "vdd-1" });
+  EXPECT_TRUE(record->steps[1].display == dt::os_display_id_t { "vdd-2" });
+
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_FALSE(store.bytes);
+  EXPECT_TRUE(healthy(executor.health()));
+}
+
+TEST_F(NativeExecutor, OneHeadListsItsTargetOnce) {
+  const auto outcome = prepare_with(executor, virtual_profile());
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok));
+  EXPECT_TRUE((outcome.targets == std::vector<dt::native_target_t> { *outcome.target }));
+}
+
+TEST_F(NativeExecutor, AHeadCountOutsideTheSupportedRangeTouchesNothing) {
+  for (const std::uint8_t count : { std::uint8_t { 0 }, std::uint8_t { dt::max_virtual_heads + 1 } }) {
+    const auto outcome = prepare_heads(executor, count);
+    EXPECT_TRUE(verdict_is(outcome, native_verdict_e::refused)) << int { count };
+    EXPECT_TRUE(mentions(outcome.reason, "virtual displays")) << outcome.reason;
+  }
+  EXPECT_EQ(store.saves, 0);
+  EXPECT_EQ(log.host_writes(), 0u);
+  EXPECT_TRUE(healthy(executor.health()));
+}
+
+TEST_F(NativeExecutor, TheSettingStillAsksForOneHeadAndRejectsTwoMonitors) {
+  const auto one = dt::parse_native_profile(R"({"version":1,"monitors":[{"source":"virtual"}]})");
+  ASSERT_TRUE(one && *one);
+  EXPECT_EQ((*one)->virtual_heads, 1);
+  EXPECT_FALSE(dt::parse_native_profile(R"({"version":1,"monitors":[{"source":"virtual"},{"source":"virtual"}]})"));
+}
+
+TEST_F(NativeExecutor, ASecondHeadTheDriverRefusesRemovesTheFirst) {
+  platform.create_inactive = true;
+  platform.on_create = [&](std::size_t call) -> dt::result_t<delivery_e> {
+    if (call > 1) return failure("the driver is full");
+    platform.add_head();
+    return delivery_e::accepted;
+  };
+  const auto outcome = prepare_heads(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::refused));
+  EXPECT_TRUE(mentions(outcome.reason, "the driver is full")) << outcome.reason;
+  EXPECT_TRUE(mentions(outcome.reason, "2 of 2")) << outcome.reason;
+  EXPECT_EQ(platform.intents.size(), 3u) << "each slot keeps its own attempts";
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_EQ(log.events.back(), "clear");
+  EXPECT_TRUE(log.contains("remove_all_heads"));
+  EXPECT_FALSE(store.bytes);
+  EXPECT_TRUE(healthy(executor.health()));
+}
+
+TEST_F(NativeExecutor, ASecondCreateThatReArrivesTheFirstIsRolledBackByThisRunsIdentities) {
+  platform.create_inactive = true;
+  platform.on_create = [&](std::size_t call) -> dt::result_t<delivery_e> {
+    if (call == 2) re_arrive_first(platform);
+    platform.add_head();
+    return delivery_e::accepted;
+  };
+  const auto outcome = prepare_heads(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::refused));
+  EXPECT_TRUE(mentions(outcome.reason, "changed a virtual display this host created")) << outcome.reason;
+  EXPECT_TRUE(log.contains("remove_all_heads"));
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_FALSE(store.bytes);
+  EXPECT_TRUE(healthy(executor.health()));
+}
+
+TEST_F(NativeExecutor, AFirstHeadReplacedByAForeignIdentityIsLeftInPlace) {
+  platform.create_inactive = true;
+  platform.on_create = [&](std::size_t call) -> dt::result_t<delivery_e> {
+    if (call == 2) find(platform.host, "vdd-1").head->guid = id<dt::head_guid_t>(0x99);
+    platform.add_head();
+    return delivery_e::accepted;
+  };
+  const auto outcome = prepare_heads(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
+  EXPECT_FALSE(log.contains("remove_all_heads"));
+  EXPECT_EQ(platform.head_count(), 2u);
+  EXPECT_TRUE(store.bytes);
+  EXPECT_TRUE(executor.health().in_conflict);
+}
+
+TEST_F(NativeExecutor, AnExtraHeadAppearingWithTheSecondIsNeverAdopted) {
+  platform.create_inactive = true;
+  platform.on_create = [&](std::size_t call) -> dt::result_t<delivery_e> {
+    platform.add_head();
+    if (call == 2) platform.host.displays.push_back(virtual_display("another", 7680));
+    return delivery_e::accepted;
+  };
+  const auto outcome = prepare_heads(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
+  EXPECT_FALSE(log.contains("remove_all_heads"));
+  EXPECT_EQ(platform.head_count(), 3u);
+  EXPECT_TRUE(store.bytes);
+}
+
+TEST_F(NativeExecutor, ActivatingTheSecondHeadMustKeepTheFirstOnTheDesktop) {
+  platform.create_inactive = true;
+  platform.on_activate = [&](const dt::observed_display_t &head) -> dt::result_t<void> {
+    if (head.id.value == "vdd-2") {
+      auto &first = find(platform.host, "vdd-1");
+      first.info.device_state = state_e::inactive;
+      first.info.display_name.clear();
+      first.layout.reset();
+    }
+    auto &target = find(platform.host, head.id.value);
+    target.info.device_state = state_e::active;
+    target.info.display_name = "\\\\.\\DISPLAY-" + head.id.value;
+    target.layout = display_topology_test::layout(3840);
+    return {};
+  };
+  const auto outcome = prepare_heads(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::refused));
+  EXPECT_TRUE(mentions(outcome.reason, "desktop")) << outcome.reason;
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(NativeExecutor, AHeadSetThatChangesAfterTheLastCreateIsRolledBack) {
+  int second_created_at = -1;
+  platform.on_create = [&](std::size_t index) -> dt::result_t<delivery_e> {
+    platform.add_head();
+    if (index == 2) {
+      second_created_at = platform.reads;
+    }
+    return delivery_e::accepted;
+  };
+  // Only the settling read, after the second head was listed and proven, sees a stray head.
+  platform.tamper = [&](int read, dt::inventory_t &inventory) {
+    if (second_created_at >= 0 && read == second_created_at + 2) {
+      inventory.displays.push_back(virtual_display("stray", 7680));
+    }
+  };
+  const auto outcome = prepare_heads(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::refused));
+  EXPECT_TRUE(mentions(outcome.reason, "changed while they were being prepared")) << outcome.reason;
+  EXPECT_TRUE(log.contains("remove_all_heads"));
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(NativeExecutor, AJournalNamingOneHeadTwiceNeverRemovesAForeignHead) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  // Ownership entries cannot repeat (the schema rejects that), but the observed steps could name one display twice.
+  auto record = store.record().value();
+  std::vector<dt::journal_step_t *> created;
+  for (auto &step : record.steps) {
+    if (step.operation == dt::journal_operation_e::create_head && step.state == dt::journal_step_state_e::observed) {
+      created.push_back(&step);
+    }
+  }
+  ASSERT_EQ(created.size(), 2u);
+  created[1]->display = created[0]->display;
+  store.put(record);
+  remove_display(platform.host, "vdd-2");
+  platform.host.displays.push_back(virtual_display("foreign", 7680));
+
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
+  EXPECT_FALSE(log.contains("remove_all_heads"));
+  EXPECT_EQ(platform.head_count(), 2u);
+  EXPECT_TRUE(store.bytes);
+}
+
+TEST_F(NativeExecutor, RestoreRemovesTwoHeadsOnlyWhileTheExactOwnedSetIsListed) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  re_arrive_first(platform);
+  auto outcome = restore_with(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
+  EXPECT_FALSE(log.contains("remove_all_heads"));
+  EXPECT_EQ(platform.head_count(), 2u);
+  EXPECT_TRUE(store.bytes);
+}
+
+TEST_F(NativeExecutor, RestoreLeavesTwoHeadsWhenAThirdIsListed) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  platform.host.displays.push_back(virtual_display("another", 7680));
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
+  EXPECT_FALSE(log.contains("remove_all_heads"));
+  EXPECT_EQ(platform.head_count(), 3u);
+}
+
+TEST_F(NativeExecutor, RestoreLeavesTwoHeadsWhenOneIsMissing) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  std::erase_if(platform.host.displays, [](const dt::observed_display_t &display) { return display.id.value == "vdd-2"; });
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
+  EXPECT_FALSE(log.contains("remove_all_heads"));
+  EXPECT_EQ(platform.head_count(), 1u);
+}
+
+TEST_F(NativeExecutor, ATwoHeadJournalOfAnEarlierRunIsInConflictOnRecovery) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  auto restarted = make_executor();
+  EXPECT_TRUE(in_conflict(recover_with(restarted)));
+  EXPECT_FALSE(log.contains("remove_all_heads"));
+  EXPECT_EQ(platform.head_count(), 2u);
+}
+
+TEST_F(NativeExecutor, ChangeModeIsRefusedWhileSeveralHeadsAreOwned) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  const auto outcome = change_with(executor, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::refused));
+  EXPECT_TRUE(mentions(outcome.reason, "several virtual displays")) << outcome.reason;
+  EXPECT_TRUE(platform.mode_requests.empty());
+  EXPECT_FALSE(executor.health().in_conflict);
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+  EXPECT_EQ(platform.head_count(), 0u);
+}

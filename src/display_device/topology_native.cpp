@@ -145,16 +145,58 @@ namespace display_device::topology {
     }
 
     bool
-    sole_matching_head(const native_platform_t &platform, const inventory_t &inventory, const observed_display_t &expected) {
+    same_listed_head(const observed_display_t &head, const observed_display_t &expected) {
+      return head.id == expected.id && head.adapter == expected.adapter && head.incarnation == expected.incarnation && head.head == expected.head;
+    }
+
+    /** Each of `expected` is listed exactly once, with the same ID, adapter, incarnation and head identity. */
+    bool
+    lists_each(const native_platform_t &platform, const inventory_t &inventory, const std::vector<observed_display_t> &expected) {
       if (!inventory.available) {
         return false;
       }
       const auto heads = virtual_heads(platform, inventory);
-      if (heads.size() != 1 || heads.front()->id != expected.id) {
+      return std::all_of(expected.begin(), expected.end(), [&](const observed_display_t &want) {
+        return std::count_if(heads.begin(), heads.end(), [&](const observed_display_t *head) { return same_listed_head(*head, want); }) == 1;
+      });
+    }
+
+    /** The listed virtual heads are exactly `expected`, and nothing else; `expected` names each display once. */
+    bool
+    exact_head_set(const native_platform_t &platform, const inventory_t &inventory, const std::vector<observed_display_t> &expected) {
+      for (auto it = expected.begin(); it != expected.end(); ++it) {
+        if (std::any_of(std::next(it), expected.end(), [&](const observed_display_t &other) { return other.id == it->id; })) {
+          return false;
+        }
+      }
+      return lists_each(platform, inventory, expected) && virtual_heads(platform, inventory).size() == expected.size();
+    }
+
+    bool
+    sole_matching_head(const native_platform_t &platform, const inventory_t &inventory, const observed_display_t &expected) {
+      return exact_head_set(platform, inventory, { expected });
+    }
+
+    /**
+     * Same-run proof when the baseline had no virtual display: every listed head carries
+     * this driver, a live incarnation and one of this run's request GUIDs, each at most once.
+     */
+    bool
+    only_requested_heads(const native_platform_t &platform, const inventory_t &inventory, const driver_instance_id_t &driver,
+      const std::vector<head_guid_t> &requests) {
+      if (!inventory.available) {
         return false;
       }
-      const auto &head = *heads.front();
-      return head.adapter == expected.adapter && head.incarnation == expected.incarnation && head.head == expected.head;
+      std::vector<head_guid_t> seen;
+      for (const auto *head : virtual_heads(platform, inventory)) {
+        if (!head->head || head->head->driver != driver || head->head->incarnation.value == 0 ||
+            std::find(requests.begin(), requests.end(), head->head->guid) == requests.end() ||
+            std::find(seen.begin(), seen.end(), head->head->guid) != seen.end()) {
+          return false;
+        }
+        seen.push_back(head->head->guid);
+      }
+      return true;
     }
 
     using signature_t = std::vector<std::pair<std::string, device_state_e>>;
@@ -199,6 +241,29 @@ namespace display_device::topology {
         return step.operation == journal_operation_e::create_head && step.state == journal_step_state_e::observed;
       });
       return it == record.steps.rend() ? nullptr : &*it;
+    }
+
+    /** Each owned head as its observed creation listed it, in creation order; nullopt unless every one is named exactly. */
+    std::optional<std::vector<observed_display_t>>
+    owned_as_observed(const journal_record_t &record) {
+      std::vector<observed_display_t> heads;
+      for (const auto &step : record.steps) {
+        if (step.operation != journal_operation_e::create_head || step.state != journal_step_state_e::observed) {
+          continue;
+        }
+        const auto *head = step.display && step.observed ? find_unique(*step.observed, *step.display) : nullptr;
+        // Each observed creation must list the head its own ownership entry names, in order.
+        if (!head || !head->head || heads.size() >= record.owned_heads.size() ||
+            head->head->guid != record.owned_heads[heads.size()].identity.guid ||
+            head->head->driver != record.owned_heads[heads.size()].identity.driver) {
+          return std::nullopt;
+        }
+        heads.push_back(*head);
+      }
+      if (heads.empty() || heads.size() != record.owned_heads.size()) {
+        return std::nullopt;
+      }
+      return heads;
     }
 
     /**
@@ -489,7 +554,7 @@ namespace display_device::topology {
       if (store_.load().present()) {
         return conflict("A native journal is still present; it must be reconciled or reset first");
       }
-      return profile.source == native_profile_t::source_e::virtual_head ? prepare_virtual(capability) :
+      return profile.source == native_profile_t::source_e::virtual_head ? prepare_virtual(capability, profile.virtual_heads) :
                                                                           prepare_physical(profile.display);
     }
     catch (const std::exception &error) {
@@ -514,11 +579,16 @@ namespace display_device::topology {
     if (platform_.is_virtual_head(*find_unique(inventory, display))) {
       return refused("Display " + display.value + " is a virtual display; use a virtual entry");
     }
-    return { native_verdict_e::ok, native_target_t { display, false }, {} };
+    native_outcome_t outcome { native_verdict_e::ok, native_target_t { display, false }, {} };
+    outcome.targets = { *outcome.target };
+    return outcome;
   }
 
   native_outcome_t
-  native_executor_t::prepare_virtual(const mutation_capability_t &capability) {
+  native_executor_t::prepare_virtual(const mutation_capability_t &capability, std::uint8_t count) {
+    if (count == 0 || count > max_virtual_heads) {
+      return refused("This version prepares 1 to " + std::to_string(max_virtual_heads) + " virtual displays, not " + std::to_string(count));
+    }
     const auto baseline = platform_.inventory();
     if (!baseline.available) {
       return refused("The display inventory is unavailable");
@@ -529,8 +599,9 @@ namespace display_device::topology {
 
     const transaction_id_t transaction { fresh_uuid() };
     const request_id_t request { fresh_uuid() };
+    // Each head slot keeps its own attempts, so every request identity is fresh.
     std::vector<head_guid_t> intents;
-    for (std::uint32_t attempt = 0; attempt < options_.create_attempts; ++attempt) {
+    for (std::uint32_t attempt = 0; attempt < options_.create_attempts * count; ++attempt) {
       intents.emplace_back(fresh_uuid());
     }
 
@@ -553,98 +624,167 @@ namespace display_device::topology {
       return conflict(std::move(reason));
     };
 
-    std::string failure;
-    for (const auto &intent : intents) {
-      record.steps.push_back({ next_sequence(record), journal_operation_e::create_head, std::nullopt, intent,
-        journal_step_state_e::attempted, std::nullopt, {} });
-      // Write-ahead: the attempt is durable before the driver is asked.
-      if (const auto saved = store_.save(record); !saved) {
-        return clear_journal(refusal("The native journal could not be saved: " + saved.error().detail));
-      }
+    // The heads this prepare owns, as last listed, in creation order. Preparation is all or
+    // nothing: a failure on any head removes every head created before it.
+    std::vector<observed_display_t> owned;
+    const auto exactly = [this](std::vector<observed_display_t> heads) {
+      return [this, heads = std::move(heads)](const inventory_t &inventory) { return exact_head_set(platform_, inventory, heads); };
+    };
+    const auto and_new = [&](const observed_display_t &head) {
+      auto heads = owned;
+      heads.push_back(head);
+      return exactly(std::move(heads));
+    };
+    const auto give_up = [&](std::string why) {
+      return owned.empty() ? clear_journal(refusal(std::move(why))) : roll_back_heads(capability, record, exactly(owned), why);
+    };
 
-      const auto created = platform_.create_head(capability, intent);
-      const auto after = platform_.inventory();
-      if (!after.available) {
-        return unresolved("The display inventory is unavailable after asking for a virtual display");
-      }
-      const auto heads = virtual_heads(platform_, after);
-      if (heads.size() > 1) {
-        return conflict("More than one virtual display appeared, so none can be proven to be this host's");
-      }
-      if (heads.empty()) {
-        if (created) {
-          return unresolved(*created == creation_delivery_e::accepted ?
-                              "The driver accepted the request but no virtual display appeared" :
-                              "The driver delivery is uncertain and no virtual display appeared");
-        }
-        // The driver refused the request, so no display of it can appear later.
-        failure = created.error().detail.empty() ? std::string { "the driver reported an error" } : created.error().detail;
-        auto &step = record.steps.back();
-        step.state = journal_step_state_e::failed;
-        step.detail = failure;
-        if (unmanaged_signature(platform_, after, record) != expected) {
-          return clear_journal(refusal("Other displays changed while creating a virtual display: " + failure));
-        }
-        continue;
-      }
-
-      const auto &head = *heads.front();
-      if (!created) {
-        return unresolved("The driver refused the request but a virtual display appeared: " + created.error().detail);
-      }
-      // Only a head carrying this request's full identity can be ours; anything else is left alone.
-      if (!head.head || head.head->driver != options_.driver || head.head->guid != intent || head.head->incarnation.value == 0) {
-        return unresolved("A virtual display appeared that does not carry this request's identity");
-      }
-      if (*created != creation_delivery_e::accepted) {
-        return roll_back_head(capability, record, head, "The driver delivery is uncertain");
-      }
-      if (unmanaged_signature(platform_, after, record) != expected) {
-        return roll_back_head(capability, record, head, "Creating the virtual display changed other displays");
-      }
-      auto &step = record.steps.back();
-      step.state = journal_step_state_e::observed;
-      step.display = head.id;
-      step.observed = after;
-      record.owned_heads.push_back({ *head.head, owner_, head.adapter.value_or(adapter_luid_t {}), 0 });
-      if (const auto saved = store_.save(record); !saved) {
-        return roll_back_head(capability, record, head, "The native journal could not record the new virtual display: " + saved.error().detail);
-      }
-      // A cold-created head can be listed but not on the desktop, with nothing to capture.
-      // It is already owned in the journal, so any failure below removes it again.
-      if (!on_desktop(head)) {
-        const auto activated = platform_.activate_head(capability, head);
-        if (!activated) {
-          return roll_back_head(capability, record, head, "The new virtual display could not be added to the desktop: " + activated.error().detail);
-        }
-        const auto active = platform_.inventory();
-        if (!sole_matching_head(platform_, active, head)) {
-          return roll_back_head(capability, record, head, "The virtual display changed identity while being added to the desktop");
-        }
-        if (!on_desktop(*virtual_heads(platform_, active).front())) {
-          return roll_back_head(capability, record, head, "The virtual display was not added to the desktop");
-        }
-        if (unmanaged_signature(platform_, active, record) != expected) {
-          return roll_back_head(capability, record, head, "Adding the virtual display to the desktop changed other displays");
-        }
-        record.steps.back().observed = active;
+    for (std::uint8_t slot = 0; slot < count; ++slot) {
+      const auto ordinal = std::to_string(slot + 1) + " of " + std::to_string(count);
+      std::string failure;
+      bool done = false;
+      for (std::uint32_t attempt = 0; attempt < options_.create_attempts && !done; ++attempt) {
+        const auto &intent = intents[slot * options_.create_attempts + attempt];
+        record.steps.push_back({ next_sequence(record), journal_operation_e::create_head, std::nullopt, intent,
+          journal_step_state_e::attempted, std::nullopt, {} });
+        // Write-ahead: the attempt is durable before the driver is asked.
         if (const auto saved = store_.save(record); !saved) {
-          return roll_back_head(capability, record, head, "The native journal could not record the activated virtual display: " + saved.error().detail);
+          return give_up("The native journal could not be saved: " + saved.error().detail);
+        }
+
+        const auto created = platform_.create_head(capability, intent);
+        const auto after = platform_.inventory();
+        if (!after.available) {
+          return unresolved("The display inventory is unavailable after asking for a virtual display");
+        }
+        const auto heads = virtual_heads(platform_, after);
+        if (heads.size() > owned.size() + 1) {
+          return conflict("More than one virtual display appeared, so none can be proven to be this host's");
+        }
+        if (!lists_each(platform_, after, owned)) {
+          // A driver may re-enumerate its heads when another is added; that is a hardware
+          // unknown, so the earlier heads are no longer proven and everything is removed.
+          auto why = "Creating virtual display " + ordinal + " changed a virtual display this host created";
+          const bool request_listed = std::any_of(heads.begin(), heads.end(), [&](const observed_display_t *head) {
+            return head->head && head->head->guid == intent;
+          });
+          if (created && !request_listed) {
+            return unresolved(why + ", and its own display did not appear");
+          }
+          return roll_back_heads(capability, record, [&](const inventory_t &inventory) {
+            return only_requested_heads(platform_, inventory, options_.driver, intents);
+          }, why);
+        }
+        const auto fresh = std::find_if(heads.begin(), heads.end(), [&](const observed_display_t *head) {
+          return std::none_of(owned.begin(), owned.end(), [&](const observed_display_t &mine) { return mine.id == head->id; });
+        });
+        if (fresh == heads.end()) {
+          if (created) {
+            return unresolved(*created == creation_delivery_e::accepted ?
+                                "The driver accepted the request but no virtual display appeared" :
+                                "The driver delivery is uncertain and no virtual display appeared");
+          }
+          // The driver refused the request, so no display of it can appear later.
+          failure = created.error().detail.empty() ? std::string { "the driver reported an error" } : created.error().detail;
+          auto &step = record.steps.back();
+          step.state = journal_step_state_e::failed;
+          step.detail = failure;
+          if (unmanaged_signature(platform_, after, record) != expected) {
+            return give_up("Other displays changed while creating a virtual display: " + failure);
+          }
+          continue;
+        }
+
+        const auto &head = **fresh;
+        if (!created) {
+          return unresolved("The driver refused the request but a virtual display appeared: " + created.error().detail);
+        }
+        // Only a head carrying this request's full identity can be ours; anything else is left alone.
+        if (!head.head || head.head->driver != options_.driver || head.head->guid != intent || head.head->incarnation.value == 0) {
+          return unresolved("A virtual display appeared that does not carry this request's identity");
+        }
+        if (*created != creation_delivery_e::accepted) {
+          return roll_back_heads(capability, record, and_new(head), "The driver delivery is uncertain");
+        }
+        if (unmanaged_signature(platform_, after, record) != expected) {
+          return roll_back_heads(capability, record, and_new(head), "Creating the virtual display changed other displays");
+        }
+        auto &step = record.steps.back();
+        step.state = journal_step_state_e::observed;
+        step.display = head.id;
+        step.observed = after;
+        record.owned_heads.push_back({ *head.head, owner_, head.adapter.value_or(adapter_luid_t {}), 0 });
+        if (const auto saved = store_.save(record); !saved) {
+          return roll_back_heads(capability, record, and_new(head), "The native journal could not record the new virtual display: " + saved.error().detail);
+        }
+        auto listed = head;
+        // A cold-created head can be listed but not on the desktop, with nothing to capture.
+        // It is already owned in the journal, so any failure below removes it again.
+        if (!on_desktop(head)) {
+          const auto activated = platform_.activate_head(capability, head);
+          if (!activated) {
+            return roll_back_heads(capability, record, and_new(head), "The new virtual display could not be added to the desktop: " + activated.error().detail);
+          }
+          const auto active = platform_.inventory();
+          auto with_head = owned;
+          with_head.push_back(head);
+          if (!exact_head_set(platform_, active, with_head)) {
+            return roll_back_heads(capability, record, and_new(head), "The virtual display changed identity while being added to the desktop");
+          }
+          const auto *now = find_unique(active, head.id);
+          if (!on_desktop(*now)) {
+            return roll_back_heads(capability, record, and_new(head), "The virtual display was not added to the desktop");
+          }
+          if (unmanaged_signature(platform_, active, record) != expected) {
+            return roll_back_heads(capability, record, and_new(head), "Adding the virtual display to the desktop changed other displays");
+          }
+          record.steps.back().observed = active;
+          if (const auto saved = store_.save(record); !saved) {
+            return roll_back_heads(capability, record, and_new(head), "The native journal could not record the activated virtual display: " + saved.error().detail);
+          }
+          listed = *now;
+        }
+        owned.push_back(std::move(listed));
+        done = true;
+      }
+      if (!done) {
+        return give_up((count == 1 ? std::string { "No virtual display was created: " } :
+                                     "Virtual display " + ordinal + " was not created: ") + failure);
+      }
+    }
+
+    if (count > 1) {
+      // Adding a head can move or deactivate the ones added before it.
+      const auto settled_heads = platform_.inventory();
+      if (!exact_head_set(platform_, settled_heads, owned)) {
+        return roll_back_heads(capability, record, exactly(owned), "The virtual displays changed while they were being prepared");
+      }
+      for (std::size_t index = 0; index < owned.size(); ++index) {
+        if (!on_desktop(*find_unique(settled_heads, owned[index].id))) {
+          return roll_back_heads(capability, record, exactly(owned),
+            "Virtual display " + std::to_string(index + 1) + " left the desktop while the others were added");
         }
       }
-      created_in_this_run_ = record.transaction;
-      health_ = { true, false, {} };
-      return { native_verdict_e::ok, native_target_t { head.id, true }, {} };
+      if (unmanaged_signature(platform_, settled_heads, record) != expected) {
+        return roll_back_heads(capability, record, exactly(owned), "Adding the virtual displays changed other displays");
+      }
     }
-    return clear_journal(refusal("No virtual display was created: " + failure));
+
+    created_in_this_run_ = record.transaction;
+    health_ = { true, false, {} };
+    native_outcome_t outcome { native_verdict_e::ok, native_target_t { owned.front().id, true }, {} };
+    for (const auto &head : owned) {
+      outcome.targets.push_back({ head.id, true });
+    }
+    return outcome;
   }
 
   native_outcome_t
-  native_executor_t::roll_back_head(const mutation_capability_t &capability, const journal_record_t &record,
-    const observed_display_t &expected, const std::string &why) {
-    // Same-run proof: no virtual display existed before, exactly one exists now, and
-    // the coordinator serializes every other virtual display operation.
-    if (!sole_matching_head(platform_, platform_.inventory(), expected)) {
+  native_executor_t::roll_back_heads(const mutation_capability_t &capability, const journal_record_t &record,
+    const std::function<bool(const inventory_t &)> &proven, const std::string &why) {
+    // Same-run proof: no virtual display existed before, the heads listed now are provably
+    // this run's, and the coordinator serializes every other virtual display operation.
+    if (!proven(platform_.inventory())) {
       return conflict(why + "; the virtual display could not be proven to be this host's before rollback");
     }
     if (const auto removed = platform_.remove_all_heads(capability); !removed) {
@@ -733,6 +873,10 @@ namespace display_device::topology {
       }
       if (semantic_problem(record) || unresolved_step(record)) {
         return refuse("The native journal does not prove a single virtual display");
+      }
+      if (record.owned_heads.size() > 1) {
+        // Per-head mode changes need per-track client control (P5); no head is touched.
+        return refuse("Changing the mode of one of several virtual displays is not supported yet");
       }
       const auto *created = observed_create(record);
       const auto *expected = created && created->display && created->observed ? find_unique(*created->observed, *created->display) : nullptr;
@@ -870,19 +1014,18 @@ namespace display_device::topology {
       }
     }
 
-    const observed_display_t *owned_display = nullptr;
+    std::vector<observed_display_t> owned_displays;
     if (attempted(record, journal_operation_e::create_head, nullptr)) {
       const auto heads = virtual_heads(platform_, current);
       if (!heads.empty()) {
         if (!same_run) {
           return conflict("A virtual display from an earlier run cannot be proven to be this host's, so it is left in place");
         }
-        const auto *created = observed_create(record);
-        const auto *expected = created && created->display && created->observed ? find_unique(*created->observed, *created->display) : nullptr;
-        if (record.owned_heads.size() != 1 || !expected || !sole_matching_head(platform_, current, *expected)) {
+        const auto expected = owned_as_observed(record);
+        if (!expected || !exact_head_set(platform_, current, *expected)) {
           return conflict("The virtual displays present no longer match the one this host created, so none is removed");
         }
-        owned_display = expected;
+        owned_displays = *expected;
       }
     }
 
@@ -891,11 +1034,11 @@ namespace display_device::topology {
         return conflict("Restoring display " + id.value + " failed: " + applied.error().detail);
       }
     }
-    if (owned_display) {
+    if (!owned_displays.empty()) {
       if (!restores.empty()) {
         // The restores changed the topology, so the proof is repeated before removing.
         const auto before = platform_.inventory();
-        if (!sole_matching_head(platform_, before, *owned_display)) {
+        if (!exact_head_set(platform_, before, owned_displays)) {
           return conflict("The virtual display could not be proven to be this host's after restoring fields, so it is left in place");
         }
       }
@@ -903,7 +1046,7 @@ namespace display_device::topology {
         return conflict("Removing the virtual display failed: " + removed.error().detail);
       }
     }
-    if (restores.empty() && !owned_display) {
+    if (restores.empty() && owned_displays.empty()) {
       // Nothing was written, so the first observation is the readback.
       if (unmanaged_signature(platform_, current, record) != unmanaged_signature(platform_, record.baseline, record)) {
         return conflict("Other displays differ from the baseline, so the native journal is kept");
@@ -927,7 +1070,7 @@ namespace display_device::topology {
         }
       }
     }
-    if (owned_display && !virtual_heads(platform_, after).empty()) {
+    if (!owned_displays.empty() && !virtual_heads(platform_, after).empty()) {
       return conflict("The virtual display is still present after its removal");
     }
     if (unmanaged_signature(platform_, after, record) != unmanaged_signature(platform_, record.baseline, record)) {

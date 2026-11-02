@@ -22,6 +22,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "topology_coordinator.h"
 #include "topology_journal_store.h"
@@ -37,10 +38,18 @@ namespace display_device::topology {
     source_e source { source_e::physical };
     /** Physical only: the exact OS display ID to capture. */
     os_display_id_t display;
+    /**
+     * Virtual only: how many heads one prepare creates, all or nothing (1..max_virtual_heads).
+     * The setting parser always yields 1; more heads need multi-track streaming (P3), so
+     * only code (tests and the gated hardware kit) asks for them.
+     */
+    std::uint8_t virtual_heads { 1 };
 
     bool
     operator==(const native_profile_t &) const = default;
   };
+
+  inline constexpr std::uint8_t max_virtual_heads = 2;
 
   /**
    * @brief Parse the `display_topology_profile` setting.
@@ -149,6 +158,8 @@ namespace display_device::topology {
     native_verdict_e verdict { native_verdict_e::ok };
     std::optional<native_target_t> target;
     std::string reason;
+    /** Every prepared display in creation order; `target` is the first. */
+    std::vector<native_target_t> targets {};
   };
 
   enum class mode_change_verdict_e : std::uint8_t {
@@ -236,11 +247,12 @@ namespace display_device::topology {
     prepare_physical(const os_display_id_t &display);
 
     native_outcome_t
-    prepare_virtual(const mutation_capability_t &capability);
+    prepare_virtual(const mutation_capability_t &capability, std::uint8_t count);
 
+    /** Remove every virtual head when `proven` holds for the current inventory, then clear the journal. */
     native_outcome_t
-    roll_back_head(const mutation_capability_t &capability, const journal_record_t &record,
-      const observed_display_t &expected, const std::string &why);
+    roll_back_heads(const mutation_capability_t &capability, const journal_record_t &record,
+      const std::function<bool(const inventory_t &)> &proven, const std::string &why);
 
     /** Point the journal's observed creation and owned head at `head` as listed in `after`. */
     mode_change_outcome_t
