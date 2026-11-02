@@ -299,6 +299,12 @@ namespace video::admission {
       return _enforced;
     }
 
+    /** The longest a reservation may stay pending under this policy. */
+    topology::monotonic_time_t
+    max_pending() const {
+      return _state->policy.max_pending;
+    }
+
     std::uint64_t
     revision() const {
       std::lock_guard lg { _state->lock };

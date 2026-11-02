@@ -7,6 +7,7 @@
 #include "input.h"
 #include "platform/common.h"
 #include "thread_safe.h"
+#include "video_admission.h"
 #include "video_colorspace.h"
 
 #include <boost/smart_ptr/shared_ptr.hpp>
@@ -637,9 +638,28 @@ namespace video {
     vdd_compatible
   };
 
+  /** The mode a live probe is admitted for. */
+  struct probe_mode_t {
+    std::uint32_t width {};
+    std::uint32_t height {};
+    std::uint32_t fps {};
+  };
+
   struct probe_target_t {
     std::string output_name; /**< Device selector in the same domain as config::video.output_name. */
     probe_target_policy_e policy { probe_target_policy_e::backend_autoselect };
+    /** Required by an enforced admission budget; unused otherwise. */
+    std::optional<probe_mode_t> mode {};
+  };
+
+  /** One probe call's own result; never shared with another call. */
+  struct probe_outcome_t {
+    int status { -1 };
+    probe_result_t result { probe_error_e::no_working_encoder, {}, {} };
+    /** The encoder selection this outcome was decided against. */
+    std::uint64_t encoder_generation {};
+    /** Live probes only: the admission to commit before the source is attached. */
+    admission::pending_t admission {};
   };
 
   /**
@@ -675,7 +695,24 @@ namespace video {
   int
   probe_encoders(std::optional<probe_target_t> target = std::nullopt);
 
+  /**
+   * @brief Probe like probe_encoders, returning this call's own outcome.
+   * A live probe (a source is already capturing) does not write
+   * last_encoder_probe_result and returns its admission; a global probe also
+   * publishes last_encoder_probe_result as probe_encoders does.
+   */
+  probe_outcome_t
+  probe_encoders_with_outcome(std::optional<probe_target_t> target = std::nullopt);
+
   namespace testing {
+    /** Install the live admission budget; null disables accounting (the production default). */
+    void
+    set_admission_budget(std::shared_ptr<admission::budget_t> budget);
+
+    /** Advances on every change of the chosen encoder. */
+    std::uint64_t
+    encoder_generation();
+
     using capture_display_factory_t = std::function<std::shared_ptr<platf::display_t>(platf::mem_type_e, const std::string &, const config_t &)>;
     using capture_display_names_t = std::function<std::vector<std::string>(platf::mem_type_e)>;
     /** The adapter LUID an output is attached to; nullopt when unknown. */

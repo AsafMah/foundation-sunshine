@@ -9,9 +9,11 @@
 #include "src/globals.h"
 #include "src/video.h"
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 using namespace std::chrono_literals;
 
@@ -386,4 +388,184 @@ TEST(VideoLiveAdmission, NamesOnlyPlatformStillBlocksTheGlobalProbe) {
 
   EXPECT_NE(result, 0);
   EXPECT_NE(message.find("test capture platform"), std::string::npos) << message;
+}
+
+namespace {
+  namespace admission = video::admission;
+  constexpr video::probe_mode_t mode_1080p60 { 1920, 1080, 60 };
+
+  class scoped_budget_t {
+  public:
+    explicit scoped_budget_t(std::map<std::uint64_t, admission::adapter_limits_t> adapters):
+        budget { std::make_shared<admission::budget_t>(admission::policy_t { std::move(adapters), std::chrono::milliseconds { 5000 }, 64 },
+          [] { return display_device::topology::monotonic_time_t { 1000 }; }) } {
+      video::testing::set_admission_budget(budget);
+    }
+    ~scoped_budget_t() {
+      video::testing::set_admission_budget(nullptr);
+    }
+    std::uint64_t
+    sessions(std::uint64_t adapter) const {
+      return budget->held(admission::resource_kind_e::encode_session, adapter);
+    }
+    std::shared_ptr<admission::budget_t> budget;
+  };
+
+  video::probe_target_t
+  exact_target(const std::string &name, std::optional<video::probe_mode_t> mode = mode_1080p60) {
+    return { name, video::probe_target_policy_e::exact, mode };
+  }
+
+  constexpr std::uint64_t ample_rate = 1920ull * 1080 * 60 * 8;
+}  // namespace
+
+TEST(VideoLiveAdmission, EachCallReportsItsOwnOutcome) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  expect_only(*live, 1);
+
+  std::atomic<int> crossed {};
+  std::vector<std::thread> threads;
+  for (int t = 0; t < 8; ++t) {
+    threads.emplace_back([&, t] {
+      for (int i = 0; i < 50; ++i) {
+        const bool available = t % 2 == 0;
+        auto outcome = video::probe_encoders_with_outcome(exact_target(available ? "FAKE_B" : "FAKE_GONE", std::nullopt));
+        const bool ok = outcome.status == 0 && outcome.result.error == video::probe_error_e::none;
+        const bool refused = outcome.status != 0 && outcome.result.error == video::probe_error_e::no_active_display;
+        if (available ? !ok : !refused) ++crossed;
+      }
+    });
+  }
+  for (auto &thread : threads) thread.join();
+  EXPECT_EQ(crossed.load(), 0);
+}
+
+TEST(VideoLiveAdmission, AdmissionIsReservedOnTheValidatedAdapter) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 2, ample_rate } } } };
+
+  auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_B"));
+  ASSERT_EQ(outcome.status, 0) << outcome.result.message;
+  EXPECT_EQ(budget.sessions(0x10), 1u);
+  auto lease = outcome.admission.commit();
+  ASSERT_TRUE(lease) << lease.error().detail;
+  EXPECT_EQ(budget.sessions(0x10), 1u);
+  *lease = admission::lease_t {};
+  EXPECT_EQ(budget.sessions(0x10), 0u);
+}
+
+TEST(VideoLiveAdmission, AdmissionBeyondTheBudgetIsRefused) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  const auto encoder = video::testing::chosen_encoder_name();
+  scoped_budget_t budget { { { 0x10, { 1, ample_rate } } } };
+
+  auto first = video::probe_encoders_with_outcome(exact_target("FAKE_B"));
+  ASSERT_EQ(first.status, 0) << first.result.message;
+  auto second = video::probe_encoders_with_outcome(exact_target("FAKE_B"));
+  EXPECT_NE(second.status, 0);
+  EXPECT_EQ(second.result.error, video::probe_error_e::no_working_encoder);
+  EXPECT_NE(second.result.message.find("budget"), std::string::npos) << second.result.message;
+  EXPECT_EQ(budget.sessions(0x10), 1u);
+  EXPECT_EQ(video::testing::chosen_encoder_name(), encoder);
+
+  first = {};
+  EXPECT_EQ(budget.sessions(0x10), 0u);
+}
+
+TEST(VideoLiveAdmission, TheLegacyEntryPointStillReportsThroughTheGlobalResult) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 1, ample_rate } } } };
+
+  // A probe whose ticket nobody can carry must not hold the budget.
+  EXPECT_EQ(video::probe_encoders(exact_target("FAKE_B")), 0) << video::last_encoder_probe_result.message;
+  EXPECT_EQ(budget.sessions(0x10), 0u);
+  EXPECT_TRUE(video::last_encoder_probe_result);
+}
+
+TEST(VideoLiveAdmission, AnEnforcedBudgetNeedsTheRequestedMode) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 4, ample_rate } } } };
+
+  auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_B", std::nullopt));
+  EXPECT_NE(outcome.status, 0);
+  EXPECT_EQ(outcome.result.error, video::probe_error_e::no_working_encoder);
+  EXPECT_NE(outcome.result.message.find("needs the requested mode"), std::string::npos) << outcome.result.message;
+  EXPECT_EQ(budget.sessions(0x10), 0u);
+}
+
+TEST(VideoLiveAdmission, WithoutABudgetNothingIsAccounted) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+
+  auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_B"));
+  ASSERT_EQ(outcome.status, 0) << outcome.result.message;
+  EXPECT_TRUE(outcome.admission.commit());
+}
+
+TEST(VideoLiveAdmission, SoftwareAdmissionIsAccountedOnTheDisplayAdapter) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 }, { "FAKE_C", 3 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x20 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  ASSERT_EQ(video::testing::chosen_encoder_name(), "software");
+  scoped_budget_t budget { { { 0x20, { 2, ample_rate } } } };
+
+  auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_B"));
+  ASSERT_EQ(outcome.status, 0) << outcome.result.message;
+  EXPECT_EQ(budget.sessions(0x20), 1u);
+
+  // Room remains on 0x20, so only the unknown adapter can refuse this.
+  auto unknown = video::probe_encoders_with_outcome(exact_target("FAKE_C"));
+  EXPECT_NE(unknown.status, 0);
+  EXPECT_NE(unknown.result.message.find("unknown adapter"), std::string::npos) << unknown.result.message;
+  EXPECT_EQ(budget.sessions(0x20), 1u);
+}
+
+TEST(VideoLiveAdmission, ChoosingTheEncoderAdvancesTheGeneration) {
+  if (!video::testing::chosen_encoder_name().empty()) {
+    GTEST_SKIP() << "An encoder was already chosen by an earlier test";
+  }
+  const auto before = video::testing::encoder_generation();
+  std::uint64_t during {};
+  {
+    fake_capture_platform_t platform { { { "FAKE_A", 1 } } };
+    ASSERT_EQ(video::testing::chosen_encoder_name(), "software");
+    during = video::testing::encoder_generation();
+    EXPECT_NE(during, before);
+  }
+  EXPECT_TRUE(video::testing::chosen_encoder_name().empty());
+  EXPECT_NE(video::testing::encoder_generation(), during);
+}
+
+TEST(VideoLiveAdmission, TheOutcomeCarriesTheEncoderGeneration) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  const auto software = video::probe_encoders_with_outcome(exact_target("FAKE_B", std::nullopt));
+  ASSERT_EQ(software.status, 0) << software.result.message;
+  EXPECT_EQ(software.encoder_generation, video::testing::encoder_generation());
+  std::uint64_t hardware_generation {};
+  {
+    video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+    const auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_B", std::nullopt));
+    ASSERT_EQ(outcome.status, 0) << outcome.result.message;
+    hardware_generation = outcome.encoder_generation;
+    EXPECT_NE(hardware_generation, software.encoder_generation);
+  }
+  EXPECT_NE(video::testing::encoder_generation(), hardware_generation);
 }

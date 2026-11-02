@@ -1792,20 +1792,53 @@ namespace video {
     testing::capture_display_adapter_t capture_display_adapter_override;
 
     // The adapter each encoder last passed validation on; 0 when unknown.
+    // Also guards writes of chosen_encoder and its generation, so a live probe
+    // reads the encoder, its adapter and the generation as one snapshot.
     std::mutex validated_adapter_lock;
     std::map<const encoder_t *, std::uint64_t> validated_adapter_luids;
+    std::uint64_t chosen_encoder_generation {};
 
     void
     record_validated_adapter(const encoder_t &encoder, std::uint64_t adapter_luid) {
       std::lock_guard lg { validated_adapter_lock };
       validated_adapter_luids[&encoder] = adapter_luid;
+      ++chosen_encoder_generation;
     }
 
-    std::uint64_t
-    validated_adapter(const encoder_t &encoder) {
+    // Every write of chosen_encoder. Capture threads still read it unlocked: the
+    // global probe that rewrites it only runs while nothing streams.
+    void
+    set_chosen_encoder(encoder_t *encoder) {
       std::lock_guard lg { validated_adapter_lock };
-      const auto it = validated_adapter_luids.find(&encoder);
-      return it == validated_adapter_luids.end() ? 0 : it->second;
+      chosen_encoder = encoder;
+      ++chosen_encoder_generation;
+    }
+
+    struct encoder_snapshot_t {
+      const encoder_t *encoder {};
+      std::uint64_t validated_adapter {};
+      std::uint64_t generation {};
+    };
+
+    encoder_snapshot_t
+    chosen_encoder_snapshot() {
+      std::lock_guard lg { validated_adapter_lock };
+      encoder_snapshot_t snapshot { chosen_encoder, 0, chosen_encoder_generation };
+      if (chosen_encoder) {
+        const auto it = validated_adapter_luids.find(chosen_encoder);
+        snapshot.validated_adapter = it == validated_adapter_luids.end() ? 0 : it->second;
+      }
+      return snapshot;
+    }
+
+    // Live admission accounting; null (the production default) admits without accounting.
+    std::mutex admission_budget_lock;
+    std::shared_ptr<admission::budget_t> admission_budget;
+
+    std::shared_ptr<admission::budget_t>
+    current_admission_budget() {
+      std::lock_guard lg { admission_budget_lock };
+      return admission_budget;
     }
 
     std::optional<std::uint64_t>
@@ -5163,58 +5196,110 @@ namespace video {
     return true;
   }
 
+  namespace {
+    probe_outcome_t
+    refused(probe_error_e error, std::string message, std::string hint, std::uint64_t generation) {
+      probe_outcome_t outcome;
+      outcome.result = { error, std::move(message), std::move(hint) };
+      outcome.encoder_generation = generation;
+      return outcome;
+    }
+
+    // An exact managed target beside a live stream must not reselect the shared
+    // encoder or its capability flags under that stream. Admit it against the
+    // encoder already validated, after checking the target is capturable.
+    probe_outcome_t
+    probe_live(const probe_target_t &target) {
+      const auto snapshot = chosen_encoder_snapshot();
+      const auto *encoder = snapshot.encoder;
+      if (!encoder) {
+        return refused(probe_error_e::no_working_encoder, "No validated encoder is available to admit another display while streaming.", {}, snapshot.generation);
+      }
+      const auto display_name = resolve_capture_display(target.output_name, display_device::get_display_name(target.output_name));
+      const auto available = capture_platform_display_names(encoder->platform_formats->dev_type);
+      if (display_name.empty() || std::ranges::find(available, display_name) == available.end()) {
+        BOOST_LOG(error) << "Requested output ["sv << target.output_name << "] is unavailable for live admission"sv;
+        return refused(probe_error_e::no_active_display, "The requested display is not available to capture while streaming.",
+          "Connect or enable the selected display, then try again.", snapshot.generation);
+      }
+      std::optional<std::uint64_t> admission_adapter;
+      if (encoder != &software) {
+        // A hardware encoder runs on the capture display's device; it is only
+        // proven on the adapter it was validated on. Unknown on either side fails closed.
+        const auto display_adapter = capture_platform_display_adapter(display_name);
+        if (snapshot.validated_adapter == 0 || !display_adapter || *display_adapter != snapshot.validated_adapter) {
+          BOOST_LOG(error) << "Live admission of output ["sv << display_name << "] refused for hardware encoder ["sv << encoder->name
+                           << "]: adapter agreement not established"sv;
+          return refused(probe_error_e::no_working_encoder, "The requested display is not on the adapter the live hardware encoder was validated on.",
+            "End the current stream, then try again.", snapshot.generation);
+        }
+        admission_adapter = snapshot.validated_adapter;
+      }
+
+      probe_outcome_t outcome;
+      outcome.encoder_generation = snapshot.generation;
+      if (const auto budget = current_admission_budget(); budget && budget->enforced()) {
+        if (!target.mode) {
+          return refused(probe_error_e::no_working_encoder, "The live admission budget needs the requested mode.", {}, snapshot.generation);
+        }
+        if (!admission_adapter) {
+          // Software encodes in system memory, but capture still runs on the display's adapter.
+          admission_adapter = capture_platform_display_adapter(display_name);
+        }
+        if (!admission_adapter || *admission_adapter == 0) {
+          return refused(probe_error_e::no_working_encoder, "The live admission budget cannot account a display on an unknown adapter.", {}, snapshot.generation);
+        }
+        auto pending = budget->reserve({ *admission_adapter, target.mode->width, target.mode->height, target.mode->fps }, budget->max_pending());
+        if (!pending) {
+          BOOST_LOG(warning) << "Live admission of output ["sv << display_name << "] refused by the admission budget: "sv << pending.error().detail;
+          return refused(probe_error_e::no_working_encoder, "The live admission budget refused the requested display: " + pending.error().detail,
+            "End another stream, then try again.", snapshot.generation);
+        }
+        outcome.admission = std::move(*pending);
+      }
+      else {
+        outcome.admission = admission::pending_t::unaccounted();
+      }
+      BOOST_LOG(info) << "Admitted exact output ["sv << display_name << "] beside a live stream with encoder ["sv << encoder->name << "]"sv;
+      outcome.status = 0;
+      outcome.result = { probe_error_e::none, "Encoder probe succeeded.", {} };
+      return outcome;
+    }
+
+    int
+    probe_encoders_global(std::optional<probe_target_t> target);
+  }  // namespace
+
+  probe_outcome_t
+  probe_encoders_with_outcome(std::optional<probe_target_t> target) {
+    const bool live_capture = capture_thread_async.has_ref() || capture_thread_sync.has_ref() || exact_capture_sources.any_live();
+    if (target && target->policy == probe_target_policy_e::exact && live_capture) {
+      return probe_live(*target);
+    }
+    // The global probe still publishes through last_encoder_probe_result; it
+    // only runs while nothing streams, so no live outcome can interleave.
+    probe_outcome_t outcome;
+    outcome.status = probe_encoders_global(std::move(target));
+    outcome.result = last_encoder_probe_result;
+    outcome.encoder_generation = chosen_encoder_snapshot().generation;
+    return outcome;
+  }
+
   int
   probe_encoders(std::optional<probe_target_t> target) {
+    auto outcome = probe_encoders_with_outcome(std::move(target));
+    last_encoder_probe_result = std::move(outcome.result);
+    return outcome.status;
+  }
+
+  namespace {
+  int
+  probe_encoders_global(std::optional<probe_target_t> target) {
     last_encoder_probe_result = {
       probe_error_e::none,
       "Encoder probe succeeded.",
       {}
     };
-
-    // An exact managed target beside a live stream must not reselect the shared
-    // encoder or its capability flags under that stream. Admit it against the
-    // encoder already validated, after checking the target is capturable.
-    const bool live_capture = capture_thread_async.has_ref() || capture_thread_sync.has_ref() || exact_capture_sources.any_live();
-    if (target && target->policy == probe_target_policy_e::exact && live_capture) {
-      const auto *encoder = chosen_encoder;
-      if (!encoder) {
-        last_encoder_probe_result = {
-          probe_error_e::no_working_encoder,
-          "No validated encoder is available to admit another display while streaming.",
-          {}
-        };
-        return -1;
-      }
-      const auto display_name = resolve_capture_display(target->output_name, display_device::get_display_name(target->output_name));
-      const auto available = capture_platform_display_names(encoder->platform_formats->dev_type);
-      if (display_name.empty() || std::ranges::find(available, display_name) == available.end()) {
-        last_encoder_probe_result = {
-          probe_error_e::no_active_display,
-          "The requested display is not available to capture while streaming.",
-          "Connect or enable the selected display, then try again."
-        };
-        BOOST_LOG(error) << "Requested output ["sv << target->output_name << "] is unavailable for live admission"sv;
-        return -1;
-      }
-      if (encoder != &software) {
-        // A hardware encoder runs on the capture display's device; it is only
-        // proven on the adapter it was validated on. Unknown on either side fails closed.
-        const auto validated = validated_adapter(*encoder);
-        const auto display_adapter = capture_platform_display_adapter(display_name);
-        if (validated == 0 || !display_adapter || *display_adapter != validated) {
-          last_encoder_probe_result = {
-            probe_error_e::no_working_encoder,
-            "The requested display is not on the adapter the live hardware encoder was validated on.",
-            "End the current stream, then try again."
-          };
-          BOOST_LOG(error) << "Live admission of output ["sv << display_name << "] refused for hardware encoder ["sv << encoder->name
-                           << "]: adapter agreement not established"sv;
-          return -1;
-        }
-      }
-      BOOST_LOG(info) << "Admitted exact output ["sv << display_name << "] beside a live stream with encoder ["sv << encoder->name << "]"sv;
-      return 0;
-    }
 
     {
       std::lock_guard lg { capture_platform_lock };
@@ -5315,7 +5400,7 @@ namespace video {
 
     // Restart encoder selection
     auto previous_encoder = chosen_encoder;
-    chosen_encoder = nullptr;
+    set_chosen_encoder(nullptr);
     active_encoder_for_status.store(nullptr, std::memory_order_release);
     active_hevc_mode = config::video.hevc_mode;
     active_av1_mode = config::video.av1_mode;
@@ -5361,7 +5446,7 @@ namespace video {
           // We will return an encoder here even if it fails one of the codec requirements specified by the user
           adjust_encoder_constraints(encoder);
 
-          chosen_encoder = encoder;
+          set_chosen_encoder(encoder);
           break;
         }
 
@@ -5404,7 +5489,7 @@ namespace video {
           continue;
         }
 
-        chosen_encoder = encoder;
+        set_chosen_encoder(encoder);
         break;
       });
 
@@ -5434,7 +5519,7 @@ namespace video {
         // We will return an encoder here even if it fails one of the codec requirements specified by the user
         adjust_encoder_constraints(encoder);
 
-        chosen_encoder = encoder;
+        set_chosen_encoder(encoder);
         break;
       });
     }
@@ -5525,6 +5610,7 @@ namespace video {
 
     return 0;
   }
+  }  // namespace
 
   // Linux only declaration
   typedef int (*vaapi_init_avcodec_hardware_input_buffer_fn)(platf::avcodec_encode_device_t *encode_device, AVBufferRef **hw_device_buf);
@@ -5676,9 +5762,10 @@ namespace video {
         _previous { chosen_encoder } {
       for (auto *encoder : encoders) {
         if (encoder != &software) {
-          chosen_encoder = encoder;
           _selected = encoder;
           std::lock_guard lg { validated_adapter_lock };
+          chosen_encoder = encoder;
+          ++chosen_encoder_generation;
           if (const auto it = validated_adapter_luids.find(encoder); it != validated_adapter_luids.end()) {
             _previous_luid = it->second;
           }
@@ -5689,8 +5776,8 @@ namespace video {
     }
 
     scoped_hardware_encoder_t::~scoped_hardware_encoder_t() {
+      std::lock_guard lg { validated_adapter_lock };
       if (_selected) {
-        std::lock_guard lg { validated_adapter_lock };
         const auto *encoder = static_cast<const encoder_t *>(_selected);
         if (_previous_luid) {
           validated_adapter_luids[encoder] = *_previous_luid;
@@ -5700,6 +5787,18 @@ namespace video {
         }
       }
       chosen_encoder = static_cast<encoder_t *>(_previous);
+      ++chosen_encoder_generation;
+    }
+
+    void
+    set_admission_budget(std::shared_ptr<admission::budget_t> budget) {
+      std::lock_guard lg { admission_budget_lock };
+      admission_budget = std::move(budget);
+    }
+
+    std::uint64_t
+    encoder_generation() {
+      return chosen_encoder_snapshot().generation;
     }
 
     void
@@ -5714,11 +5813,11 @@ namespace video {
       static bool substituted = false;
       if (capture_display_override && !chosen_encoder) {
         probed_encoder = chosen_encoder;
-        chosen_encoder = &software;
+        set_chosen_encoder(&software);
         substituted = true;
       }
       else if (!capture_display_override && substituted) {
-        chosen_encoder = probed_encoder;
+        set_chosen_encoder(probed_encoder);
         substituted = false;
       }
     }
