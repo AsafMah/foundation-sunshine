@@ -792,5 +792,116 @@ namespace display_device::topology {
       EXPECT_EQ(f.log.events(), (std::vector<std::string> { "startup" }));
     }
 
+    namespace {
+      struct mode_change_run_t {
+        bool completed {};
+        native_mode_changed_t changed { native_mode_verdict_e::applied, "not run", "not run" };
+        native_health_t published;
+      };
+
+      mode_change_run_t
+      change_mode(process_lifecycle_t &lifecycle, std::uint32_t width, std::uint32_t height) {
+        mode_change_run_t result;
+        result.completed = lifecycle.coordinator().run(kind::reconfigure, [&](const mutation_capability_t &capability, const command_context_t &) {
+          result.changed = lifecycle.change_native_mode(capability, width, height);
+          result.published = lifecycle.coordinator().status().native;
+        }).completed();
+        return result;
+      }
+    }  // namespace
+
+    TEST(ProcessLifecycleManaged, ChangeNativeModeRunsTheHookAndPublishesTheNewHealth) {
+      fixture_t f;
+      std::vector<std::string> seen;
+      auto &lifecycle = f.make_managed([&](native_lifecycle_hooks_t &hooks) {
+        hooks.change_mode = [&](const mutation_capability_t &capability, std::uint32_t width, std::uint32_t height) {
+          capability.require(operation_e::native_mode);
+          seen.push_back(std::to_string(width) + "x" + std::to_string(height));
+          return native_mode_changed_t { native_mode_verdict_e::applied, "{zako-head}", {} };
+        };
+      });
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      f.native_initial = { true, false, "journaled at 2560x1440" };
+      const auto run = change_mode(lifecycle, 2560, 1440);
+      ASSERT_TRUE(run.completed);
+      EXPECT_EQ(run.changed.verdict, native_mode_verdict_e::applied);
+      EXPECT_EQ(run.changed.display, "{zako-head}");
+      EXPECT_EQ(seen, (std::vector<std::string> { "2560x1440" }));
+      EXPECT_TRUE(same_health(run.published, f.native_initial)) << "the head's new journal is published";
+    }
+
+    TEST(ProcessLifecycleManaged, ARefusedNativeModeChangeKeepsItsReason) {
+      fixture_t f;
+      auto &lifecycle = f.make_managed([&](native_lifecycle_hooks_t &hooks) {
+        hooks.change_mode = [](const mutation_capability_t &, std::uint32_t, std::uint32_t) {
+          return native_mode_changed_t { native_mode_verdict_e::refused, "{zako-head}", "mode not offered" };
+        };
+      });
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      const auto run = change_mode(lifecycle, 2560, 1440);
+      ASSERT_TRUE(run.completed);
+      EXPECT_EQ(run.changed.verdict, native_mode_verdict_e::refused);
+      EXPECT_EQ(run.changed.reason, "mode not offered");
+    }
+
+    TEST(ProcessLifecycleManaged, AThrowingNativeModeChangeIsInConflict) {
+      fixture_t f;
+      auto &lifecycle = f.make_managed([&](native_lifecycle_hooks_t &hooks) {
+        hooks.change_mode = [](const mutation_capability_t &, std::uint32_t, std::uint32_t) -> native_mode_changed_t {
+          throw std::runtime_error { "ioctl exploded" };
+        };
+      });
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      const auto run = change_mode(lifecycle, 2560, 1440);
+      ASSERT_TRUE(run.completed);
+      EXPECT_EQ(run.changed.verdict, native_mode_verdict_e::conflict);
+      EXPECT_NE(run.changed.reason.find("ioctl exploded"), std::string::npos) << run.changed.reason;
+      EXPECT_TRUE(run.published.in_conflict);
+    }
+
+    TEST(ProcessLifecycleManaged, AnUnknownHealthAfterAModeChangeIsInConflict) {
+      fixture_t f;
+      bool changed = false;
+      auto &lifecycle = f.make_managed([&](native_lifecycle_hooks_t &hooks) {
+        auto health = hooks.health;
+        hooks.health = [&changed, health]() {
+          if (changed) throw std::runtime_error { "journal unreadable" };
+          return health();
+        };
+        hooks.change_mode = [&changed](const mutation_capability_t &, std::uint32_t, std::uint32_t) {
+          changed = true;
+          return native_mode_changed_t { native_mode_verdict_e::applied, "{zako-head}", {} };
+        };
+      });
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      const auto run = change_mode(lifecycle, 2560, 1440);
+      ASSERT_TRUE(run.completed);
+      EXPECT_EQ(run.changed.verdict, native_mode_verdict_e::conflict);
+      EXPECT_TRUE(run.published.in_conflict);
+    }
+
+    TEST(ProcessLifecycleManaged, WithoutAChangeHookTheModeChangeIsRefused) {
+      fixture_t f;
+      auto &lifecycle = f.make_managed();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      const auto run = change_mode(lifecycle, 2560, 1440);
+      ASSERT_TRUE(run.completed);
+      EXPECT_EQ(run.changed.verdict, native_mode_verdict_e::refused);
+      EXPECT_FALSE(run.changed.reason.empty());
+    }
+
+    TEST(ProcessLifecycleManaged, LegacyChangeNativeModeRefusesWithoutRunningAnything) {
+      fixture_t f;
+      auto &lifecycle = f.make();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      native_mode_changed_t changed { native_mode_verdict_e::applied, {}, {} };
+      const auto ran = lifecycle.coordinator().run(kind::reset_persistence,
+        [&](const mutation_capability_t &capability, const command_context_t &) { changed = lifecycle.change_native_mode(capability, 2560, 1440); });
+      EXPECT_TRUE(ran.completed());
+      EXPECT_EQ(changed.verdict, native_mode_verdict_e::refused);
+      EXPECT_FALSE(changed.reason.empty());
+      EXPECT_EQ(f.log.events(), (std::vector<std::string> { "startup" }));
+    }
+
   }  // namespace
 }  // namespace display_device::topology

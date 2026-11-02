@@ -289,6 +289,42 @@ namespace display_device::topology {
     return prepared;
   }
 
+  native_mode_changed_t
+  process_lifecycle_t::change_native_mode(const mutation_capability_t &capability, std::uint32_t width, std::uint32_t height) {
+    if (!hooks_.native) {
+      return { native_mode_verdict_e::refused, {}, "Managed display topology is not active" };
+    }
+    if (!hooks_.native->change_mode) {
+      return { native_mode_verdict_e::refused, {}, "The managed head cannot change its mode" };
+    }
+    native_mode_changed_t changed;
+    try {
+      changed = hooks_.native->change_mode(capability, width, height);
+    }
+    catch (const std::exception &error) {
+      changed = { native_mode_verdict_e::conflict, {}, std::string { "Native mode change failed: " } + error.what() };
+      coordinator_.publish_native_health(failed_native(changed.reason));
+      return changed;
+    }
+    catch (...) {
+      changed = { native_mode_verdict_e::conflict, {}, "Native mode change failed" };
+      coordinator_.publish_native_health(failed_native(changed.reason));
+      return changed;
+    }
+    try {
+      coordinator_.publish_native_health(hooks_.native->health());
+    }
+    catch (const std::exception &error) {
+      coordinator_.publish_native_health(failed_native(std::string { "Native health is unknown: " } + error.what()));
+      return { native_mode_verdict_e::conflict, {}, "Native health is unknown after the mode change" };
+    }
+    catch (...) {
+      coordinator_.publish_native_health(failed_native("Native health is unknown"));
+      return { native_mode_verdict_e::conflict, {}, "Native health is unknown after the mode change" };
+    }
+    return changed;
+  }
+
   void
   process_lifecycle_t::report(const std::string &line) const {
     if (hooks_.report) hooks_.report(line);

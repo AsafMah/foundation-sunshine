@@ -64,6 +64,36 @@ TEST(VideoAdmission, WithoutAPolicyAdmitsAndAccountsNothing) {
   EXPECT_EQ(sessions(budget), 0u);
 }
 
+TEST(VideoAdmission, AnAccountedAdmissionRemembersItsRequestThroughCommitAndMove) {
+  fake_clock_t clock;
+  admission::budget_t budget { policy(2, rate_1080p60 * 4), clock.clock() };
+  auto pending = budget.reserve(hd(adapter_b), 1000ms);
+  ASSERT_TRUE(pending) << pending.error().detail;
+  ASSERT_TRUE(pending->request());
+  EXPECT_EQ(pending->request()->adapter_luid, adapter_b);
+  auto lease = pending->commit();
+  ASSERT_TRUE(lease) << lease.error().detail;
+  auto moved = std::move(*lease);
+  ASSERT_TRUE(moved.request());
+  EXPECT_EQ(moved.request()->adapter_luid, adapter_b);
+  EXPECT_EQ(moved.request()->width, 1920u);
+  EXPECT_EQ(moved.request()->height, 1080u);
+  EXPECT_EQ(moved.request()->fps, 60u);
+  moved.reset();
+  EXPECT_FALSE(moved.request());
+}
+
+TEST(VideoAdmission, AnUnaccountedAdmissionHasNoRequest) {
+  fake_clock_t clock;
+  admission::budget_t budget { std::nullopt, clock.clock() };
+  auto pending = budget.reserve(hd(), 1000ms);
+  ASSERT_TRUE(pending) << pending.error().detail;
+  EXPECT_FALSE(pending->request());
+  auto lease = pending->commit();
+  ASSERT_TRUE(lease) << lease.error().detail;
+  EXPECT_FALSE(lease->request());
+}
+
 TEST(VideoAdmission, CapacityOneAdmitsExactlyOne) {
   fake_clock_t clock;
   admission::budget_t budget { policy(1, rate_1080p60 * 4), clock.clock() };

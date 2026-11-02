@@ -166,18 +166,21 @@ namespace video::admission {
   class lease_t {
   public:
     lease_t() = default;
-    lease_t(std::shared_ptr<detail::state_t> state, std::uint64_t handle):
+    lease_t(std::shared_ptr<detail::state_t> state, std::uint64_t handle, std::optional<request_t> request = std::nullopt):
         _state(std::move(state)),
-        _handle(handle) {}
+        _handle(handle),
+        _request(request) {}
     lease_t(lease_t &&other) noexcept:
         _state(std::move(other._state)),
-        _handle(std::exchange(other._handle, 0)) {}
+        _handle(std::exchange(other._handle, 0)),
+        _request(std::exchange(other._request, std::nullopt)) {}
     lease_t &
     operator=(lease_t &&other) noexcept {
       if (this != &other) {
         reset();
         _state = std::move(other._state);
         _handle = std::exchange(other._handle, 0);
+        _request = std::exchange(other._request, std::nullopt);
       }
       return *this;
     }
@@ -190,6 +193,7 @@ namespace video::admission {
 
     void
     reset() noexcept {
+      _request.reset();
       if (!_state || !_handle) {
         _state.reset();
         return;
@@ -203,9 +207,16 @@ namespace video::admission {
       _handle = 0;
     }
 
+    /** What this lease holds; nullopt when unaccounted or released. */
+    const std::optional<request_t> &
+    request() const noexcept {
+      return _request;
+    }
+
   private:
     std::shared_ptr<detail::state_t> _state;
     std::uint64_t _handle {};
+    std::optional<request_t> _request;
   };
 
   class pending_t {
@@ -217,12 +228,14 @@ namespace video::admission {
       pending._unaccounted = true;
       return pending;
     }
-    pending_t(std::shared_ptr<detail::state_t> state, std::uint64_t handle):
+    pending_t(std::shared_ptr<detail::state_t> state, std::uint64_t handle, std::optional<request_t> request = std::nullopt):
         _state(std::move(state)),
-        _handle(handle) {}
+        _handle(handle),
+        _request(request) {}
     pending_t(pending_t &&other) noexcept:
         _state(std::move(other._state)),
         _handle(std::exchange(other._handle, 0)),
+        _request(std::exchange(other._request, std::nullopt)),
         _unaccounted(std::exchange(other._unaccounted, false)),
         _consumed(std::exchange(other._consumed, false)) {}
     pending_t &
@@ -231,10 +244,17 @@ namespace video::admission {
         reset();
         _state = std::move(other._state);
         _handle = std::exchange(other._handle, 0);
+        _request = std::exchange(other._request, std::nullopt);
         _unaccounted = std::exchange(other._unaccounted, false);
         _consumed = std::exchange(other._consumed, false);
       }
       return *this;
+    }
+
+    /** What this reservation asks for; nullopt when unaccounted. */
+    const std::optional<request_t> &
+    request() const noexcept {
+      return _request;
     }
     pending_t(const pending_t &) = delete;
     pending_t &
@@ -268,11 +288,12 @@ namespace video::admission {
       auto committed = _state->ledger->commit(*it->second.token, now);
       if (!committed) return std::unexpected(committed.error());
       _consumed = true;
-      return lease_t { std::exchange(_state, {}), std::exchange(_handle, 0) };
+      return lease_t { std::exchange(_state, {}), std::exchange(_handle, 0), std::exchange(_request, std::nullopt) };
     }
 
     void
     reset() noexcept {
+      _request.reset();
       if (!_state || !_handle) {
         _state.reset();
         return;
@@ -299,6 +320,7 @@ namespace video::admission {
 
     std::shared_ptr<detail::state_t> _state;
     std::uint64_t _handle {};
+    std::optional<request_t> _request;
     bool _unaccounted {};
     bool _consumed {};
   };
@@ -422,7 +444,7 @@ namespace video::admission {
       if (!record) return std::unexpected(record.error());
       const auto handle = _state->next_handle++;
       _state->handles.emplace(handle, detail::handle_t { record->token });
-      return pending_t { _state, handle };
+      return pending_t { _state, handle, request };
     }
 
   private:

@@ -1013,6 +1013,158 @@ TEST(VideoAdmissionTicket, AReprobeBeforeTheFirstStreamAttachesStalesItsTicket) 
   ticket.reset();
   EXPECT_EQ(budget.sessions(0x10), 0u);
 }
+
+namespace {
+  // A ticketed FAKE_A capture on adapter 0x10 at 1920x1080x60, as a managed stream holds it.
+  struct replacement_fixture_t {
+    fake_capture_platform_t platform { { { "FAKE_A", 1 } }, { { "FAKE_A", 0x10 } } };
+    video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+    scoped_budget_t budget;
+    scoped_global_probe_t global { 0 };
+    std::shared_ptr<video::admission_ticket_t> ticket;
+    std::unique_ptr<video::testing::capture_attachment_t> attached;
+
+    explicit replacement_fixture_t(std::uint32_t sessions):
+        budget { { { 0x10, { sessions, ample_rate } } } } {
+      auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_A"));
+      EXPECT_EQ(outcome.status, 0) << outcome.result.message;
+      ticket = ticket_from(outcome);
+      attached = video::testing::attach_capture(ticketed_config("FAKE_A", ticket));
+      EXPECT_TRUE(attached);
+    }
+
+    std::uint32_t
+    held_width() {
+      std::lock_guard lg { ticket->lock };
+      return ticket->lease.request() ? ticket->lease.request()->width : 0;
+    }
+  };
+}  // namespace
+
+TEST(VideoAdmissionTicket, AReplacementIsAdmittedWhileTheOldModeIsStillHeld) {
+  replacement_fixture_t fixture { 2 };
+  ASSERT_EQ(fixture.budget.sessions(0x10), 1u);
+  ASSERT_EQ(fixture.held_width(), 1920u);
+
+  auto replacement = video::reserve_replacement(fixture.ticket, 1280, 720);
+  ASSERT_TRUE(replacement) << replacement.error();
+  ASSERT_TRUE(replacement->request());
+  EXPECT_EQ(replacement->request()->adapter_luid, 0x10u);
+  EXPECT_EQ(replacement->request()->fps, 60u);
+  EXPECT_EQ(fixture.budget.sessions(0x10), 2u) << "make before break: both modes are held";
+  EXPECT_EQ(fixture.held_width(), 1920u);
+
+  ASSERT_TRUE(video::commit_replacement(fixture.ticket, std::move(*replacement)));
+  EXPECT_EQ(fixture.budget.sessions(0x10), 1u) << "the commit released the old mode";
+  EXPECT_EQ(fixture.held_width(), 1280u);
+  fixture.attached.reset();
+  EXPECT_EQ(fixture.budget.sessions(0x10), 0u) << "the capture end releases the replacement";
+}
+
+TEST(VideoAdmissionTicket, AReplacementOverTheBudgetIsRefusedAndTheOldModeKept) {
+  replacement_fixture_t fixture { 1 };
+  auto replacement = video::reserve_replacement(fixture.ticket, 1280, 720);
+  ASSERT_FALSE(replacement);
+  EXPECT_NE(replacement.error().find("budget"), std::string::npos) << replacement.error();
+  EXPECT_EQ(fixture.budget.sessions(0x10), 1u);
+  EXPECT_EQ(fixture.held_width(), 1920u);
+}
+
+TEST(VideoAdmissionTicket, ADroppedReplacementRollsBack) {
+  replacement_fixture_t fixture { 2 };
+  {
+    auto replacement = video::reserve_replacement(fixture.ticket, 1280, 720);
+    ASSERT_TRUE(replacement) << replacement.error();
+    EXPECT_EQ(fixture.budget.sessions(0x10), 2u);
+  }
+  EXPECT_EQ(fixture.budget.sessions(0x10), 1u);
+  EXPECT_EQ(fixture.held_width(), 1920u);
+}
+
+TEST(VideoAdmissionTicket, NoReplacementAfterTheCaptureEnds) {
+  replacement_fixture_t fixture { 3 };
+  auto early = video::reserve_replacement(fixture.ticket, 1280, 720);
+  ASSERT_TRUE(early) << early.error();
+  fixture.attached.reset();
+  EXPECT_EQ(fixture.budget.sessions(0x10), 1u) << "only the uncommitted replacement remains";
+  const auto committed = video::commit_replacement(fixture.ticket, std::move(*early));
+  ASSERT_FALSE(committed);
+  EXPECT_NE(committed.error().find("not capturing"), std::string::npos) << committed.error();
+  EXPECT_EQ(fixture.budget.sessions(0x10), 0u) << "the refused replacement rolled back";
+  const auto late = video::reserve_replacement(fixture.ticket, 1280, 720);
+  ASSERT_FALSE(late);
+  EXPECT_NE(late.error().find("not capturing"), std::string::npos) << late.error();
+  EXPECT_EQ(fixture.held_width(), 0u);
+}
+
+TEST(VideoAdmissionTicket, AManagedHeadAlwaysFollowsItsSizeOtherDisplaysHonourTheSetting) {
+  EXPECT_TRUE(video::follows_display_resolution(true, false)) << "a client-requested managed change must reach the encoder";
+  EXPECT_TRUE(video::follows_display_resolution(true, true));
+  EXPECT_TRUE(video::follows_display_resolution(false, true));
+  EXPECT_FALSE(video::follows_display_resolution(false, false)) << "legacy opt-out unchanged";
+}
+
+TEST(VideoAdmissionTicket, AReplacementIsRefusedBeforeTheCaptureAttaches) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 } }, { { "FAKE_A", 0x10 } } };
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 3, ample_rate } } } };
+  scoped_global_probe_t global { 0 };
+  auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_A"));
+  ASSERT_EQ(outcome.status, 0) << outcome.result.message;
+  const auto ticket = ticket_from(outcome);
+  const auto early = video::reserve_replacement(ticket, 1280, 720);
+  ASSERT_FALSE(early);
+  EXPECT_NE(early.error().find("not capturing"), std::string::npos) << early.error();
+  EXPECT_EQ(budget.sessions(0x10), 1u);
+}
+
+TEST(VideoAdmissionTicket, AReplacementIsFencedOnTheEncoderGeneration) {
+  replacement_fixture_t fixture { 2 };
+  auto replacement = video::reserve_replacement(fixture.ticket, 1280, 720);
+  ASSERT_TRUE(replacement) << replacement.error();
+  std::expected<void, std::string> committed;
+  {
+    video::testing::scoped_hardware_encoder_t reselected { 0x10 };
+    committed = video::commit_replacement(fixture.ticket, std::move(*replacement));
+  }
+  ASSERT_FALSE(committed);
+  EXPECT_NE(committed.error().find("generation"), std::string::npos) << committed.error();
+  EXPECT_EQ(fixture.budget.sessions(0x10), 1u) << "the refused replacement rolled back";
+  EXPECT_EQ(fixture.held_width(), 1920u);
+}
+
+TEST(VideoAdmissionTicket, AnUnaccountedReplacementCannotReplaceAnAccountedMode) {
+  replacement_fixture_t fixture { 2 };
+  const auto committed = video::commit_replacement(fixture.ticket, video::admission::pending_t::unaccounted());
+  ASSERT_FALSE(committed);
+  EXPECT_EQ(fixture.budget.sessions(0x10), 1u);
+  EXPECT_EQ(fixture.held_width(), 1920u);
+}
+
+TEST(VideoAdmissionTicket, WithoutABudgetAReplacementIsUnaccounted) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 } } };
+  scoped_global_probe_t global { 0 };
+  auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_A"));
+  ASSERT_EQ(outcome.status, 0) << outcome.result.message;
+  const auto ticket = ticket_from(outcome);
+  auto attached = video::testing::attach_capture(ticketed_config("FAKE_A", ticket));
+  ASSERT_TRUE(attached);
+  auto replacement = video::reserve_replacement(ticket, 1280, 720);
+  ASSERT_TRUE(replacement) << replacement.error();
+  EXPECT_FALSE(replacement->request());
+  EXPECT_TRUE(video::commit_replacement(ticket, std::move(*replacement)));
+
+  auto untracked = video::reserve_replacement(nullptr, 1280, 720);
+  ASSERT_TRUE(untracked);
+  EXPECT_TRUE(video::commit_replacement(nullptr, std::move(*untracked)));
+}
+
+TEST(VideoAdmissionTicket, UnderABudgetASessionWithoutATicketCannotChangeMode) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 } }, { { "FAKE_A", 0x10 } } };
+  scoped_budget_t budget { { { 0x10, { 3, ample_rate } } } };
+  EXPECT_FALSE(video::reserve_replacement(nullptr, 1280, 720));
+  EXPECT_EQ(budget.sessions(0x10), 0u);
+}
 TEST(VideoJoinerAdmission, AJoinerIsAdmittedOnTheOwnersSelectionBeforeItCaptures) {
   fake_capture_platform_t platform { { { "FAKE_A", 1 } }, { { "FAKE_A", 0x10 } } };
   video::testing::scoped_hardware_encoder_t hardware { 0x10 };

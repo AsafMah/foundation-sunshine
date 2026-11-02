@@ -27,6 +27,7 @@ TEST(StreamSessionObservability, NamesEveryStopReason) {
   EXPECT_STREQ(stop_reason_name(stop_reason_e::audio_ended), "audio_ended");
   EXPECT_STREQ(stop_reason_name(stop_reason_e::client_cancel), "client_cancel");
   EXPECT_STREQ(stop_reason_name(stop_reason_e::host_terminate), "host_terminate");
+  EXPECT_STREQ(stop_reason_name(stop_reason_e::display_failed), "display_failed");
 }
 
 TEST(StreamSessionObservability, PreservesFirstStopReason) {

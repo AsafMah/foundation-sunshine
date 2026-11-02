@@ -12,6 +12,7 @@
 #include "settings.h"
 #include "topology_coordinator.h"
 #include "topology_native.h"
+#include "topology_process_lifecycle.h"
 
 namespace display_device::coordinated {
   topology::coordinator_t &coordinator();
@@ -22,6 +23,11 @@ namespace display_device::coordinated {
   void shutdown_vdd_destroy();
   /** Managed launches only: prepare the latched native profile on the topology worker. */
   topology::native_prepared_t prepare_native(const topology::mutation_capability_t &capability);
+  /**
+   * Managed streams only: change the managed head's resolution on the topology worker
+   * (`reconfigure`). Refused, without touching the head, when not admitted.
+   */
+  topology::native_mode_changed_t change_native_mode(std::uint32_t width, std::uint32_t height);
   /** The `display_topology_profile` this process latched; blank in legacy mode. */
   const std::string &latched_profile();
   /** Read-only admin report of the saved `display_topology_profile` against the one this process latched. */

@@ -73,6 +73,7 @@ namespace stream {
       audio_ended,
       client_cancel,
       host_terminate,
+      display_failed,
     };
 
     const char *

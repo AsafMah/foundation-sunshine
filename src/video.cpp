@@ -1890,11 +1890,41 @@ namespace video {
                       << "), pixel rate "sv << derived.limits.pixel_rate << "/s ("sv << (derived.pixel_rate_reported ? "reported"sv : "fallback"sv) << ')';
     }
 
+    // A capture's admission for as long as it captures. A ticketed admission is
+    // held in its ticket, so a replacement mode can swap it; ending the hold
+    // releases whatever the ticket holds then and closes it to replacements.
+    class admission_hold_t {
+    public:
+      admission_hold_t() = default;
+      explicit admission_hold_t(std::shared_ptr<admission_ticket_t> ticket):
+          _ticket(std::move(ticket)) {}
+      admission_hold_t(admission_hold_t &&) noexcept = default;
+      admission_hold_t &
+      operator=(admission_hold_t &&) = delete;
+      admission_hold_t(const admission_hold_t &) = delete;
+      admission_hold_t &
+      operator=(const admission_hold_t &) = delete;
+      ~admission_hold_t() {
+        if (!_ticket) {
+          return;
+        }
+        admission::lease_t released;
+        {
+          std::lock_guard lg { _ticket->lock };
+          released = std::move(_ticket->lease);
+          _ticket->closed = true;
+        }
+      }
+
+    private:
+      std::shared_ptr<admission_ticket_t> _ticket;
+    };
+
     // Commits a session's admission before its capture source is acquired. The
     // ticket is fenced on the encoder selection it was granted against. An
     // exact session without a ticket is refused while the budget is enforced;
     // otherwise sessions without one attach as before, unaccounted.
-    std::optional<admission::lease_t>
+    std::optional<admission_hold_t>
     admit_capture(const config_t &config) {
       if (const auto ticket = config.admission) {
         std::lock_guard lg { ticket->lock };
@@ -1908,7 +1938,9 @@ namespace video {
           BOOST_LOG(error) << "Capture of output ["sv << config.display_name << "] refused: "sv << lease.error().detail;
           return std::nullopt;
         }
-        return std::move(*lease);
+        ticket->lease = std::move(*lease);
+        ticket->attached = true;
+        return std::optional<admission_hold_t> { std::in_place, ticket };
       }
       if (config.display_exact) {
         if (const auto budget = current_admission_budget(); budget && budget->enforced()) {
@@ -1916,7 +1948,7 @@ namespace video {
           return std::nullopt;
         }
       }
-      return admission::lease_t {};
+      return std::optional<admission_hold_t> { std::in_place };
     }
 
     std::optional<std::uint64_t>
@@ -4640,7 +4672,7 @@ namespace video {
         last_display_width = current_width;
         last_display_height = current_height;
 
-        if (!config::video.dynamic_resolution_follow_display) {
+        if (!follows_display_resolution(config.display_exact, config::video.dynamic_resolution_follow_display)) {
           // Toggle off: keep the originally negotiated stream resolution and let the
           // encoder's scaler adapt. Avoids sending SS_RESOLUTION_CHANGE, which legacy
           // Moonlight clients (e.g. PSVita port) don't implement and would freeze on.
@@ -4891,6 +4923,58 @@ namespace video {
         channel_data, dynamic_param_events,
         std::move(session_factory), std::move(backend_failure_handler));
     }
+  }
+
+  std::expected<admission::pending_t, std::string>
+  reserve_replacement(const std::shared_ptr<admission_ticket_t> &ticket, std::uint32_t width, std::uint32_t height) {
+    const auto budget = current_admission_budget();
+    const bool enforced = budget && budget->enforced();
+    if (!ticket) {
+      if (enforced) return std::unexpected(std::string { "the session holds no admission" });
+      return admission::pending_t::unaccounted();
+    }
+    std::lock_guard lg { ticket->lock };
+    if (!ticket->attached || ticket->closed) {
+      return std::unexpected(std::string { "the session is not capturing" });
+    }
+    const auto &held = ticket->lease.request();
+    if (!held) {
+      if (enforced) return std::unexpected(std::string { "the session's admission is unaccounted" });
+      return admission::pending_t::unaccounted();
+    }
+    if (!budget) return std::unexpected(std::string { "the admission budget is gone" });
+    auto request = *held;
+    request.width = width;
+    request.height = height;
+    auto pending = budget->reserve(request, budget->max_pending());
+    if (!pending) return std::unexpected("over the admission budget: " + pending.error().detail);
+    return std::move(*pending);
+  }
+
+  std::expected<void, std::string>
+  commit_replacement(const std::shared_ptr<admission_ticket_t> &ticket, admission::pending_t replacement) {
+    if (!ticket) {
+      if (!replacement.request()) return {};
+      return std::unexpected(std::string { "the session holds no admission" });
+    }
+    admission::lease_t released;
+    {
+      std::lock_guard lg { ticket->lock };
+      if (!ticket->attached || ticket->closed) {
+        return std::unexpected(std::string { "the session is not capturing" });
+      }
+      if (const auto generation = chosen_encoder_snapshot().generation; generation != ticket->encoder_generation) {
+        return std::unexpected("its admission was granted on encoder generation " + std::to_string(ticket->encoder_generation) +
+                               ", now " + std::to_string(generation));
+      }
+      if (ticket->lease.request() && !replacement.request()) {
+        return std::unexpected(std::string { "an unaccounted replacement cannot replace an accounted admission" });
+      }
+      auto lease = replacement.commit();
+      if (!lease) return std::unexpected(lease.error().detail);
+      released = std::exchange(ticket->lease, std::move(*lease));
+    }
+    return {};
   }
 
   void
@@ -6045,7 +6129,7 @@ namespace video {
     namespace {
       class attachment_t: public capture_attachment_t {
       public:
-        attachment_t(admission::lease_t lease, capture_source_ref_t ref, captured_frame_event_t images):
+        attachment_t(admission_hold_t lease, capture_source_ref_t ref, captured_frame_event_t images):
             _lease { std::move(lease) }, _ref { std::move(ref) }, _images { std::move(images) } {}
 
         ~attachment_t() override {
@@ -6060,7 +6144,7 @@ namespace video {
 
       private:
         // Declared first: released only after the capture ref is dropped.
-        admission::lease_t _lease;
+        admission_hold_t _lease;
         capture_source_ref_t _ref;
         captured_frame_event_t _images;
       };

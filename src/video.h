@@ -15,8 +15,10 @@
 
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -148,13 +150,46 @@ namespace video {
   /**
    * A launch's admission, carried from the probe that granted it to the
    * capture attach that commits it. It is valid only against the encoder
-   * selection it was granted on, and commits at most once.
+   * selection it was granted on, and commits at most once. While the session
+   * captures, `lease` holds its committed admission; a replacement mode swaps
+   * it (make-before-break) until the capture ends and closes the ticket.
    */
   struct admission_ticket_t {
     std::mutex lock;
     admission::pending_t pending;
     std::uint64_t encoder_generation {};
+    admission::lease_t lease;
+    /** The capture committed `pending` and holds `lease`. */
+    bool attached {};
+    /** The capture ended: nothing is held, and no replacement may be committed. */
+    bool closed {};
   };
+
+  /**
+   * Reserve a session's replacement mode while its current admission stays held
+   * (make-before-break): same adapter and frame rate, new size. Refused unless
+   * the session is capturing. Unaccounted when its admission was.
+   */
+  std::expected<admission::pending_t, std::string>
+  reserve_replacement(const std::shared_ptr<admission_ticket_t> &ticket, std::uint32_t width, std::uint32_t height);
+
+  /**
+   * Commit a replacement from `reserve_replacement` and release the admission it
+   * replaces. Refused (the reservation rolls back, the old lease stays) when the
+   * capture ended or the encoder selection moved since the ticket was granted.
+   */
+  std::expected<void, std::string>
+  commit_replacement(const std::shared_ptr<admission_ticket_t> &ticket, admission::pending_t replacement);
+
+  /**
+   * Whether the encoder follows a host display size change. A managed (exact)
+   * head only changes size on the client's request, so it always follows; other
+   * displays honour `dynamic_resolution_follow_display`.
+   */
+  constexpr bool
+  follows_display_resolution(bool display_exact, bool follow_setting) {
+    return display_exact || follow_setting;
+  }
 
   /* Encoding configuration requested by remote client */
   struct config_t {

@@ -120,6 +120,28 @@ namespace display_device::coordinated {
             {},
           };
         },
+        [managed](const auto &capability, std::uint32_t width, std::uint32_t height) {
+          auto outcome = managed->change_mode(capability, resolution_t { width, height });
+          topology::native_mode_changed_t changed;
+          switch (outcome.verdict) {
+            case topology::mode_change_verdict_e::applied:
+              changed.verdict = topology::native_mode_verdict_e::applied;
+              break;
+            case topology::mode_change_verdict_e::unchanged:
+              changed.verdict = topology::native_mode_verdict_e::unchanged;
+              break;
+            case topology::mode_change_verdict_e::refused:
+              changed.verdict = topology::native_mode_verdict_e::refused;
+              break;
+            case topology::mode_change_verdict_e::conflict:
+            default:
+              changed.verdict = topology::native_mode_verdict_e::conflict;
+              break;
+          }
+          changed.display = outcome.display ? outcome.display->value : std::string {};
+          changed.reason = std::move(outcome.reason);
+          return changed;
+        },
       };
     }
 
@@ -205,6 +227,18 @@ namespace display_device::coordinated {
   topology::native_prepared_t
   prepare_native(const topology::mutation_capability_t &capability) {
     return lifecycle().prepare_native(capability);
+  }
+
+  topology::native_mode_changed_t
+  change_native_mode(std::uint32_t width, std::uint32_t height) {
+    auto done = topology::run_for_value(coordinator(), topology::command_kind_e::reconfigure,
+      [width, height](const topology::mutation_capability_t &capability) {
+        return lifecycle().change_native_mode(capability, width, height);
+      });
+    if (!done) {
+      return { topology::native_mode_verdict_e::refused, {}, "not run: " + done.error().detail };
+    }
+    return std::move(*done);
   }
 
   const std::string &

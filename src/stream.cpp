@@ -2158,7 +2158,54 @@ namespace stream {
 
         const auto width = read_dynamic_param_i32(payload, WIRE_WORD_SIZE);
         const auto height = read_dynamic_param_i32(payload, WIRE_WORD_SIZE * 2);
-        const auto outcome = stream::dynamic_mode::gate(session->config.monitor, stream::dynamic_mode::request_t::resolution(width, height), [&]() {
+        const auto request = stream::dynamic_mode::request_t::resolution(width, height);
+        if (session->config.monitor.display_exact) {
+          namespace dm = stream::dynamic_mode;
+          const auto ticket = session->config.monitor.admission;
+          const auto outcome = dm::change_managed_resolution(request, session->config.monitor.width, session->config.monitor.height,
+            session->config.monitor.display_name,
+            [](auto &&body) { return stream::session::run_display_reconfiguration_if_single_video_session(body); },
+            [&ticket](std::uint32_t w, std::uint32_t h) { return video::reserve_replacement(ticket, w, h); },
+            [](std::uint32_t w, std::uint32_t h) {
+              namespace topology = display_device::topology;
+              const auto changed = display_device::coordinated::change_native_mode(w, h);
+              dm::head_change_t head;
+              switch (changed.verdict) {
+                case topology::native_mode_verdict_e::applied:
+                  head.verdict = dm::head_verdict_e::applied;
+                  break;
+                case topology::native_mode_verdict_e::unchanged:
+                  head.verdict = dm::head_verdict_e::unchanged;
+                  break;
+                case topology::native_mode_verdict_e::refused:
+                  head.verdict = dm::head_verdict_e::refused;
+                  break;
+                default:
+                  head.verdict = dm::head_verdict_e::conflict;
+                  break;
+              }
+              head.display = changed.display;
+              head.reason = changed.reason;
+              return head;
+            },
+            [&ticket](video::admission::pending_t &&pending) { return video::commit_replacement(ticket, std::move(pending)); },
+            [session](int w, int h) {
+              session->config.monitor.width = w;
+              session->config.monitor.height = h;
+              perf::update_session_display(session->launch_session_id, w, h, session->config.monitor.framerate);
+              session->video.idr_events->raise(true);
+            });
+          if (outcome.decision == dm::decision_e::failed) {
+            // The head may no longer match what this stream captures and encodes.
+            BOOST_LOG(warning) << outcome.message << "; stopping the stream"sv;
+            session::stop(*session, session::stop_reason_e::display_failed);
+          }
+          else if (!outcome.message.empty()) {
+            BOOST_LOG(info) << outcome.message;
+          }
+          return;
+        }
+        const auto outcome = stream::dynamic_mode::gate(session->config.monitor, request, [&]() {
           handle_resolution_change(session, width, height);
         });
         if (outcome.decision == stream::dynamic_mode::decision_e::refused_managed) {
@@ -4313,6 +4360,8 @@ namespace stream {
           return "client_cancel";
         case stop_reason_e::host_terminate:
           return "host_terminate";
+        case stop_reason_e::display_failed:
+          return "display_failed";
       }
       return "unknown";
     }

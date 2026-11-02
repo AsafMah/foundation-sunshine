@@ -4,8 +4,11 @@
  * Provisional pending G1 hardware.
  */
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <expected>
 #include <limits>
 #include <string>
+#include <vector>
 
 #include "src/stream_dynamic_mode.h"
 
@@ -133,5 +136,186 @@ namespace {
     EXPECT_EQ(nan.decision, decision_e::refused_managed);
     EXPECT_EQ(applied, 0);
     EXPECT_EQ(monitor.framerate, 60);
+  }
+
+  // A managed resolution change against fakes: every step is traced in order.
+  struct managed_fake_t {
+    std::vector<std::string> trace;
+    bool exclusive = true;
+    std::expected<int, std::string> reservation = 7;
+    std::vector<head_change_t> changes { { head_verdict_e::applied, "\\\\.\\DISPLAY9", {} } };
+    std::size_t next_change = 0;
+    std::expected<void, std::string> committed {};
+    int live_pending = 0;
+
+    // A move-only pending that counts how many reservations are alive (dropping one rolls it back).
+    struct pending_t {
+      managed_fake_t *owner;
+      int id;
+      pending_t(managed_fake_t *o, int i):
+          owner(o), id(i) { ++owner->live_pending; }
+      pending_t(pending_t &&other) noexcept:
+          owner(std::exchange(other.owner, nullptr)), id(other.id) {}
+      pending_t(const pending_t &) = delete;
+      ~pending_t() {
+        if (owner) --owner->live_pending;
+      }
+    };
+
+    outcome_t
+    run(int to_width, int to_height) {
+      return change_managed_resolution(request_t::resolution(to_width, to_height), 1920, 1080, "\\\\.\\DISPLAY9",
+        [this](auto &&body) {
+          trace.push_back("exclusive");
+          if (!exclusive) return false;
+          body();
+          return true;
+        },
+        [this](std::uint32_t w, std::uint32_t h) -> std::expected<pending_t, std::string> {
+          trace.push_back("reserve " + std::to_string(w) + "x" + std::to_string(h));
+          if (!reservation) return std::unexpected(reservation.error());
+          return pending_t { this, *reservation };
+        },
+        [this](std::uint32_t w, std::uint32_t h) {
+          trace.push_back("change " + std::to_string(w) + "x" + std::to_string(h));
+          const auto i = std::min(next_change++, changes.size() - 1);
+          return changes[i];
+        },
+        [this](pending_t &&pending) -> std::expected<void, std::string> {
+          pending_t consumed { std::move(pending) };
+          trace.push_back("commit " + std::to_string(consumed.id));
+          return committed;
+        },
+        [this](int w, int h) { trace.push_back("apply " + std::to_string(w) + "x" + std::to_string(h)); });
+    }
+  };
+
+  TEST(StreamDynamicModeManaged, AdmitsThenChangesTheHeadThenCommitsThenFollows) {
+    managed_fake_t fake;
+    const auto outcome = fake.run(2560, 1440);
+    EXPECT_EQ(outcome.decision, decision_e::applied);
+    EXPECT_NE(outcome.message.find("1920x1080 -> 2560x1440"), std::string::npos);
+    EXPECT_EQ(fake.trace, (std::vector<std::string> { "exclusive", "reserve 2560x1440", "change 2560x1440", "commit 7", "apply 2560x1440" }));
+    EXPECT_EQ(fake.live_pending, 0);
+  }
+
+  TEST(StreamDynamicModeManaged, PlatformUnchangedStillCommitsAndFollows) {
+    managed_fake_t fake;
+    fake.changes = { { head_verdict_e::unchanged, "\\\\.\\DISPLAY9", {} } };
+    const auto outcome = fake.run(2560, 1440);
+    EXPECT_EQ(outcome.decision, decision_e::applied);
+    EXPECT_EQ(fake.trace.back(), "apply 2560x1440");
+  }
+
+  TEST(StreamDynamicModeManaged, BudgetRefusalNeverTouchesTheHead) {
+    managed_fake_t fake;
+    fake.reservation = std::unexpected(std::string { "over the adapter's encode sessions" });
+    const auto outcome = fake.run(2560, 1440);
+    EXPECT_EQ(outcome.decision, decision_e::refused_managed);
+    EXPECT_NE(outcome.message.find("keeping 1920x1080"), std::string::npos);
+    EXPECT_NE(outcome.message.find("encode sessions"), std::string::npos);
+    EXPECT_EQ(fake.trace, (std::vector<std::string> { "exclusive", "reserve 2560x1440" }));
+  }
+
+  TEST(StreamDynamicModeManaged, HeadRefusalRollsTheReservationBackAndKeepsTheMode) {
+    managed_fake_t fake;
+    fake.changes = { { head_verdict_e::refused, "\\\\.\\DISPLAY9", "mode not in the head's list" } };
+    const auto outcome = fake.run(2560, 1440);
+    EXPECT_EQ(outcome.decision, decision_e::refused_managed);
+    EXPECT_NE(outcome.message.find("mode not in the head's list"), std::string::npos);
+    EXPECT_EQ(fake.trace, (std::vector<std::string> { "exclusive", "reserve 2560x1440", "change 2560x1440" }));
+    EXPECT_EQ(fake.live_pending, 0);
+  }
+
+  TEST(StreamDynamicModeManaged, HeadConflictTriesToRestoreAndFailsWhenItCannot) {
+    managed_fake_t fake;
+    fake.changes = { { head_verdict_e::conflict, {}, "journal write failed" }, { head_verdict_e::refused, {}, "In conflict" } };
+    const auto outcome = fake.run(2560, 1440);
+    EXPECT_EQ(outcome.decision, decision_e::failed);
+    EXPECT_NE(outcome.message.find("journal write failed"), std::string::npos);
+    EXPECT_NE(outcome.message.find("In conflict"), std::string::npos);
+    EXPECT_EQ(fake.trace, (std::vector<std::string> { "exclusive", "reserve 2560x1440", "change 2560x1440", "change 1920x1080" }));
+    EXPECT_EQ(fake.live_pending, 0);
+  }
+
+  TEST(StreamDynamicModeManaged, HeadConflictWithAProvenRestoreKeepsTheStream) {
+    managed_fake_t fake;
+    fake.changes = { { head_verdict_e::conflict, {}, "re-verify timed out" }, { head_verdict_e::unchanged, "\\\\.\\DISPLAY9", {} } };
+    const auto outcome = fake.run(2560, 1440);
+    EXPECT_EQ(outcome.decision, decision_e::refused_managed);
+    EXPECT_NE(outcome.message.find("previous mode restored"), std::string::npos);
+    EXPECT_EQ(fake.trace.back(), "change 1920x1080");
+    EXPECT_EQ(fake.live_pending, 0);
+  }
+
+  TEST(StreamDynamicModeManaged, HeadThatMovedDisplaysIsChangedBackAndNeverCommitted) {
+    managed_fake_t fake;
+    fake.changes = { { head_verdict_e::applied, "\\\\.\\DISPLAY10", {} }, { head_verdict_e::applied, "\\\\.\\DISPLAY10", {} } };
+    const auto outcome = fake.run(2560, 1440);
+    EXPECT_EQ(outcome.decision, decision_e::failed) << "the old display is gone, so the stream cannot be kept";
+    EXPECT_NE(outcome.message.find("DISPLAY10"), std::string::npos);
+    EXPECT_EQ(fake.trace, (std::vector<std::string> { "exclusive", "reserve 2560x1440", "change 2560x1440", "change 1920x1080" }));
+    EXPECT_EQ(fake.live_pending, 0);
+  }
+
+  TEST(StreamDynamicModeManaged, HeadThatMovedAndCameBackIsRestored) {
+    managed_fake_t fake;
+    fake.changes = { { head_verdict_e::applied, "\\\\.\\DISPLAY10", {} }, { head_verdict_e::applied, "\\\\.\\DISPLAY9", {} } };
+    const auto outcome = fake.run(2560, 1440);
+    EXPECT_EQ(outcome.decision, decision_e::refused_managed);
+    EXPECT_NE(outcome.message.find("keeping 1920x1080"), std::string::npos);
+    EXPECT_EQ(fake.trace.back(), "change 1920x1080");
+  }
+
+  TEST(StreamDynamicModeManaged, CommitFailureRestoresThePreviousMode) {
+    managed_fake_t fake;
+    fake.committed = std::unexpected(std::string { "encoder generation moved" });
+    fake.changes = { { head_verdict_e::applied, "\\\\.\\DISPLAY9", {} }, { head_verdict_e::applied, "\\\\.\\DISPLAY9", {} } };
+    const auto outcome = fake.run(2560, 1440);
+    EXPECT_EQ(outcome.decision, decision_e::refused_managed);
+    EXPECT_NE(outcome.message.find("previous mode restored"), std::string::npos);
+    EXPECT_NE(outcome.message.find("encoder generation moved"), std::string::npos);
+    EXPECT_EQ(fake.trace, (std::vector<std::string> { "exclusive", "reserve 2560x1440", "change 2560x1440", "commit 7", "change 1920x1080" }));
+  }
+
+  TEST(StreamDynamicModeManaged, CommitFailureWithAFailedRestoreFails) {
+    managed_fake_t fake;
+    fake.committed = std::unexpected(std::string { "encoder generation moved" });
+    fake.changes = { { head_verdict_e::applied, "\\\\.\\DISPLAY9", {} }, { head_verdict_e::refused, "\\\\.\\DISPLAY9", "busy" } };
+    const auto outcome = fake.run(2560, 1440);
+    EXPECT_EQ(outcome.decision, decision_e::failed);
+    EXPECT_NE(outcome.message.find("busy"), std::string::npos);
+    EXPECT_EQ(fake.trace.back(), "change 1920x1080");
+  }
+
+  TEST(StreamDynamicModeManaged, RestoreToAnotherDisplayIsNotARestore) {
+    managed_fake_t fake;
+    fake.committed = std::unexpected(std::string { "x" });
+    fake.changes = { { head_verdict_e::applied, "\\\\.\\DISPLAY9", {} }, { head_verdict_e::applied, "\\\\.\\DISPLAY10", {} } };
+    EXPECT_EQ(fake.run(2560, 1440).decision, decision_e::failed);
+  }
+
+  TEST(StreamDynamicModeManaged, OtherStreamsActiveRefusesWithoutAnything) {
+    managed_fake_t fake;
+    fake.exclusive = false;
+    const auto outcome = fake.run(2560, 1440);
+    EXPECT_EQ(outcome.decision, decision_e::refused_managed);
+    EXPECT_NE(outcome.message.find("other streams are active"), std::string::npos);
+    EXPECT_EQ(fake.trace, (std::vector<std::string> { "exclusive" }));
+  }
+
+  TEST(StreamDynamicModeManaged, InvalidOrUnchangedSizesDoNothing) {
+    for (const auto &[w, h] : std::vector<std::pair<int, int>> { { 0, 1080 }, { 1920, -1 }, { 16385, 1080 }, { 1920, 16385 } }) {
+      managed_fake_t fake;
+      EXPECT_EQ(fake.run(w, h).decision, decision_e::refused_managed) << w << 'x' << h;
+      EXPECT_TRUE(fake.trace.empty());
+    }
+    managed_fake_t edge;
+    EXPECT_EQ(edge.run(16384, 16384).decision, decision_e::applied);
+    managed_fake_t same;
+    const auto outcome = same.run(1920, 1080);
+    EXPECT_EQ(outcome.decision, decision_e::unchanged);
+    EXPECT_TRUE(outcome.message.empty());
+    EXPECT_TRUE(same.trace.empty());
   }
 }  // namespace

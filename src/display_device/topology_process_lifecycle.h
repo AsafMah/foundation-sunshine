@@ -52,6 +52,24 @@ namespace display_device::topology {
   const char *
   to_string(lifecycle_cleanup_e value) noexcept;
 
+  enum class native_mode_verdict_e : std::uint8_t {
+    /** The head now runs the requested mode. */
+    applied,
+    /** The head already ran the requested mode; nothing changed. */
+    unchanged,
+    /** Refused before anything changed; the head keeps its mode. */
+    refused,
+    /** The change failed in a way that left the head's state uncertain (In conflict). */
+    conflict,
+  };
+
+  struct native_mode_changed_t {
+    native_mode_verdict_e verdict { native_mode_verdict_e::refused };
+    /** The head's display after the change; empty when unknown. */
+    std::string display;
+    std::string reason;
+  };
+
   /**
    * Managed (native) mode. Present selects managed mode for the whole process: every
    * hook is required, and each returned health is published to the coordinator.
@@ -67,6 +85,11 @@ namespace display_device::topology {
     std::function<native_health_t(const mutation_capability_t &)> reset;
     /** Managed launch preparation (`launch_prepare` authority); `health` is published after it. */
     std::function<native_prepared_t(const mutation_capability_t &)> prepare;
+    /**
+     * Optional: change the managed head's resolution (`native_mode` authority);
+     * `health` is published after it. Absent refuses every mode change.
+     */
+    std::function<native_mode_changed_t(const mutation_capability_t &, std::uint32_t width, std::uint32_t height)> change_mode;
   };
 
   struct lifecycle_hooks_t {
@@ -145,6 +168,14 @@ namespace display_device::topology {
      */
     native_prepared_t
     prepare_native(const mutation_capability_t &capability);
+
+    /**
+     * Change the managed head's resolution under `capability` and publish the resulting
+     * health; a throwing change publishes In conflict and returns `conflict`. Legacy mode,
+     * or no change hook, refuses without running anything.
+     */
+    native_mode_changed_t
+    change_native_mode(const mutation_capability_t &capability, std::uint32_t width, std::uint32_t height);
 
   private:
     coordinator_options_t
