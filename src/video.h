@@ -9,6 +9,7 @@
 #include "thread_safe.h"
 #include "video_admission.h"
 #include "video_colorspace.h"
+#include "video_encoder_capacity.h"
 
 #include <boost/smart_ptr/shared_ptr.hpp>
 
@@ -227,6 +228,9 @@ namespace video {
     // The launch's admission, committed once before the capture source is
     // acquired; its lease lives as long as the session's capture ref.
     std::shared_ptr<admission_ticket_t> admission;
+    // Probe only, managed profile only: the encoder records its driver-reported
+    // capacity for the admission budget. False keeps every driver call unchanged.
+    bool report_admission_capacity = false;
 
     platf::frame_pipeline_policy_t
     effective_frame_pipeline_policy() const {
@@ -490,6 +494,12 @@ namespace video {
     fec_percentage() const {
       return bitrate_budget ? bitrate_budget->applied().fec_percentage : 0;
     }
+
+    /** What the encoder reported when created with `report_admission_capacity`; empty otherwise. */
+    virtual encoder_capacity_t
+    admission_capacity() const {
+      return {};
+    }
   };
 
   // encoders
@@ -729,10 +739,26 @@ namespace video {
   probe_outcome_t
   admit_existing(const probe_target_t &target);
 
+  /**
+   * Install the production admission budget for a managed profile, once; later
+   * calls keep the installed budget. The blank profile never calls this, so it
+   * keeps no budget and admits unaccounted, as before.
+   */
+  void
+  install_managed_admission_budget();
+
   namespace testing {
     /** Install the live admission budget; null disables accounting (the production default). */
     void
     set_admission_budget(std::shared_ptr<admission::budget_t> budget);
+
+    /** Whether a probe now asks encoders for their capacity: only under an enforced budget. */
+    bool
+    capacity_reporting_requested();
+
+    /** What the end of a successful encoder validation does with the probe's reported capacity. */
+    void
+    learn_validated_capacity(std::uint64_t adapter_luid, const encoder_capacity_t &capacity);
 
     /** Advances on every change of the chosen encoder. */
     std::uint64_t

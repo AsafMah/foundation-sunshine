@@ -19,7 +19,8 @@ namespace {
 
   constexpr std::uint64_t adapter_a = 0x10;
   constexpr std::uint64_t adapter_b = 0x20;
-  constexpr std::uint64_t rate_1080p60 = 1920ull * 1080 * 60;
+  // A 1080p60 stream's charge: admission counts whole macroblocks, so 1088 rows.
+  constexpr std::uint64_t rate_1080p60 = 1920ull * 1088 * 60;
 
   struct fake_clock_t {
     std::shared_ptr<std::atomic<std::int64_t>> now = std::make_shared<std::atomic<std::int64_t>>(1000);

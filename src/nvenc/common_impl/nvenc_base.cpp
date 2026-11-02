@@ -108,6 +108,7 @@ namespace nvenc {
     if (!nvenc && !init_library()) return false;
 
     if (encoder) destroy_encoder();
+    reported_capacity = {};
     auto fail_guard = util::fail_guard([this] { destroy_encoder(); });
     dynamic_metadata.configure(
       video::hdr_metadata::formats_for(sunshine_colorspace, client_config.videoFormat));
@@ -212,6 +213,13 @@ namespace nvenc {
                          << ", requested " << encoder_params.width << "x" << encoder_params.height;
         return false;
       }
+    }
+
+    if (client_config.report_admission_capacity) {
+      // NVENC reports macroblock throughput but no session limit; the
+      // admission budget keeps its conservative session fallback.
+      reported_capacity.macroblocks_per_second =
+        video::encoder_capacity_t::reported(get_encoder_cap(NV_ENC_CAPS_MB_PER_SEC_MAX));
     }
 
     if (buffer_is_10bit() && !get_encoder_cap(NV_ENC_CAPS_SUPPORT_10BIT_ENCODE)) {

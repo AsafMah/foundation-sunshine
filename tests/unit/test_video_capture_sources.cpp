@@ -7,7 +7,9 @@
 #include "../tests_common.h"
 
 #include "src/globals.h"
+#include "src/utility.h"
 #include "src/video.h"
+#include "src/video_admission_policy.h"
 
 #include <atomic>
 #include <map>
@@ -564,6 +566,147 @@ TEST(VideoLiveAdmission, SoftwareAdmissionIsAccountedOnTheDisplayAdapter) {
   EXPECT_NE(unknown.result.message.find("unknown adapter"), std::string::npos) << unknown.result.message;
   EXPECT_TRUE(unknown.budget_refusal);
   EXPECT_EQ(budget.sessions(0x20), 1u);
+}
+
+namespace {
+  // The production managed policy, on a fixed clock.
+  class scoped_managed_budget_t {
+  public:
+    scoped_managed_budget_t():
+        budget { std::make_shared<admission::budget_t>(admission::production_policy(true),
+          [] { return display_device::topology::monotonic_time_t { 1000 }; }) } {
+      video::testing::set_admission_budget(budget);
+    }
+    ~scoped_managed_budget_t() {
+      video::testing::set_admission_budget(nullptr);
+    }
+    std::uint64_t
+    sessions(std::uint64_t adapter) const {
+      return budget->held(admission::resource_kind_e::encode_session, adapter);
+    }
+    std::shared_ptr<admission::budget_t> budget;
+  };
+
+  video::encoder_capacity_t
+  reported_sessions(std::uint32_t sessions) {
+    video::encoder_capacity_t capacity;
+    capacity.encode_sessions = sessions;
+    capacity.macroblocks_per_second = 4ull * 3840 * 2160 * 120 / 256;
+    return capacity;
+  }
+}  // namespace
+
+TEST(VideoAdmissionPolicyWiring, ProbesAskForCapacityOnlyUnderAnEnforcedBudget) {
+  EXPECT_FALSE(video::testing::capacity_reporting_requested()) << "no budget: the blank profile";
+  {
+    video::testing::set_admission_budget(std::make_shared<admission::budget_t>(admission::production_policy(false),
+      [] { return display_device::topology::monotonic_time_t { 1000 }; }));
+    EXPECT_FALSE(video::testing::capacity_reporting_requested()) << "an unenforced budget";
+    video::testing::set_admission_budget(nullptr);
+  }
+  scoped_managed_budget_t budget;
+  EXPECT_TRUE(video::testing::capacity_reporting_requested());
+  EXPECT_FALSE(video::config_t {}.report_admission_capacity) << "a stream's config never asks";
+}
+
+TEST(VideoAdmissionPolicyWiring, AManagedBudgetIsInstalledOnceAndKeepsWhatItLearned) {
+  ASSERT_FALSE(video::testing::capacity_reporting_requested());
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  video::install_managed_admission_budget();
+  auto cleanup = util::fail_guard([] { video::testing::set_admission_budget(nullptr); });
+  ASSERT_TRUE(video::testing::capacity_reporting_requested());
+
+  video::testing::learn_validated_capacity(0x10, reported_sessions(1));
+  video::install_managed_admission_budget();
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  auto first = video::probe_encoders_with_outcome(exact_target("FAKE_B"));
+  ASSERT_EQ(first.status, 0) << first.result.message;
+  auto second = video::probe_encoders_with_outcome(exact_target("FAKE_A"));
+  EXPECT_NE(second.status, 0) << "the reinstall must not reset the learned single session";
+  EXPECT_TRUE(second.budget_refusal);
+}
+
+TEST(VideoAdmissionPolicyWiring, ALearnedSessionLimitBoundsLiveAdmission) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_managed_budget_t budget;
+  video::testing::learn_validated_capacity(0x10, reported_sessions(1));
+  ASSERT_TRUE(budget.budget->limits(0x10));
+  EXPECT_EQ(budget.budget->limits(0x10)->encode_sessions, 1u);
+
+  auto first = video::probe_encoders_with_outcome(exact_target("FAKE_B"));
+  ASSERT_EQ(first.status, 0) << first.result.message;
+  auto second = video::probe_encoders_with_outcome(exact_target("FAKE_B"));
+  EXPECT_NE(second.status, 0);
+  EXPECT_TRUE(second.budget_refusal);
+  EXPECT_EQ(budget.sessions(0x10), 1u);
+}
+
+TEST(VideoAdmissionPolicyWiring, LearningNeverMovesAHeldAdapter) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_managed_budget_t budget;
+  video::testing::learn_validated_capacity(0x10, reported_sessions(2));
+  auto held = video::probe_encoders_with_outcome(exact_target("FAKE_B"));
+  ASSERT_EQ(held.status, 0) << held.result.message;
+
+  video::testing::learn_validated_capacity(0x10, reported_sessions(1));
+  EXPECT_EQ(budget.budget->limits(0x10)->encode_sessions, 2u);
+}
+
+TEST(VideoAdmissionPolicyWiring, AnUnprobedEnumeratedAdapterTakesTheFallback) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x20 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  ASSERT_EQ(video::testing::chosen_encoder_name(), "software");
+  scoped_managed_budget_t budget;
+  ASSERT_FALSE(budget.budget->limits(0x20));
+
+  auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_B"));
+  ASSERT_EQ(outcome.status, 0) << outcome.result.message;
+  EXPECT_EQ(budget.sessions(0x20), 1u);
+  ASSERT_TRUE(budget.budget->limits(0x20));
+  EXPECT_EQ(budget.budget->limits(0x20)->encode_sessions, admission::fallback_encode_sessions);
+  EXPECT_EQ(budget.budget->limits(0x20)->pixel_rate, admission::fallback_pixel_rate);
+}
+
+TEST(VideoAdmissionPolicyWiring, ADisplayWithoutAnAdapterIsStillRefused) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_C", 3 } }, { { "FAKE_A", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  ASSERT_EQ(video::testing::chosen_encoder_name(), "software");
+  scoped_managed_budget_t budget;
+
+  auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_C"));
+  EXPECT_NE(outcome.status, 0);
+  EXPECT_NE(outcome.result.message.find("unknown adapter"), std::string::npos) << outcome.result.message;
+  EXPECT_TRUE(outcome.budget_refusal);
+}
+
+TEST(VideoAdmissionPolicyWiring, WithoutAFallbackAnUnlistedAdapterIsRefused) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x20 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  scoped_budget_t budget { { { 0x10, { 2, ample_rate } } } };
+
+  auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_B"));
+  EXPECT_NE(outcome.status, 0);
+  EXPECT_TRUE(outcome.budget_refusal);
+  EXPECT_NE(outcome.result.message.find("has no limits"), std::string::npos)
+    << "refused by the ensure check, not incidentally by reserve: " << outcome.result.message;
+  EXPECT_FALSE(budget.budget->limits(0x20));
+  EXPECT_EQ(budget.sessions(0x20), 0u);
+}
+
+TEST(VideoAdmissionPolicyWiring, LearningWithoutABudgetChangesNothing) {
+  video::testing::learn_validated_capacity(0x10, reported_sessions(1));
+  EXPECT_FALSE(video::testing::capacity_reporting_requested());
 }
 
 TEST(VideoLiveAdmission, EncoderAndDisplayRefusalsAreNotBudgetRefusals) {

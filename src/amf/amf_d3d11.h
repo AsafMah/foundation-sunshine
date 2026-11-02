@@ -64,7 +64,16 @@ namespace amf {
     void *
     get_input_texture() override;
 
+    video::encoder_capacity_t
+    admission_capacity() const override {
+      return reported_capacity;
+    }
+
   private:
+    /// Read the stream limit and throughput the driver reports for this codec.
+    void
+    read_admission_capacity();
+
     amf_encoded_frame
     make_encoded_frame(const ::amf::AMFDataPtr &output_data);
 
@@ -112,6 +121,7 @@ namespace amf {
 
     // Encoder state
     video::config_t current_config {};
+    video::encoder_capacity_t reported_capacity;
     int video_format = 0;  // 0=H264, 1=HEVC, 2=AV1
     AMF_SURFACE_FORMAT surface_format = AMF_SURFACE_NV12;
     int encode_width = 0;

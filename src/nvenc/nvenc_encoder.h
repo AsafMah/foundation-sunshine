@@ -92,6 +92,15 @@ namespace nvenc {
      */
     virtual void
     set_luminance_stats(const platf::hdr_frame_luminance_stats_t &stats) = 0;
+
+    /**
+     * @brief What the GPU reported at the last `create_encoder()` whose client config set
+     *        `report_admission_capacity`; empty when not requested or not reported.
+     */
+    virtual video::encoder_capacity_t
+    admission_capacity() const {
+      return {};
+    }
   };
 
 }  // namespace nvenc

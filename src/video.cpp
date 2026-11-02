@@ -42,6 +42,7 @@ extern "C" {
 #include "pyrowave/capture_policy.h"
 #include "sync.h"
 #include "video.h"
+#include "video_admission_policy.h"
 #include "video_dolby_vision.h"
 #include "video_hdr_metadata.h"
 #include "video_probe.h"
@@ -877,6 +878,11 @@ namespace video {
       return device && device->nvenc && device->nvenc->set_bitrate(bitrate_kbps);
     }
 
+    encoder_capacity_t
+    admission_capacity() const override {
+      return device && device->nvenc ? device->nvenc->admission_capacity() : encoder_capacity_t {};
+    }
+
     void
     set_dynamic_param(const dynamic_param_t &param) override {
       if (!device || !device->nvenc) return;
@@ -1039,6 +1045,11 @@ namespace video {
     bool
     set_bitrate(int bitrate_kbps) override {
       return device && device->amf && device->amf->set_bitrate(bitrate_kbps);
+    }
+
+    encoder_capacity_t
+    admission_capacity() const override {
+      return device && device->amf ? device->amf->admission_capacity() : encoder_capacity_t {};
     }
 
     void
@@ -1840,6 +1851,43 @@ namespace video {
     current_admission_budget() {
       std::lock_guard lg { admission_budget_lock };
       return admission_budget;
+    }
+
+    // Only under an enforced (managed-profile) budget do probes ask encoders
+    // for their capacity; otherwise no driver call changes.
+    bool
+    probe_reports_capacity() {
+      const auto budget = current_admission_budget();
+      return budget && budget->enforced();
+    }
+
+    // Set by validate_encoder for one validation on the probing thread; each
+    // successful validate_config merges its probe session's capacity into it.
+    thread_local encoder_capacity_t *probe_capacity_sink = nullptr;
+
+    // A validated adapter takes the limits its encoder reported, or the
+    // conservative fallback for anything it did not report.
+    void
+    learn_probe_capacity(std::uint64_t adapter_luid, const encoder_capacity_t &capacity) {
+      const auto budget = current_admission_budget();
+      if (!budget || !budget->enforced() || adapter_luid == 0) {
+        return;
+      }
+      const auto derived = admission::derive_limits(capacity);
+      const auto learned = budget->learn_adapter(adapter_luid, derived.limits);
+      if (!learned) {
+        BOOST_LOG(warning) << "Admission budget could not take the limits of adapter 0x"sv << std::hex << adapter_luid << std::dec
+                           << ": "sv << learned.error().detail;
+        return;
+      }
+      if (!*learned) {
+        BOOST_LOG(info) << "Admission budget kept the limits of adapter 0x"sv << std::hex << adapter_luid << std::dec
+                        << ": it holds a stream"sv;
+        return;
+      }
+      BOOST_LOG(info) << "Admission budget for adapter 0x"sv << std::hex << adapter_luid << std::dec << ": "sv
+                      << derived.limits.encode_sessions << " encode sessions ("sv << (derived.sessions_reported ? "reported"sv : "fallback"sv)
+                      << "), pixel rate "sv << derived.limits.pixel_rate << "/s ("sv << (derived.pixel_rate_reported ? "reported"sv : "fallback"sv) << ')';
     }
 
     // Commits a session's admission before its capture source is acquired. The
@@ -4900,7 +4948,16 @@ namespace video {
   };
 
   int
-  validate_config(std::shared_ptr<platf::display_t> disp, const encoder_t &encoder, const config_t &config) {
+  validate_config(std::shared_ptr<platf::display_t> disp, const encoder_t &encoder, const config_t &plain_config) {
+    // Only a managed-profile validation asks the encoder for its capacity; a
+    // blank-profile probe runs on the caller's config, unchanged.
+    std::optional<config_t> reporting_config;
+    if (probe_capacity_sink) {
+      reporting_config.emplace(plain_config);
+      reporting_config->report_admission_capacity = true;
+    }
+    const config_t &config = reporting_config ? *reporting_config : plain_config;
+
     auto encode_device = make_encode_device(*disp, encoder, config);
     if (!encode_device) {
       return -1;
@@ -4956,6 +5013,9 @@ namespace video {
       }
     }
 
+    if (probe_capacity_sink) {
+      probe_capacity_sink->merge_min(session->admission_capacity());
+    }
     return flag;
   }
 
@@ -5011,6 +5071,12 @@ namespace video {
     std::shared_ptr<platf::display_t> disp;
     const auto configured_capture_backend = config::video.capture;
     record_validated_adapter(encoder, 0);
+    encoder_capacity_t probe_capacity;
+    const bool reports_capacity = probe_reports_capacity();
+    probe_capacity_sink = reports_capacity ? &probe_capacity : nullptr;
+    auto clear_capacity_sink = util::fail_guard([]() {
+      probe_capacity_sink = nullptr;
+    });
 
     BOOST_LOG(info) << "Trying encoder ["sv << encoder.name << ']';
     auto fg = util::fail_guard([&]() {
@@ -5228,7 +5294,11 @@ namespace video {
       BOOST_LOG(warning) << encoder.name << ": hevc missing sps->vui parameters"sv;
     }
 
-    record_validated_adapter(encoder, disp ? disp->adapter_luid() : 0);
+    const auto validated_adapter = disp ? disp->adapter_luid() : 0;
+    if (reports_capacity) {
+      learn_probe_capacity(validated_adapter, probe_capacity);
+    }
+    record_validated_adapter(encoder, validated_adapter);
     fg.disable();
     return true;
   }
@@ -5281,6 +5351,13 @@ namespace video {
         }
         if (!admission_adapter || *admission_adapter == 0) {
           return budget_refused("The live admission budget cannot account a display on an unknown adapter.", {}, snapshot.generation);
+        }
+        // An enumerated adapter no probe has measured gets the conservative
+        // fallback limits; a measured one keeps its learned limits.
+        if (const auto known = budget->ensure_adapter(*admission_adapter); !known || !*known) {
+          BOOST_LOG(warning) << "Admission of output ["sv << display_name << "] refused by the admission budget: adapter 0x"sv << std::hex
+                             << *admission_adapter << std::dec << " has no limits"sv << (known ? ""sv : ": "sv) << (known ? std::string {} : known.error().detail);
+          return budget_refused("The live admission budget has no limits for the requested display's adapter.", {}, snapshot.generation);
         }
         auto pending = budget->reserve({ *admission_adapter, target.mode->width, target.mode->height, target.mode->fps }, budget->max_pending());
         if (!pending) {
@@ -5384,6 +5461,22 @@ namespace video {
     // The launch it joins was probed on this selection; whether or not that
     // stream is capturing yet, admit like a live admission.
     return probe_live(target);
+  }
+
+  void
+  install_managed_admission_budget() {
+    std::lock_guard lg { admission_budget_lock };
+    if (admission_budget) {
+      return;
+    }
+    const auto policy = admission::production_policy(true);
+    if (!policy) {
+      return;
+    }
+    admission_budget = std::make_shared<admission::budget_t>(*policy, []() {
+      return std::chrono::duration_cast<admission::topology::monotonic_time_t>(std::chrono::steady_clock::now().time_since_epoch());
+    });
+    BOOST_LOG(info) << "Managed display profile: live admission budget installed (adapter limits learned at the next probe)"sv;
   }
 
   namespace {
@@ -5905,6 +5998,16 @@ namespace video {
     set_admission_budget(std::shared_ptr<admission::budget_t> budget) {
       std::lock_guard lg { admission_budget_lock };
       admission_budget = std::move(budget);
+    }
+
+    bool
+    capacity_reporting_requested() {
+      return probe_reports_capacity();
+    }
+
+    void
+    learn_validated_capacity(std::uint64_t adapter_luid, const encoder_capacity_t &capacity) {
+      learn_probe_capacity(adapter_luid, capacity);
     }
 
     std::uint64_t

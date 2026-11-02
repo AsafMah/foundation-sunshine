@@ -402,6 +402,8 @@ namespace nvhttp {
       if (managed_) {
         // One cooldown for the process: the latched profile is its only target.
         static const auto cooldown = std::make_shared<stream_start::launch_cooldown_t>();
+        // Managed streams are accounted per adapter before their display is prepared.
+        video::install_managed_admission_budget();
         return {
           display_device::coordinated::coordinator(), *token_, {},
           []() { lifetime::force_terminate(EXIT_FAILURE); },

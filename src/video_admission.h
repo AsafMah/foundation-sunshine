@@ -35,6 +35,7 @@ namespace video::admission {
 
   struct adapter_limits_t {
     std::uint64_t encode_sessions {};
+    /** Pixels per second, counting each frame at 16x16-macroblock-aligned width and height. */
     std::uint64_t pixel_rate {};
   };
 
@@ -42,6 +43,8 @@ namespace video::admission {
     std::map<std::uint64_t, adapter_limits_t> adapters;
     topology::monotonic_time_t max_pending {};
     std::size_t history_limit {};
+    /** Limits `ensure_adapter` gives an enumerated adapter not listed above; none keeps it unknown. */
+    std::optional<adapter_limits_t> fallback;
   };
 
   struct request_t {
@@ -133,6 +136,28 @@ namespace video::admission {
         revision_base = previous - fresh.revision().value;
         ledger.emplace(std::move(fresh));
         handles = std::move(remapped);
+        return true;
+      }
+
+      std::optional<adapter_limits_t>
+      limits(std::uint64_t adapter_luid) const {
+        const auto sessions = capacities.find({ resource_kind_e::encode_session, adapter_luid });
+        const auto rate = capacities.find({ resource_kind_e::pixel_rate, adapter_luid });
+        if (sessions == capacities.end() || rate == capacities.end()) return std::nullopt;
+        return adapter_limits_t { sessions->second, rate->second };
+      }
+
+      // Capacities are an immutable ledger snapshot: change them by rebuilding
+      // through compact. Nothing changes unless the rebuild succeeds.
+      topology::result_t<bool>
+      set_limits(std::uint64_t adapter_luid, adapter_limits_t limits) {
+        const auto previous = capacities;
+        capacities[{ resource_kind_e::encode_session, adapter_luid }] = limits.encode_sessions;
+        capacities[{ resource_kind_e::pixel_rate, adapter_luid }] = limits.pixel_rate;
+        if (!compact(now())) {
+          capacities = previous;
+          return std::unexpected(topology::error_t { topology::error_code_e::history_full, "Admission budget could not take the adapter's capacity", {} });
+        }
         return true;
       }
     };
@@ -317,6 +342,45 @@ namespace video::admission {
       return _state->ledger ? _state->ledger->held({ kind, adapter_luid }) : 0;
     }
 
+    /** The adapter's current limits; nullopt while it is unknown. */
+    std::optional<adapter_limits_t>
+    limits(std::uint64_t adapter_luid) const {
+      std::lock_guard lg { _state->lock };
+      return _state->limits(adapter_luid);
+    }
+
+    /**
+     * Gives an unknown adapter the policy fallback. Only for a LUID taken from
+     * display enumeration: `reserve` itself never admits an unknown adapter.
+     * True when the adapter is known afterwards.
+     */
+    topology::result_t<bool>
+    ensure_adapter(std::uint64_t adapter_luid) {
+      if (!_enforced || adapter_luid == 0) return false;
+      std::lock_guard lg { _state->lock };
+      if (_state->limits(adapter_luid)) return true;
+      if (!_state->policy.fallback) return false;
+      return _state->set_limits(adapter_luid, *_state->policy.fallback);
+    }
+
+    /**
+     * Replaces an adapter's limits with what its encoder reported, only while
+     * the adapter holds nothing, so a holding never sees its capacity move.
+     * False (limits kept) otherwise. The revision is unchanged: no holding moved.
+     */
+    topology::result_t<bool>
+    learn_adapter(std::uint64_t adapter_luid, adapter_limits_t limits) {
+      if (!_enforced || adapter_luid == 0) return false;
+      std::lock_guard lg { _state->lock };
+      if (_state->limits(adapter_luid)) {
+        if (_state->ledger->held({ resource_kind_e::encode_session, adapter_luid }) != 0 ||
+            _state->ledger->held({ resource_kind_e::pixel_rate, adapter_luid }) != 0) {
+          return false;
+        }
+      }
+      return _state->set_limits(adapter_luid, limits);
+    }
+
     /** Atomically reserve one encode session and the mode's pixel rate on one adapter. */
     topology::result_t<pending_t>
     reserve(const request_t &request, topology::monotonic_time_t pending_for) {
@@ -326,7 +390,12 @@ namespace video::admission {
       }
       std::uint64_t pixels {};
       std::uint64_t rate {};
-      if (__builtin_mul_overflow(std::uint64_t { request.width }, std::uint64_t { request.height }, &pixels) ||
+      // Encoders process whole 16x16 macroblocks, so charge the aligned frame:
+      // a driver-reported macroblock rate then bounds the same unit exactly.
+      const auto aligned = [](std::uint32_t extent) {
+        return (std::uint64_t { extent } + 15) / 16 * 16;
+      };
+      if (__builtin_mul_overflow(aligned(request.width), aligned(request.height), &pixels) ||
           __builtin_mul_overflow(pixels, std::uint64_t { request.fps }, &rate)) {
         return failure(topology::error_code_e::arithmetic_overflow, "Admission pixel rate overflows");
       }

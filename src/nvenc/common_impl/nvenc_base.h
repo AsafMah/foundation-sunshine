@@ -59,6 +59,11 @@ namespace nvenc {
     void
     set_luminance_stats(const platf::hdr_frame_luminance_stats_t &stats) override;
 
+    video::encoder_capacity_t
+    admission_capacity() const override {
+      return reported_capacity;
+    }
+
   protected:
     /**
      * @brief Required. Used for loading NvEnc library and setting `nvenc` variable with `NvEncodeAPICreateInstance()`.
@@ -137,6 +142,7 @@ namespace nvenc {
 
     // HDR metadata support
     std::optional<nvenc_hdr_metadata> hdr_metadata;
+    video::encoder_capacity_t reported_capacity;
     int video_format = 0;  // 0 = H.264, 1 = HEVC, 2 = AV1
 
     // Per-frame HDR luminance stats for dynamic metadata

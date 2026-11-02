@@ -105,6 +105,32 @@ namespace amf {
     }
   }
 
+  void
+  amf_d3d11::read_admission_capacity() {
+    ::amf::AMFCapsPtr caps;
+    if (!encoder || encoder->GetCaps(&caps) != AMF_OK || !caps) {
+      BOOST_LOG(info) << "AMF: encoder capacity not reported; the admission budget uses its fallback";
+      return;
+    }
+    const wchar_t *streams = video_format == 1 ? AMF_VIDEO_ENCODER_HEVC_CAP_NUM_OF_STREAMS :
+                             video_format == 2 ? nullptr :  // AV1 reports no stream limit.
+                                                 AMF_VIDEO_ENCODER_CAP_NUM_OF_STREAMS;
+    const wchar_t *throughput = video_format == 1 ? AMF_VIDEO_ENCODER_HEVC_CAP_MAX_THROUGHPUT :
+                                video_format == 2 ? AMF_VIDEO_ENCODER_AV1_CAP_MAX_THROUGHPUT :
+                                                    AMF_VIDEO_ENCODER_CAP_MAX_THROUGHPUT;
+    amf_int64 value = 0;
+    if (streams && caps->GetProperty(streams, &value) == AMF_OK) {
+      if (const auto sessions = video::encoder_capacity_t::reported(value)) {
+        reported_capacity.encode_sessions = static_cast<std::uint32_t>(std::min<std::uint64_t>(*sessions, UINT32_MAX));
+      }
+    }
+    value = 0;
+    if (caps->GetProperty(throughput, &value) == AMF_OK) {
+      // The SDK documents MaxThroughput in 16x16 macroblocks; taken as per second.
+      reported_capacity.macroblocks_per_second = video::encoder_capacity_t::reported(value);
+    }
+  }
+
   bool
   amf_d3d11::set_ltr_property(const wchar_t *name, int64_t value) {
     auto res = encoder->SetProperty(name, value);
@@ -679,6 +705,7 @@ namespace amf {
     // Determine video format from client config
     video_format = client_config.videoFormat;
     current_config = client_config;
+    reported_capacity = {};
 
     // Initialize AMF library
     if (!init_amf_library()) return false;
@@ -763,6 +790,10 @@ namespace amf {
     if (res != AMF_OK) {
       BOOST_LOG(error) << "AMF: encoder Init failed after fallbacks, error: " << res;
       return false;
+    }
+
+    if (client_config.report_admission_capacity) {
+      read_admission_capacity();
     }
 
     if (video_format == 1) {
