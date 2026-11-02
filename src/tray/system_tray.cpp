@@ -58,6 +58,7 @@
   #include "src/globals.h"
   #include "system_tray_i18n.h"
   #include "tray_state.h"
+  #include "tray_dispatch.h"
   #include "version.h"
 
 using namespace std::literals;
@@ -269,26 +270,7 @@ namespace system_tray {
     }).detach();
   }
 
-  // 拓扑协调器的阻塞调用不能在托盘线程上执行：工作线程会通过 tray_update 同步 SendMessage 到托盘窗口
-  template <class F>
-  static void run_off_tray_thread(const char *action, F &&work) {
-    try {
-      std::thread([action, work = std::forward<F>(work)]() mutable {
-        try {
-          work();
-        }
-        catch (const std::exception &e) {
-          BOOST_LOG(error) << action << " failed: "sv << e.what();
-        }
-        catch (...) {
-          BOOST_LOG(error) << action << " failed with an unknown exception"sv;
-        }
-      }).detach();
-    }
-    catch (const std::exception &e) {
-      BOOST_LOG(error) << action << " could not start: "sv << e.what();
-    }
-  }
+  // 拓扑协调器的阻塞调用不能在托盘线程上执行（见 tray_dispatch.h）
 
   // 创建虚拟显示器回调
   auto tray_vdd_create_cb = [](struct tray_menu *item) {
