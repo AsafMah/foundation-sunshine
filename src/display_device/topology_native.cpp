@@ -937,6 +937,175 @@ namespace display_device::topology {
   }
 
   mode_change_outcome_t
+  native_executor_t::change_mode(const mutation_capability_t &capability, std::size_t index, const resolution_t &resolution) {
+    capability.require(operation_e::native_mode);
+    const auto refuse = [](std::string reason) {
+      return mode_change_outcome_t { mode_change_verdict_e::refused, std::nullopt, std::move(reason) };
+    };
+    const auto in_conflict = [this](std::string reason) {
+      conflict(reason);
+      return mode_change_outcome_t { mode_change_verdict_e::conflict, std::nullopt, std::move(reason) };
+    };
+    try {
+      if (health_.in_conflict) {
+        return refuse("The native topology is In conflict: " + health_.reason);
+      }
+      if (resolution.width == 0 || resolution.height == 0) {
+        return refuse("The requested resolution is empty");
+      }
+      const auto loaded = store_.load();
+      if (!loaded.present() || loaded.status != journal_load_status_e::loaded) {
+        return refuse("No virtual display of this run is present");
+      }
+      const auto &record = *loaded.record;
+      if (record.owner != owner_ || created_in_this_run_ != record.transaction) {
+        return refuse("The virtual display was not created by this run");
+      }
+      if (semantic_problem(record) || unresolved_step(record)) {
+        return refuse("The native journal does not prove its virtual displays");
+      }
+      if (index >= std::max<std::size_t>(record.owned_heads.size(), 1)) {
+        return refuse("The requested virtual display is not one this run created");
+      }
+      if (record.owned_heads.size() <= 1) {
+        return change_mode(capability, resolution);
+      }
+      const auto owned = owned_as_observed(record);
+      if (!owned) {
+        return refuse("The native journal does not prove its virtual displays");
+      }
+      const auto current = platform_.inventory();
+      if (!exact_head_set(platform_, current, *owned)) {
+        return refuse("The virtual displays no longer match the ones this run created");
+      }
+      const auto *head = find_unique(current, (*owned)[index].id);
+      if (!head || !head->layout) {
+        return refuse("The virtual display is not active");
+      }
+      const auto previous = head->layout->mode;
+      if (same_resolution(previous.resolution, resolution)) {
+        return { mode_change_verdict_e::unchanged, head->id, {} };
+      }
+
+      // The other heads of the set, exactly as listed now: same identity, state and mode afterwards.
+      std::vector<observed_display_t> siblings;
+      for (std::size_t i = 0; i < owned->size(); ++i) {
+        if (i == index) {
+          continue;
+        }
+        const auto *sibling = find_unique(current, (*owned)[i].id);
+        if (!sibling) {
+          return refuse("The virtual displays no longer match the ones this run created");
+        }
+        siblings.push_back(*sibling);
+      }
+      const auto siblings_unchanged = [&](const inventory_t &inventory) {
+        if (!lists_each(platform_, inventory, siblings) || virtual_heads(platform_, inventory).size() != owned->size()) {
+          return false;
+        }
+        return std::all_of(siblings.begin(), siblings.end(), [&](const observed_display_t &was) {
+          const auto *now = find_unique(inventory, was.id);
+          return now && now->info.device_state == was.info.device_state && now->layout.has_value() == was.layout.has_value() &&
+                 (!was.layout || (same_resolution(now->layout->mode.resolution, was.layout->mode.resolution) &&
+                                   same_refresh(now->layout->mode.refresh_rate, was.layout->mode.refresh_rate)));
+        });
+      };
+      const auto guid = head->head->guid;
+      const auto adapter = record.owned_heads[index].adapter;
+      const auto others = unmanaged_signature(platform_, current, record);
+      const auto unchanged_others = [&](const inventory_t &inventory) {
+        return unmanaged_signature(platform_, inventory, record) == others && siblings_unchanged(inventory);
+      };
+      // This run's head: its GUID once, on the journal's adapter, under an OS id nothing else carries.
+      // Anything less is not proven ours, so it is neither rolled back nor re-anchored.
+      const auto owned_head = [&](const inventory_t &inventory) -> const observed_display_t * {
+        if (!inventory.available) {
+          return nullptr;
+        }
+        const observed_display_t *found = nullptr;
+        for (const auto *listed : virtual_heads(platform_, inventory)) {
+          if (!listed->head || listed->head->driver != options_.driver || listed->head->guid != guid || listed->head->incarnation.value == 0) {
+            continue;
+          }
+          if (found) {
+            return nullptr;
+          }
+          found = listed;
+        }
+        if (!found || !found->adapter || *found->adapter != adapter || find_unique(inventory, found->id) != found) {
+          return nullptr;
+        }
+        return found;
+      };
+
+      auto target = previous;
+      target.resolution = resolution;
+      const auto changed = platform_.change_head_mode(capability, *head, target);
+      const auto after = platform_.inventory();
+      const auto *now = owned_head(after);
+      if (changed && settled(now, target, unchanged_others(after))) {
+        return re_anchor_head(record, index, *now, after, mode_change_verdict_e::applied, {});
+      }
+
+      auto why = changed ? std::string { "The virtual display did not take the requested mode" } :
+                           "Changing the virtual display mode failed: " + changed.error().detail;
+      const bool never_sent = !changed && changed.error().code != error_code_e::unknown_applied_state;
+      if (never_sent && settled(now, previous, unchanged_others(after))) {
+        return re_anchor_head(record, index, *now, after, mode_change_verdict_e::refused, std::move(why));
+      }
+      if (!now) {
+        return in_conflict(why + "; the virtual display can no longer be proven to be this host's");
+      }
+      const auto rolled = platform_.change_head_mode(capability, *now, previous);
+      const auto restored = platform_.inventory();
+      const auto *back = owned_head(restored);
+      if (rolled && settled(back, previous, unchanged_others(restored))) {
+        return re_anchor_head(record, index, *back, restored, mode_change_verdict_e::refused, why + "; the previous mode was restored");
+      }
+      return in_conflict(why + "; the previous mode could not be restored" + (rolled ? std::string {} : ": " + rolled.error().detail));
+    }
+    catch (const std::exception &error) {
+      return in_conflict(std::string { "Changing the virtual display mode failed: " } + error.what());
+    }
+    catch (...) {
+      return in_conflict("Changing the virtual display mode failed");
+    }
+  }
+
+  mode_change_outcome_t
+  native_executor_t::re_anchor_head(journal_record_t record, std::size_t index, const observed_display_t &head, const inventory_t &after,
+    mode_change_verdict_e verdict, std::string reason) {
+    const auto fail = [&](const std::string &detail) {
+      const auto full = (reason.empty() ? std::string {} : reason + "; ") + detail;
+      conflict(full);
+      return mode_change_outcome_t { mode_change_verdict_e::conflict, std::nullopt, full };
+    };
+    journal_step_t *created = nullptr;
+    std::size_t seen = 0;
+    for (auto &step : record.steps) {
+      if (step.operation == journal_operation_e::create_head && step.state == journal_step_state_e::observed && seen++ == index) {
+        created = &step;
+        break;
+      }
+    }
+    if (!created || index >= record.owned_heads.size() || !head.head) {
+      return fail("the native journal no longer names the virtual display it created");
+    }
+    auto &owned = record.owned_heads[index];
+    // The journal keeps its slot; it must not claim a head on another adapter, or one whose adapter is unknown.
+    if (!head.adapter || *head.adapter != owned.adapter) {
+      return fail("the virtual display is no longer on the adapter the native journal names");
+    }
+    created->display = head.id;
+    created->observed = after;
+    owned.identity = *head.head;
+    if (const auto saved = store_.save(record); !saved) {
+      return fail("the native journal could not record the virtual display as it is now: " + saved.error().detail);
+    }
+    return { verdict, head.id, std::move(reason) };
+  }
+
+  mode_change_outcome_t
   native_executor_t::re_anchor(journal_record_t record, const observed_display_t &head, const inventory_t &after,
     mode_change_verdict_e verdict, std::string reason) {
     auto created = std::find_if(record.steps.rbegin(), record.steps.rend(), [](const journal_step_t &step) {

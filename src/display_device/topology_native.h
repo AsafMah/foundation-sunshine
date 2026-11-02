@@ -234,6 +234,17 @@ namespace display_device::topology {
     mode_change_outcome_t
     change_mode(const mutation_capability_t &capability, const resolution_t &resolution);
 
+    /**
+     * @brief Change the resolution of one virtual head of this run's set; refresh is kept.
+     * @details `head` is the 0-based index in creation order. One owned head is exactly the
+     *          single-head change above. With several, the other heads must stay listed with the
+     *          same identity, state and mode, and no other display may appear, vanish or change
+     *          state; anything else is rolled back like the single-head change. A recreated head
+     *          is re-anchored in its own journal slot only.
+     */
+    mode_change_outcome_t
+    change_mode(const mutation_capability_t &capability, std::size_t head, const resolution_t &resolution);
+
     const native_health_t &
     health() const noexcept {
       return health_;
@@ -257,6 +268,11 @@ namespace display_device::topology {
     /** Point the journal's observed creation and owned head at `head` as listed in `after`. */
     mode_change_outcome_t
     re_anchor(journal_record_t record, const observed_display_t &head, const inventory_t &after,
+      mode_change_verdict_e verdict, std::string reason);
+
+    /** Point the `index`-th observed creation and owned head at `head` as listed in `after`. */
+    mode_change_outcome_t
+    re_anchor_head(journal_record_t record, std::size_t index, const observed_display_t &head, const inventory_t &after,
       mode_change_verdict_e verdict, std::string reason);
 
     /** In conflict: the journal is kept. */

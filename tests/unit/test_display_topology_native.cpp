@@ -3712,3 +3712,330 @@ TEST_F(NativeExecutor, ChangeModeIsRefusedWhileSeveralHeadsAreOwned) {
   EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
   EXPECT_EQ(platform.head_count(), 0u);
 }
+
+// --- GW-H1: per-head mode change on a set of heads (host only, provisional pending G1 hardware) ---
+
+namespace {
+  dt::mode_change_outcome_t
+  change_head_with(dt::native_executor_t &executor, std::size_t head, unsigned width, unsigned height) {
+    dt::mode_change_outcome_t outcome;
+    with_capability(dt::command_kind_e::reconfigure, [&](const auto &capability) {
+      outcome = executor.change_mode(capability, head, { width, height });
+    }, true);
+    return outcome;
+  }
+
+  display_device::display_mode_t
+  mode_of(fake_platform_t &platform, const std::string &name) {
+    return find(platform.host, name).layout->mode;
+  }
+
+  std::vector<const dt::journal_step_t *>
+  observed_creates(const dt::journal_record_t &record) {
+    std::vector<const dt::journal_step_t *> steps;
+    for (const auto &step : record.steps) {
+      if (step.operation == dt::journal_operation_e::create_head && step.state == step_e::observed) steps.push_back(&step);
+    }
+    return steps;
+  }
+}  // namespace
+
+TEST_F(NativeExecutor, ChangeModeOfOneOfTwoHeadsLeavesTheOtherAlone) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  const auto first = mode_of(platform, "vdd-1");
+  const auto before = store.record();
+  ASSERT_TRUE(before);
+  const auto outcome = change_head_with(executor, 1, 2560, 1440);
+  ASSERT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::applied));
+  EXPECT_EQ(outcome.display, dt::os_display_id_t { "vdd-2" });
+  ASSERT_EQ(platform.mode_requests.size(), 1u);
+  EXPECT_EQ(platform.mode_requests[0].first, dt::os_display_id_t { "vdd-2" });
+  EXPECT_EQ(resolution_of(find(platform.host, "vdd-2")).width, 2560u);
+  EXPECT_EQ(resolution_of(find(platform.host, "vdd-2")).height, 1440u);
+  EXPECT_TRUE(same_mode(mode_of(platform, "vdd-1"), first));
+  EXPECT_EQ(platform.mode_requests[0].second.refresh_rate.numerator, first.refresh_rate.numerator);
+  EXPECT_FALSE(executor.health().in_conflict);
+  const auto after = store.record();
+  ASSERT_TRUE(after);
+  EXPECT_EQ(after->owned_heads, before->owned_heads);
+
+  ASSERT_TRUE(mode_verdict_is(change_head_with(executor, 0, 1280, 720), dt::mode_change_verdict_e::applied));
+  EXPECT_EQ(resolution_of(find(platform.host, "vdd-1")).width, 1280u);
+  EXPECT_EQ(resolution_of(find(platform.host, "vdd-2")).width, 2560u);
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(NativeExecutor, ChangeModeOfOneOfTwoHeadsToItsCurrentResolutionTouchesNothing) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  const auto current = resolution_of(find(platform.host, "vdd-2"));
+  const auto writes = log.host_writes();
+  const auto saves = store.saves;
+  const auto outcome = change_head_with(executor, 1, current.width, current.height);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::unchanged));
+  EXPECT_EQ(outcome.display, dt::os_display_id_t { "vdd-2" });
+  EXPECT_EQ(log.host_writes(), writes);
+  EXPECT_EQ(store.saves, saves);
+}
+
+TEST_F(NativeExecutor, ChangeModeOfAHeadOutsideTheOwnedSetTouchesNothing) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  const auto outcome = change_head_with(executor, 2, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::refused));
+  EXPECT_TRUE(mentions(outcome.reason, "not one this run created")) << outcome.reason;
+  EXPECT_TRUE(platform.mode_requests.empty());
+  EXPECT_FALSE(executor.health().in_conflict);
+  EXPECT_TRUE(mode_verdict_is(change_head_with(executor, 0, 0, 1440), dt::mode_change_verdict_e::refused));
+  EXPECT_TRUE(platform.mode_requests.empty());
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+}
+
+TEST_F(NativeExecutor, ChangeModeOfTheOnlyHeadByIndexIsTheSingleHeadChange) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  const auto beyond = change_head_with(executor, 1, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(beyond, dt::mode_change_verdict_e::refused));
+  EXPECT_TRUE(mentions(beyond.reason, "not one this run created")) << beyond.reason;
+  EXPECT_TRUE(platform.mode_requests.empty());
+  const auto outcome = change_head_with(executor, 0, 2560, 1440);
+  ASSERT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::applied));
+  EXPECT_EQ(outcome.display, dt::os_display_id_t { "vdd-1" });
+  EXPECT_EQ(resolution_of(the_head(platform)).width, 2560u);
+
+  // Index 0 of one head is the single-head change itself, refusals included.
+  platform.tamper = [](int, dt::inventory_t &inventory) { inventory.displays.push_back(virtual_display("another", 7680)); };
+  const auto by_index = change_head_with(executor, 0, 1920, 1080);
+  const auto single = change_with(executor, 1920, 1080);
+  platform.tamper = {};
+  EXPECT_TRUE(mode_verdict_is(by_index, dt::mode_change_verdict_e::refused));
+  EXPECT_EQ(by_index.reason, single.reason);
+  EXPECT_EQ(platform.mode_requests.size(), 1u);
+
+  auto none = make_executor();
+  const auto foreign = change_head_with(none, 0, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(foreign, dt::mode_change_verdict_e::refused));
+  EXPECT_TRUE(mentions(foreign.reason, "not created by this run")) << foreign.reason;
+}
+
+TEST_F(NativeExecutor, ChangeModeOfOneOfTwoHeadsRefusesASetThatNoLongerMatches) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  const std::vector<std::pair<std::string, std::function<void(dt::inventory_t &)>>> changes {
+    { "a third head", [](dt::inventory_t &inventory) { inventory.displays.push_back(virtual_display("another", 7680)); } },
+    { "the other head is gone", [](dt::inventory_t &inventory) { remove_display(inventory, "vdd-1"); } },
+    { "another display shares the other head's id", [](dt::inventory_t &inventory) {
+        auto clash = inventory.displays.front();
+        clash.id = dt::os_display_id_t { "vdd-1" };
+        inventory.displays.push_back(clash);
+      } },
+    { "the other head re-arrived", [](dt::inventory_t &inventory) {
+        for (auto &display : inventory.displays) {
+          if (display.id.value == "vdd-1") display.head->incarnation = dt::head_incarnation_t { display.head->incarnation.value + 1 };
+        }
+      } },
+  };
+  for (const auto &[name, change] : changes) {
+    SCOPED_TRACE(name);
+    platform.tamper = [&](int, dt::inventory_t &inventory) { change(inventory); };
+    const auto outcome = change_head_with(executor, 1, 2560, 1440);
+    EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::refused));
+    EXPECT_TRUE(mentions(outcome.reason, "no longer match")) << outcome.reason;
+  }
+  platform.tamper = {};
+  EXPECT_TRUE(platform.mode_requests.empty());
+  EXPECT_FALSE(executor.health().in_conflict);
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+}
+
+TEST_F(NativeExecutor, ChangeModeOfOneOfTwoHeadsFollowsAHeadTheDriverRecreated) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  const auto before = store.record();
+  ASSERT_TRUE(before);
+  platform.recreate_on_mode = true;
+  const auto outcome = change_head_with(executor, 0, 2560, 1440);
+  ASSERT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::applied));
+  EXPECT_EQ(outcome.display, dt::os_display_id_t { "vdd-3" });
+
+  const auto record = store.record();
+  ASSERT_TRUE(record);
+  ASSERT_EQ(record->owned_heads.size(), 2u);
+  EXPECT_EQ(record->owned_heads[0].identity.incarnation, dt::head_incarnation_t { 2 });
+  EXPECT_EQ(record->owned_heads[1], before->owned_heads[1]);
+  const auto created = observed_creates(*record);
+  ASSERT_EQ(created.size(), 2u);
+  EXPECT_EQ(created[0]->display, dt::os_display_id_t { "vdd-3" });
+  EXPECT_EQ(created[1]->display, dt::os_display_id_t { "vdd-2" });
+
+  // The re-anchored journal still proves both heads, for further changes and for restore.
+  EXPECT_TRUE(mode_verdict_is(change_head_with(executor, 1, 1280, 720), dt::mode_change_verdict_e::applied));
+  EXPECT_TRUE(mode_verdict_is(change_head_with(executor, 0, 1920, 1080), dt::mode_change_verdict_e::applied));
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(NativeExecutor, ChangeModeOfOneOfTwoHeadsThatAlsoChangesTheOtherRollsBack) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  const auto first = mode_of(platform, "vdd-1");
+  const auto second = mode_of(platform, "vdd-2");
+  platform.on_change_mode = [&](std::size_t attempt, const auto &head, const auto &target) -> dt::result_t<void> {
+    platform.set_head_mode(head.id.value, target, false);
+    // The driver resized the other head too, and undoes both on the rollback.
+    platform.set_head_mode("vdd-1", attempt == 1 ? mode(1280, 720) : first, false);
+    return {};
+  };
+  const auto outcome = change_head_with(executor, 1, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::refused));
+  EXPECT_TRUE(mentions(outcome.reason, "did not take the requested mode")) << outcome.reason;
+  EXPECT_TRUE(mentions(outcome.reason, "previous mode was restored")) << outcome.reason;
+  ASSERT_EQ(platform.mode_requests.size(), 2u);
+  EXPECT_EQ(platform.mode_requests[1].first, dt::os_display_id_t { "vdd-2" });
+  EXPECT_TRUE(same_mode(platform.mode_requests[1].second, second));
+  EXPECT_TRUE(same_mode(mode_of(platform, "vdd-1"), first));
+  EXPECT_TRUE(same_mode(mode_of(platform, "vdd-2"), second));
+  EXPECT_FALSE(executor.health().in_conflict);
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+}
+
+TEST_F(NativeExecutor, ChangeModeOfOneOfTwoHeadsThatDisturbsTheOtherIsInConflictAndKeepsThem) {
+  const std::vector<std::pair<std::string, std::function<void(fake_platform_t &)>>> disturbances {
+    { "resized", [](fake_platform_t &platform) { platform.set_head_mode("vdd-1", mode(1280, 720), false); } },
+    { "refresh", [](fake_platform_t &platform) {
+        auto shown = find(platform.host, "vdd-1").layout->mode;
+        shown.refresh_rate = { 30, 1 };
+        platform.set_head_mode("vdd-1", shown, false);
+      } },
+    { "gone", [](fake_platform_t &platform) { remove_display(platform.host, "vdd-1"); } },
+    { "re-arrived", [](fake_platform_t &platform) { re_arrive_first(platform); } },
+    { "turned off", [](fake_platform_t &platform) {
+        auto &other = find(platform.host, "vdd-1");
+        other.info.device_state = state_e::inactive;
+        other.layout.reset();
+      } },
+    { "made primary", [](fake_platform_t &platform) { find(platform.host, "vdd-1").info.device_state = state_e::primary; } },
+    { "a third head", [](fake_platform_t &platform) { platform.host.displays.push_back(virtual_display("another", 7680)); } },
+    { "a physical display", [](fake_platform_t &platform) { find(platform.host, "os-B").info.device_state = state_e::inactive; } },
+  };
+  for (const auto &[name, disturb] : disturbances) {
+    SCOPED_TRACE(name);
+    event_log_t trace;
+    fake_platform_t host { trace };
+    memory_store_t journal { trace };
+    dt::native_executor_t run { journal, host, { next_uuid, 2, driver() } };
+    ASSERT_TRUE(verdict_is(prepare_heads(run), native_verdict_e::ok));
+    host.on_change_mode = [&](std::size_t attempt, const auto &head, const auto &target) -> dt::result_t<void> {
+      host.set_head_mode(head.id.value, target, false);
+      if (attempt == 1) disturb(host);
+      return {};
+    };
+    const auto outcome = change_head_with(run, 1, 2560, 1440);
+    EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::conflict));
+    EXPECT_TRUE(mentions(outcome.reason, "could not be restored")) << outcome.reason;
+    EXPECT_EQ(host.mode_requests.size(), 2u) << "the change is rolled back once";
+    EXPECT_TRUE(run.health().in_conflict);
+    EXPECT_TRUE(journal.bytes);
+    EXPECT_FALSE(trace.contains("remove_all_heads"));
+  }
+}
+
+TEST_F(NativeExecutor, ChangeModeOfOneOfTwoHeadsThatFailsWithoutEffectKeepsBoth) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  const auto first = mode_of(platform, "vdd-1");
+  const auto second = mode_of(platform, "vdd-2");
+  platform.on_change_mode = [](std::size_t, const auto &, const auto &) -> dt::result_t<void> { return failure("driver busy"); };
+  const auto outcome = change_head_with(executor, 1, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::refused));
+  EXPECT_TRUE(mentions(outcome.reason, "driver busy")) << outcome.reason;
+  EXPECT_EQ(platform.mode_requests.size(), 1u);
+  EXPECT_TRUE(same_mode(mode_of(platform, "vdd-1"), first));
+  EXPECT_TRUE(same_mode(mode_of(platform, "vdd-2"), second));
+  EXPECT_FALSE(executor.health().in_conflict);
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+}
+
+TEST_F(NativeExecutor, ChangeModeOfOneOfTwoHeadsWithAnUncertainOutcomeRollsBack) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  const auto second = mode_of(platform, "vdd-2");
+  platform.on_change_mode = [&](std::size_t attempt, const auto &head, const auto &target) -> dt::result_t<void> {
+    if (attempt == 1) return std::unexpected(dt::error_t { dt::error_code_e::unknown_applied_state, "ioctl timed out", {} });
+    platform.set_head_mode(head.id.value, target, false);
+    return {};
+  };
+  const auto outcome = change_head_with(executor, 1, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::refused));
+  EXPECT_TRUE(mentions(outcome.reason, "previous mode was restored")) << outcome.reason;
+  ASSERT_EQ(platform.mode_requests.size(), 2u);
+  EXPECT_TRUE(same_mode(platform.mode_requests[1].second, second));
+  EXPECT_FALSE(executor.health().in_conflict);
+}
+
+TEST_F(NativeExecutor, ChangeModeOfOneOfTwoHeadsThatLosesItIsInConflictWithoutRollback) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  platform.on_change_mode = [&](std::size_t, const auto &, const auto &) -> dt::result_t<void> {
+    remove_display(platform.host, "vdd-2");
+    return failure("head vanished");
+  };
+  const auto outcome = change_head_with(executor, 1, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::conflict));
+  EXPECT_TRUE(mentions(outcome.reason, "can no longer be proven")) << outcome.reason;
+  EXPECT_EQ(platform.mode_requests.size(), 1u);
+  EXPECT_TRUE(executor.health().in_conflict);
+}
+
+TEST_F(NativeExecutor, ChangeModeOfOneOfTwoHeadsNeverTouchesOrClaimsAHeadOnAnotherAdapterOrId) {
+  const std::vector<std::pair<std::string, std::function<void(fake_platform_t &, const std::string &)>>> moves {
+    { "another adapter", [](fake_platform_t &platform, const std::string &name) { find(platform.host, name).adapter = dt::adapter_luid_t { 8 }; } },
+    { "no adapter", [](fake_platform_t &platform, const std::string &name) { find(platform.host, name).adapter.reset(); } },
+    { "the other head's id", [](fake_platform_t &platform, const std::string &name) { find(platform.host, name).id = dt::os_display_id_t { "vdd-1" }; } },
+  };
+  for (const bool disturb_sibling : { false, true }) {
+    for (const auto &[name, move] : moves) {
+      SCOPED_TRACE(name + (disturb_sibling ? " with the other head resized" : ""));
+      event_log_t trace;
+      fake_platform_t host { trace };
+      memory_store_t journal { trace };
+      dt::native_executor_t run { journal, host, { next_uuid, 2, driver() } };
+      ASSERT_TRUE(verdict_is(prepare_heads(run), native_verdict_e::ok));
+      const auto before = journal.record();
+      ASSERT_TRUE(before);
+      host.on_change_mode = [&](std::size_t attempt, const auto &head, const auto &target) -> dt::result_t<void> {
+        host.set_head_mode(head.id.value, target, attempt == 1);
+        if (attempt != 1) return {};
+        move(host, "vdd-3");
+        if (disturb_sibling) host.set_head_mode("vdd-1", mode(1280, 720), false);
+        return {};
+      };
+      const auto outcome = change_head_with(run, 1, 2560, 1440);
+      EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::conflict));
+      EXPECT_TRUE(mentions(outcome.reason, "can no longer be proven")) << outcome.reason;
+      EXPECT_EQ(host.mode_requests.size(), 1u) << "no rollback is sent to a head that is not proven ours";
+      const auto after = journal.record();
+      ASSERT_TRUE(after);
+      EXPECT_EQ(after->owned_heads, before->owned_heads);
+      EXPECT_EQ(after->steps, before->steps);
+      EXPECT_TRUE(run.health().in_conflict);
+    }
+  }
+}
+
+TEST_F(NativeExecutor, ChangeModeOfOneOfTwoHeadsThatThrowsIsInConflict) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  platform.on_change_mode = [](std::size_t, const auto &, const auto &) -> dt::result_t<void> { throw std::runtime_error { "edge exploded" }; };
+  const auto outcome = change_head_with(executor, 1, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::conflict));
+  EXPECT_TRUE(mentions(outcome.reason, "edge exploded"));
+  EXPECT_TRUE(executor.health().in_conflict);
+}
+
+TEST_F(NativeExecutor, ChangeModeOfOneHeadNeedsAManagedReconfigure) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  for (const bool managed_mode : { false, true }) {
+    for (const auto kind : { dt::command_kind_e::reconfigure, dt::command_kind_e::launch_prepare, dt::command_kind_e::native_restore }) {
+      if (managed_mode && kind == dt::command_kind_e::reconfigure) continue;
+      SCOPED_TRACE(std::string { dt::to_string(kind) } + (managed_mode ? "/managed" : "/legacy"));
+      with_capability(kind, [&](const auto &capability) {
+        EXPECT_THROW((void) executor.change_mode(capability, std::size_t { 1 }, { 2560, 1440 }), dt::capability_error_t);
+      }, managed_mode);
+    }
+  }
+  EXPECT_TRUE(platform.mode_requests.empty());
+}
