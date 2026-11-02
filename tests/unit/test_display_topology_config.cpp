@@ -78,3 +78,20 @@ TEST(DisplayTopologyConfig, AWebUiSaveKeepsTheProfile) {
   EXPECT_EQ(persisted.at("display_topology_profile"), profile);
   EXPECT_EQ(persisted.at("sunshine_name"), "new");
 }
+
+TEST(DisplayTopologyConfig, AWebUiSaveNeverPersistsTheReadOnlyStatus) {
+  temporary_topology_config_t file;
+  file.write("sunshine_name = old\n");
+
+  // The status block is loaded with the config, so a save posts it back too.
+  std::map<std::string, std::string> incoming {
+    { "sunshine_name", "new" },
+    { "display_topology", R"({"desired":"managed","applied":"legacy","restart_required":"true"})" },
+  };
+  ASSERT_TRUE(config::update_full_config(incoming));
+
+  const auto persisted = config::parse_config(file.read());
+  EXPECT_FALSE(persisted.contains("display_topology"));
+  EXPECT_FALSE(persisted.contains("display_topology_profile"));
+  EXPECT_EQ(persisted.at("sunshine_name"), "new");
+}

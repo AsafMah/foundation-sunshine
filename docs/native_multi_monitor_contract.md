@@ -560,9 +560,12 @@ comes from the existing planner/formatter.
 Seven actual-encoder fixtures use a link-time fake transport, with no native
 driver implementation linked. Sixteen mutations fail the intended assertions,
 including exact 2047-character acceptance and 2048-character rejection. This
-closes the arbitrary-string API, not topology ownership: capability propagation
-through VDD helpers/transport, cursor persistence and every other raw setter is
-still pending. No new driver protocol or hardware operation was introduced.
+closes the arbitrary-string API, not topology ownership. The ongoing raw-boundary
+conversion additionally requires the original worker capability through encoding
+and the private immutable transport envelope. Fourteen fake-edge cases cover
+typed requests and the actual native transport guards; fifteen authority
+mutations fail their intended assertions. No new driver protocol or hardware
+operation was introduced.
 
 The standalone Windows settings-policy target compiles the actual settings and
 topology policy against fake display, session, audio and color-profile edges.
@@ -581,9 +584,45 @@ field restoration; managed reset must still bypass legacy restoration completely
 Existing session callers explicitly retain their former allow/suppress choices.
 The new suppression fixtures fail before propagation is added, including the
 nested-error path, and the API fixture detects restored permissive defaults.
-These are real-policy software checks, not proof that the future runtime selects
-the restrictive policy, that raw setters are capability-gated, or that hardware
-recovery works.
+The current raw conversion adds capability checks at settings apply/revert/reset
+and baseline loading. Managed reset forgets persistence without invoking legacy
+restoration. Sixteen settings cases now include loading an actual temporary JSON
+baseline before a later legacy apply, so the first baseline is not replaced.
+These are real-policy software checks, not proof that the unfinished runtime
+selects the restrictive policy or that hardware recovery works.
+
+Actual Windows topology/mode/HDR/primary setter entry and private rollback
+guards have four fake-edge cases and eleven assertion-killed mutations.
+Unavailable fake inventory and hard-failing CCD leaves prevent hardware access;
+these cases do not demonstrate successful CCD changes. Five actual color-profile
+cases use fake WCS functions, inventory and impersonation. Nine mutations fail
+assertions; removing one outer guard is equivalent to its immediately invoked
+helper's identical guard and is not counted as a kill.
+
+The real coordinated retry timer separates stable request identity from attempt
+generation, retains receipts through observer completion, and takes the session
+mutex only on the mutation worker. Unlock only accelerates the current request.
+Callback self-replacement and destruction cannot invalidate in-flight snapshots;
+external listeners drain before timer destruction. Seven timer cases plus the
+existing seventeen route cases pass, with ten assertion-killed timer mutations.
+
+The converted actual session loads cold-start persistence before restoration and
+registers deferred startup restoration with the coordinator. Ordinary polling
+and unlock request that restricted continuation instead of borrowing startup
+authority. Six actual-session cases use fake settings, VDD and OS edges; seven
+mutations detect lost baseline loading, wrong continuation, incomplete reset,
+unauthorized access, suppression violations and a broken unlock dispatch.
+
+The actual VDD utilities now invalidate a monotonic generation for every
+authorized create/destroy attempt, including failed and no-op attempts. Toggle
+preparation, worker mutation and dedicated-thread confirmation are separate;
+the worker returns the generation and pre-create physical baseline. Debounce
+rollback is identity-matched, and delayed followups carry the original
+generation. Ten fake-edge utility/UI cases pass. Of thirty-eight mutations,
+one initially survived a redundant stale check; a strengthened reappeared-head
+fixture then killed it. All thirty-eight have assertion-failure evidence.
+Production toggle dispatch, timer-driven cleanup policy and native dialog
+behavior remain unqualified until runtime wiring and authorized live checks.
 
 The ticket manager also supports a short binding check before publication or
 replacement, under its mutex and after capacity checks. A refused or throwing
@@ -618,11 +657,21 @@ shutdown reports an unsubmitted/skipped restore as stopped. A non-final stream
 does not receive a receipt that would wait for other streams to end. Production
 join watchdogs still need to retain and await these receipts.
 
-Production `session_t`, launch/RTSP lifecycle, Windows mutation paths and the
-administrator profile/status surface do not yet call the coordinator.
-Coordinator routing is not enabled; invalid driver requests now fail before
-transport while valid requests retain their protocol. G1 software evidence remains
-incomplete, and its manual N=1 hardware check remains blocked on GH consent.
+The raw/session signature conversion is complete: `sunshine` and `test_sunshine`
+build and link. With `display_topology_profile` blank, production keeps the
+legacy path unchanged. A non-blank profile routes every launch/resume through the
+coordinator: the first stream prepares the native target and probes it exactly,
+later streams join the recorded target, and capture fails closed on that display
+(no fallback display, manual switches ignored). Slow app starts are held, not
+expired, for both owners and joiners. Stream end releases the attachment, and the
+coordinator restores after the last video. `/api/config` reports a read-only
+`display_topology` block: `desired` (`legacy`/`managed`/`invalid`, with
+`desired_error`) for the saved setting, `applied` (`legacy`/`managed`/
+`in_conflict`) for the setting this process latched, `restart_required`,
+`journal_present`, `reason` and `attachments`. A Web UI save never persists it.
+There is no profile editor before G2. All of this is software evidence against
+fakes. G1 remains incomplete until the manual N=1 hardware check, which is
+blocked on GH consent.
 The user has authorized continuing safe software work after recording G1
 evidence without waiting for synchronous review; this does not waive GH, GD,
 GW or the requirement to report hardware-unverified milestones honestly.

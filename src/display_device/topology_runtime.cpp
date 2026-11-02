@@ -70,16 +70,29 @@ namespace display_device::coordinated {
 #endif
     }
 
+    struct latched_binding_t {
+      /** The setting this process latched, for the admin Desired/Applied report. */
+      std::string setting;
+      std::shared_ptr<topology::managed_native_t> binding;
+    };
+
     /**
-     * The `display_topology_profile` latched for this process: nullptr is legacy mode.
+     * The `display_topology_profile` latched for this process: a null binding is legacy mode.
      * Leaked with the lifecycle that uses it.
      */
+    const latched_binding_t &
+    latched() {
+      static auto *const instance = [] {
+        auto setting = config::video.display_topology_profile;
+        auto binding = topology::bind_native_profile(setting, make_native_executor);
+        return new latched_binding_t { std::move(setting), std::move(binding) };
+      }();
+      return *instance;
+    }
+
     const std::shared_ptr<topology::managed_native_t> &
     native_binding() {
-      static auto *const instance = new std::shared_ptr<topology::managed_native_t> {
-        topology::bind_native_profile(config::video.display_topology_profile, make_native_executor)
-      };
-      return *instance;
+      return latched().binding;
     }
 
     std::optional<topology::native_lifecycle_hooks_t>
@@ -192,6 +205,12 @@ namespace display_device::coordinated {
   topology::native_prepared_t
   prepare_native(const topology::mutation_capability_t &capability) {
     return lifecycle().prepare_native(capability);
+  }
+
+  topology::topology_status_report_t
+  status_report(std::string_view desired_setting) {
+    const auto status = coordinator().status();
+    return topology::describe_topology_status(desired_setting, latched().setting, status);
   }
 
   std::optional<std::string>

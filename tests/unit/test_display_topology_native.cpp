@@ -627,6 +627,79 @@ namespace {
 
 // --- Profile setting -------------------------------------------------------------
 
+namespace {
+  constexpr auto status_virtual = R"({"version":1,"monitors":[{"source":"virtual"}]})";
+
+  dt::coordinator_status_t
+  managed_status(bool in_conflict = false, std::string reason = {}) {
+    dt::coordinator_status_t status;
+    status.managed_mode = true;
+    status.native = { in_conflict, in_conflict, std::move(reason) };
+    return status;
+  }
+}  // namespace
+
+TEST(TopologyStatus, BlankSettingsReportLegacyWithoutRestart) {
+  const auto report = dt::describe_topology_status(" ", "", {});
+  EXPECT_EQ(report.desired, "legacy");
+  EXPECT_EQ(report.applied, "legacy");
+  EXPECT_FALSE(report.restart_required);
+  EXPECT_TRUE(report.desired_error.empty());
+}
+
+TEST(TopologyStatus, SavedProfileNeedsARestartToApply) {
+  const auto report = dt::describe_topology_status(status_virtual, "", {});
+  EXPECT_EQ(report.desired, "managed");
+  EXPECT_EQ(report.applied, "legacy");
+  EXPECT_TRUE(report.restart_required);
+}
+
+TEST(TopologyStatus, SameProfileWithOtherWhitespaceNeedsNoRestart) {
+  auto status = managed_status();
+  status.lease = dt::lease_snapshot_t {};
+  status.lease->attachments = 2;
+  const auto report = dt::describe_topology_status(
+    " { \"monitors\" : [ { \"source\" : \"virtual\" } ] , \"version\" : 1 } \n", status_virtual, status);
+  EXPECT_EQ(report.desired, "managed");
+  EXPECT_EQ(report.applied, "managed");
+  EXPECT_FALSE(report.restart_required);
+  EXPECT_EQ(report.attachments, 2u);
+}
+
+TEST(TopologyStatus, ClearingTheProfileNeedsARestartToReturnToLegacy) {
+  const auto report = dt::describe_topology_status("", status_virtual, managed_status());
+  EXPECT_EQ(report.desired, "legacy");
+  EXPECT_EQ(report.applied, "managed");
+  EXPECT_TRUE(report.restart_required);
+}
+
+TEST(TopologyStatus, InvalidSavedProfileIsReportedWithItsError) {
+  const auto report = dt::describe_topology_status(R"({"version":2,"monitors":[{"source":"virtual"}]})", "", {});
+  EXPECT_EQ(report.desired, "invalid");
+  EXPECT_TRUE(mentions(report.desired_error, "only version 1 is supported"));
+  EXPECT_TRUE(report.restart_required) << "a restart would leave the process In conflict";
+}
+
+TEST(TopologyStatus, InConflictProcessReportsItsHealth) {
+  const auto report = dt::describe_topology_status("not json", "not json", managed_status(true, "Invalid display_topology_profile: x"));
+  EXPECT_EQ(report.desired, "invalid");
+  EXPECT_EQ(report.applied, "in_conflict");
+  EXPECT_FALSE(report.restart_required) << "the same text was latched";
+  EXPECT_TRUE(report.journal_present);
+  EXPECT_EQ(report.reason, "Invalid display_topology_profile: x");
+
+  const auto edited = dt::describe_topology_status("not json!", "not json", managed_status(true));
+  EXPECT_TRUE(edited.restart_required);
+}
+
+TEST(TopologyStatus, ProfileForAnotherDisplayNeedsARestart) {
+  const auto report = dt::describe_topology_status(
+    R"({"version":1,"monitors":[{"source":"physical","display":"os-B"}]})",
+    R"({"version":1,"monitors":[{"source":"physical","display":"os-A"}]})", managed_status());
+  EXPECT_TRUE(report.restart_required);
+  EXPECT_EQ(report.attachments, 0u);
+}
+
 TEST(NativeProfile, BlankSettingMeansLegacyMode) {
   for (const std::string text : { "", " ", " \t\r\n " }) {
     const auto parsed = dt::parse_native_profile(text);

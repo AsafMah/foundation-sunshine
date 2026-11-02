@@ -262,4 +262,21 @@ namespace display_device::topology {
   std::shared_ptr<managed_native_t>
   bind_native_profile(std::string_view setting, const native_executor_factory_t &make_executor);
 
+  /** Read-only admin report: the saved setting (Desired) against the setting latched by this process (Applied). */
+  struct topology_status_report_t {
+    /** `legacy`, `managed` or `invalid` (a restart would leave the process In conflict). */
+    std::string desired;
+    std::string desired_error;
+    /** `legacy`, `managed` or `in_conflict`. */
+    std::string applied;
+    /** The saved setting means something other than the latched one. */
+    bool restart_required {};
+    bool journal_present {};
+    std::string reason;
+    std::size_t attachments {};
+  };
+
+  topology_status_report_t
+  describe_topology_status(std::string_view desired_setting, std::string_view applied_setting, const coordinator_status_t &status);
+
 }  // namespace display_device::topology

@@ -11,6 +11,7 @@
 #include "src/confighttp/common.h"
 #include "src/display_device/session.h"
 #include "src/display_device/to_string.h"
+#include "src/display_device/topology_runtime.h"
 #include "src/display_device/vdd_settings.h"
 #include "src/file_handler.h"
 #include "src/logging.h"
@@ -106,6 +107,19 @@ namespace confighttp::configuration {
       outputTree.put("version", PROJECT_VER);
 
       auto vars = config::parse_config(file_handler::read_file(config::sunshine.config_file.c_str()));
+      // The saved setting, with command-line overrides, is what a restart would latch.
+      std::string desired_topology;
+      const auto find_desired = [&desired_topology](const auto &settings) {
+        if (const auto it = settings.find("display_topology_profile"); it != settings.end()) {
+          desired_topology = it->second;
+        }
+      };
+      if (const auto effective = config::get_effective_config_snapshot()) {
+        find_desired(*effective);
+      }
+      else {
+        find_desired(vars);
+      }
       for (auto &[name, value] : vars) {
         // widget_token 是本地端点凭证,不回显明文;只暴露是否已配置
         if (name == "widget_token" || name == "mat_live_pipe" || name == "mat_live_producer") {
@@ -122,6 +136,17 @@ namespace confighttp::configuration {
       outputTree.put("nvidia_vsync.state", vsync.state);
       outputTree.put("nvidia_vsync.version", 1);
 #endif
+      {
+        const auto topology = display_device::coordinated::status_report(desired_topology);
+        outputTree.put("display_topology.version", 1);
+        outputTree.put("display_topology.desired", topology.desired);
+        outputTree.put("display_topology.desired_error", topology.desired_error);
+        outputTree.put("display_topology.applied", topology.applied);
+        outputTree.put("display_topology.restart_required", topology.restart_required);
+        outputTree.put("display_topology.journal_present", topology.journal_present);
+        outputTree.put("display_topology.reason", topology.reason);
+        outputTree.put("display_topology.attachments", topology.attachments);
+      }
       outputTree.put("active_encoder", video::active_encoder_name());
       if (auto frame_budget = nvenc::get_frame_budget_report()) {
         pt::ptree budget_node;

@@ -844,4 +844,30 @@ namespace display_device::topology {
     return { bound, &bound->managed };
   }
 
+  topology_status_report_t
+  describe_topology_status(std::string_view desired_setting, std::string_view applied_setting, const coordinator_status_t &status) {
+    topology_status_report_t report;
+    const auto desired = parse_native_profile(desired_setting);
+    const auto applied = parse_native_profile(applied_setting);
+    if (!desired) {
+      report.desired = "invalid";
+      report.desired_error = desired.error().detail;
+    }
+    else {
+      report.desired = desired->has_value() ? "managed" : "legacy";
+    }
+    if (!status.managed_mode) {
+      report.applied = "legacy";
+    }
+    else {
+      report.applied = status.native.in_conflict ? "in_conflict" : "managed";
+    }
+    // Compare meanings when both parse, so whitespace or key order alone needs no restart.
+    report.restart_required = desired && applied ? *desired != *applied : desired_setting != applied_setting;
+    report.journal_present = status.native.journal_present;
+    report.reason = status.native.reason;
+    report.attachments = status.lease ? status.lease->attachments : 0;
+    return report;
+  }
+
 }  // namespace display_device::topology

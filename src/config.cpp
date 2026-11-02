@@ -1962,6 +1962,7 @@ namespace config {
         "version",          // 版本号，只读
         "active_encoder",   // 运行时探测后实际使用的编码器，只读
         "nvidia_vsync",  // NVIDIA compatibility capability and runtime state, read-only
+        "display_topology",  // Native multi-monitor Desired/Applied status, read-only
         "active_nvenc_frame_budget",  // NVENC 帧预算护栏的运行时报告，只读
         "display_devices",  // 显示设备列表，运行时枚举，只读
         "adapters",         // 适配器列表，运行时枚举，只读
