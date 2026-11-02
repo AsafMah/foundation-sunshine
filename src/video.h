@@ -678,14 +678,17 @@ namespace video {
   namespace testing {
     using capture_display_factory_t = std::function<std::shared_ptr<platf::display_t>(platf::mem_type_e, const std::string &, const config_t &)>;
     using capture_display_names_t = std::function<std::vector<std::string>(platf::mem_type_e)>;
+    /** The adapter LUID an output is attached to; nullopt when unknown. */
+    using capture_display_adapter_t = std::function<std::optional<std::uint64_t>(const std::string &)>;
 
     /**
-     * Replace the platform display edge of the capture path (platf::display and
-     * platf::display_names). Empty functions restore the platform. Also selects
-     * the software encoder's device type when no encoder has been probed.
+     * Replace the platform display edge of the capture path (platf::display,
+     * platf::display_names and the output adapter lookup). Empty functions
+     * restore the platform. Also selects the software encoder's device type
+     * when no encoder has been probed.
      */
     void
-    set_capture_platform(capture_display_factory_t display, capture_display_names_t names);
+    set_capture_platform(capture_display_factory_t display, capture_display_names_t names, capture_display_adapter_t adapter = {});
 
     /** A capture session attached exactly as capture_async attaches, without an encoder. */
     class capture_attachment_t {
@@ -704,16 +707,21 @@ namespace video {
     std::string
     chosen_encoder_name();
 
-    /** Makes the first non-software encoder the chosen one for its lifetime. */
+    /**
+     * Makes the first non-software encoder the chosen one for its lifetime, as
+     * if it had been validated on the given adapter (0: no adapter recorded).
+     */
     class scoped_hardware_encoder_t {
     public:
-      scoped_hardware_encoder_t();
+      explicit scoped_hardware_encoder_t(std::uint64_t validated_adapter_luid);
       ~scoped_hardware_encoder_t();
       scoped_hardware_encoder_t(const scoped_hardware_encoder_t &) = delete;
       scoped_hardware_encoder_t &operator=(const scoped_hardware_encoder_t &) = delete;
 
     private:
       void *_previous;
+      void *_selected = nullptr;
+      std::optional<std::uint64_t> _previous_luid;
     };
   }  // namespace testing
 }  // namespace video

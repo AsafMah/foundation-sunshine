@@ -706,6 +706,13 @@ namespace platf {
       return {};
     }
 
+    // The adapter LUID this capture runs on (and encoders built from it use);
+    // 0 when the backend has no single adapter or does not report it.
+    virtual std::uint64_t
+    adapter_luid() const {
+      return 0;
+    }
+
     display_t() noexcept:
         offset_x { 0 },
         offset_y { 0 } {
@@ -944,6 +951,11 @@ namespace platf {
   std::vector<std::string>
   adapter_names();
 
+#ifdef _WIN32
+  /** The LUID of the adapter that enumerates this output; nullopt when no adapter does. */
+  std::optional<std::uint64_t>
+  display_adapter_luid(const std::string &display_name);
+#endif
   /**
    * @brief Check if GPUs/drivers have changed since the last call to this function.
    * @return `true` if a change has occurred or if it is unknown whether a change occurred.

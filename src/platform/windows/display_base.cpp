@@ -1451,6 +1451,33 @@ namespace platf {
     return display_names;
   }
 
+  std::optional<std::uint64_t>
+  display_adapter_luid(const std::string &display_name) {
+    dxgi::factory1_t factory;
+    if (FAILED(CreateDXGIFactory1(IID_IDXGIFactory1, (void **) &factory))) {
+      return std::nullopt;
+    }
+    const auto output_name = from_utf8(display_name);
+    dxgi::adapter_t::pointer adapter_p;
+    for (int x = 0; factory->EnumAdapters1(x, &adapter_p) != DXGI_ERROR_NOT_FOUND; ++x) {
+      dxgi::adapter_t adapter { adapter_p };
+      DXGI_ADAPTER_DESC1 adapter_desc;
+      if (FAILED(adapter->GetDesc1(&adapter_desc))) {
+        continue;
+      }
+      dxgi::output_t::pointer output_p {};
+      for (int y = 0; adapter->EnumOutputs(y, &output_p) != DXGI_ERROR_NOT_FOUND; ++y) {
+        dxgi::output_t output { output_p };
+        DXGI_OUTPUT_DESC desc;
+        if (SUCCEEDED(output->GetDesc(&desc)) && desc.AttachedToDesktop && output_name == desc.DeviceName) {
+          return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(adapter_desc.AdapterLuid.HighPart)) << 32) |
+                 static_cast<std::uint32_t>(adapter_desc.AdapterLuid.LowPart);
+        }
+      }
+    }
+    return std::nullopt;
+  }
+
   std::vector<std::string>
   adapter_names() {
     std::vector<std::string> adapter_names;

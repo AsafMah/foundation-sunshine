@@ -197,6 +197,11 @@ namespace platf::dxgi {
     std::string
     captured_display_name() const override;
 
+    std::uint64_t
+    adapter_luid() const override {
+      return capture_adapter_luid;
+    }
+
     bool captures_monitor = true;
 
     int

@@ -53,8 +53,8 @@ namespace {
 
   class fake_capture_platform_t {
   public:
-    explicit fake_capture_platform_t(std::map<std::string, int> sources):
-        _sources { std::move(sources) } {
+    explicit fake_capture_platform_t(std::map<std::string, int> sources, std::map<std::string, std::uint64_t> adapters = {}):
+        _sources { std::move(sources) }, _adapters { std::move(adapters) } {
       if (!mail::man) {
         mail::man = std::make_shared<safe::mail_raw_t>();
         _installed_mail = true;
@@ -75,11 +75,15 @@ namespace {
             names.push_back(name);
           }
           return names;
+        },
+        [this](const std::string &name) -> std::optional<std::uint64_t> {
+          const auto it = _adapters.find(name);
+          return it == _adapters.end() ? std::nullopt : std::optional { it->second };
         });
     }
 
     ~fake_capture_platform_t() {
-      video::testing::set_capture_platform({}, {});
+      video::testing::set_capture_platform({}, {}, {});
       if (_installed_mail) {
         mail::man.reset();
       }
@@ -93,6 +97,7 @@ namespace {
 
   private:
     std::map<std::string, int> _sources;
+    std::map<std::string, std::uint64_t> _adapters;
     std::mutex _lock;
     std::map<std::string, int> _opened;
     bool _installed_mail = false;
@@ -304,28 +309,80 @@ TEST(VideoLiveAdmission, NonExactTargetsNeverTakeTheLiveAdmission) {
   EXPECT_NE(video::probe_encoders(), 0);
 }
 
-TEST(VideoLiveAdmission, HardwareEncoderRefusesWithoutReprobing) {
+TEST(VideoLiveAdmission, HardwareEncoderRefusesAnUnknownAdapter) {
   fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } } };
   auto live = video::testing::attach_capture(exact_config("FAKE_A"));
   ASSERT_TRUE(live);
   expect_only(*live, 1);
-  video::testing::scoped_hardware_encoder_t hardware;
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
   const auto encoder = video::testing::chosen_encoder_name();
   ASSERT_NE(encoder, "software");
 
   EXPECT_NE(video::probe_encoders(video::probe_target_t { "FAKE_B", video::probe_target_policy_e::exact }), 0);
   EXPECT_EQ(video::last_encoder_probe_result.error, video::probe_error_e::no_working_encoder);
-  EXPECT_NE(video::last_encoder_probe_result.message.find("live hardware-encoded"), std::string::npos)
+  EXPECT_NE(video::last_encoder_probe_result.message.find("adapter"), std::string::npos)
     << video::last_encoder_probe_result.message;
   EXPECT_EQ(video::testing::chosen_encoder_name(), encoder);
   EXPECT_EQ(platform.opened("FAKE_B"), 0);
 }
 
+TEST(VideoLiveAdmission, HardwareEncoderAdmitsItsValidatedAdapter) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  expect_only(*live, 1);
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  const auto encoder = video::testing::chosen_encoder_name();
+
+  EXPECT_EQ(video::probe_encoders(video::probe_target_t { "FAKE_B", video::probe_target_policy_e::exact }), 0)
+    << video::last_encoder_probe_result.message;
+  EXPECT_EQ(video::testing::chosen_encoder_name(), encoder);
+  expect_only(*live, 1);
+  EXPECT_EQ(platform.opened("FAKE_B"), 0);
+}
+
+TEST(VideoLiveAdmission, HardwareEncoderRefusesAnotherAdapter) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x20 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  expect_only(*live, 1);
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  const auto encoder = video::testing::chosen_encoder_name();
+
+  EXPECT_NE(video::probe_encoders(video::probe_target_t { "FAKE_B", video::probe_target_policy_e::exact }), 0);
+  EXPECT_EQ(video::last_encoder_probe_result.error, video::probe_error_e::no_working_encoder);
+  EXPECT_NE(video::last_encoder_probe_result.message.find("adapter"), std::string::npos)
+    << video::last_encoder_probe_result.message;
+  EXPECT_EQ(video::testing::chosen_encoder_name(), encoder);
+}
+
+TEST(VideoLiveAdmission, HardwareEncoderRefusesWithoutAValidatedAdapter) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  expect_only(*live, 1);
+  video::testing::scoped_hardware_encoder_t hardware { 0 };
+
+  EXPECT_NE(video::probe_encoders(video::probe_target_t { "FAKE_B", video::probe_target_policy_e::exact }), 0);
+  EXPECT_EQ(video::last_encoder_probe_result.error, video::probe_error_e::no_working_encoder);
+}
+
+TEST(VideoLiveAdmission, SoftwareEncoderIgnoresAdapters) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x20 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  expect_only(*live, 1);
+  ASSERT_EQ(video::testing::chosen_encoder_name(), "software");
+
+  EXPECT_EQ(video::probe_encoders(video::probe_target_t { "FAKE_B", video::probe_target_policy_e::exact }), 0)
+    << video::last_encoder_probe_result.message;
+}
+
 TEST(VideoLiveAdmission, NamesOnlyPlatformStillBlocksTheGlobalProbe) {
-  video::testing::set_capture_platform({}, [](platf::mem_type_e) { return std::vector<std::string> { "FAKE_A" }; });
+  video::testing::set_capture_platform({}, [](platf::mem_type_e) { return std::vector<std::string> { "FAKE_A" }; }, {});
   const auto result = video::probe_encoders();
   const auto message = video::last_encoder_probe_result.message;
-  video::testing::set_capture_platform({}, {});
+  video::testing::set_capture_platform({}, {}, {});
 
   EXPECT_NE(result, 0);
   EXPECT_NE(message.find("test capture platform"), std::string::npos) << message;

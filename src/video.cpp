@@ -1789,6 +1789,46 @@ namespace video {
     std::mutex capture_platform_lock;
     testing::capture_display_factory_t capture_display_override;
     testing::capture_display_names_t capture_display_names_override;
+    testing::capture_display_adapter_t capture_display_adapter_override;
+
+    // The adapter each encoder last passed validation on; 0 when unknown.
+    std::mutex validated_adapter_lock;
+    std::map<const encoder_t *, std::uint64_t> validated_adapter_luids;
+
+    void
+    record_validated_adapter(const encoder_t &encoder, std::uint64_t adapter_luid) {
+      std::lock_guard lg { validated_adapter_lock };
+      validated_adapter_luids[&encoder] = adapter_luid;
+    }
+
+    std::uint64_t
+    validated_adapter(const encoder_t &encoder) {
+      std::lock_guard lg { validated_adapter_lock };
+      const auto it = validated_adapter_luids.find(&encoder);
+      return it == validated_adapter_luids.end() ? 0 : it->second;
+    }
+
+    std::optional<std::uint64_t>
+    capture_platform_display_adapter(const std::string &display_name) {
+      testing::capture_display_adapter_t adapter;
+      bool overridden;
+      {
+        std::lock_guard lg { capture_platform_lock };
+        adapter = capture_display_adapter_override;
+        overridden = capture_display_override || capture_display_names_override;
+      }
+      if (adapter) {
+        return adapter(display_name);
+      }
+      if (overridden) {
+        return std::nullopt;
+      }
+#ifdef _WIN32
+      return platf::display_adapter_luid(display_name);
+#else
+      return std::nullopt;
+#endif
+    }
 
     std::shared_ptr<platf::display_t>
     capture_platform_display(platf::mem_type_e type, const std::string &display_name, const config_t &config) {
@@ -4900,6 +4940,7 @@ namespace video {
     const std::string &probe_display_name) {
     std::shared_ptr<platf::display_t> disp;
     const auto configured_capture_backend = config::video.capture;
+    record_validated_adapter(encoder, 0);
 
     BOOST_LOG(info) << "Trying encoder ["sv << encoder.name << ']';
     auto fg = util::fail_guard([&]() {
@@ -5117,6 +5158,7 @@ namespace video {
       BOOST_LOG(warning) << encoder.name << ": hevc missing sps->vui parameters"sv;
     }
 
+    record_validated_adapter(encoder, disp ? disp->adapter_luid() : 0);
     fg.disable();
     return true;
   }
@@ -5143,17 +5185,6 @@ namespace video {
         };
         return -1;
       }
-      if (encoder != &software) {
-        // A hardware encoder is bound to one adapter; capture visibility alone
-        // does not prove it can consume this display. Refuse rather than reprobe.
-        last_encoder_probe_result = {
-          probe_error_e::no_working_encoder,
-          "Another display cannot be admitted beside a live hardware-encoded stream yet.",
-          "End the current stream, then try again."
-        };
-        BOOST_LOG(error) << "Live admission of output ["sv << target->output_name << "] refused for hardware encoder ["sv << encoder->name << "]"sv;
-        return -1;
-      }
       const auto display_name = resolve_capture_display(target->output_name, display_device::get_display_name(target->output_name));
       const auto available = capture_platform_display_names(encoder->platform_formats->dev_type);
       if (display_name.empty() || std::ranges::find(available, display_name) == available.end()) {
@@ -5164,6 +5195,22 @@ namespace video {
         };
         BOOST_LOG(error) << "Requested output ["sv << target->output_name << "] is unavailable for live admission"sv;
         return -1;
+      }
+      if (encoder != &software) {
+        // A hardware encoder runs on the capture display's device; it is only
+        // proven on the adapter it was validated on. Unknown on either side fails closed.
+        const auto validated = validated_adapter(*encoder);
+        const auto display_adapter = capture_platform_display_adapter(display_name);
+        if (validated == 0 || !display_adapter || *display_adapter != validated) {
+          last_encoder_probe_result = {
+            probe_error_e::no_working_encoder,
+            "The requested display is not on the adapter the live hardware encoder was validated on.",
+            "End the current stream, then try again."
+          };
+          BOOST_LOG(error) << "Live admission of output ["sv << display_name << "] refused for hardware encoder ["sv << encoder->name
+                           << "]: adapter agreement not established"sv;
+          return -1;
+        }
       }
       BOOST_LOG(info) << "Admitted exact output ["sv << display_name << "] beside a live stream with encoder ["sv << encoder->name << "]"sv;
       return 0;
@@ -5625,26 +5672,43 @@ namespace video {
       return chosen_encoder ? std::string { chosen_encoder->name } : std::string {};
     }
 
-    scoped_hardware_encoder_t::scoped_hardware_encoder_t():
+    scoped_hardware_encoder_t::scoped_hardware_encoder_t(std::uint64_t validated_adapter_luid):
         _previous { chosen_encoder } {
       for (auto *encoder : encoders) {
         if (encoder != &software) {
           chosen_encoder = encoder;
+          _selected = encoder;
+          std::lock_guard lg { validated_adapter_lock };
+          if (const auto it = validated_adapter_luids.find(encoder); it != validated_adapter_luids.end()) {
+            _previous_luid = it->second;
+          }
+          validated_adapter_luids[encoder] = validated_adapter_luid;
           break;
         }
       }
     }
 
     scoped_hardware_encoder_t::~scoped_hardware_encoder_t() {
+      if (_selected) {
+        std::lock_guard lg { validated_adapter_lock };
+        const auto *encoder = static_cast<const encoder_t *>(_selected);
+        if (_previous_luid) {
+          validated_adapter_luids[encoder] = *_previous_luid;
+        }
+        else {
+          validated_adapter_luids.erase(encoder);
+        }
+      }
       chosen_encoder = static_cast<encoder_t *>(_previous);
     }
 
     void
-    set_capture_platform(capture_display_factory_t display, capture_display_names_t names) {
+    set_capture_platform(capture_display_factory_t display, capture_display_names_t names, capture_display_adapter_t adapter) {
       {
         std::lock_guard lg { capture_platform_lock };
         capture_display_override = std::move(display);
         capture_display_names_override = std::move(names);
+        capture_display_adapter_override = std::move(adapter);
       }
       static encoder_t *probed_encoder = nullptr;
       static bool substituted = false;
