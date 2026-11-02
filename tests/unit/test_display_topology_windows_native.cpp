@@ -107,6 +107,49 @@ namespace {
       return { edge_delivery_e::delivered, {} };
     }
 
+    std::optional<std::vector<dt::edge_mode_t>>
+    list_modes(const std::string &display_name) override {
+      ++mode_reads;
+      if (modes_unreadable) return std::nullopt;
+      const bool driver_head = std::ranges::any_of(displays, [&](const auto &display) {
+        return display.kind == head_class_e::driver_head && display.info.display_name == display_name;
+      });
+      if (!driver_head) return std::nullopt;
+      return driver_modes;
+    }
+
+    dt::edge_send_t
+    set_mode(const dt::mutation_capability_t &capability, const dt::os_display_id_t &display, const display_device::display_mode_t &mode) override {
+      capability.require(dt::operation_e::write_display_modes);
+      mode_sets.emplace_back(display, mode);
+      if (on_set_mode) return on_set_mode(display, mode);
+      for (auto &listed : displays) {
+        if (listed.id == display && listed.layout) listed.layout->mode = mode;
+      }
+      return { edge_delivery_e::delivered, {} };
+    }
+
+    dt::edge_send_t
+    send_set_modes(const dt::mutation_capability_t &capability, const std::vector<dt::edge_mode_t> &modes, const dt::version_gate_t &gate) override {
+      capability.require(dt::operation_e::vdd_set_modes);
+      if (const auto refusal = gate(version)) {
+        refusals.push_back(*refusal);
+        return { edge_delivery_e::not_sent, *refusal };
+      }
+      plans.push_back(modes);
+      if (on_set_modes) return on_set_modes(modes);
+      driver_modes = modes;
+      // ZakoVDD recreates its heads: same ContainerId, a new arrival and OS identity.
+      for (auto &display : displays) {
+        if (display.kind != head_class_e::driver_head) continue;
+        const auto name = "vdd-r" + std::to_string(++recreated);
+        display.id = dt::os_display_id_t { name };
+        display.info.display_name = "\\\\.\\DISPLAY-" + name;
+        display.arrival += 100;
+      }
+      return { edge_delivery_e::delivered, {} };
+    }
+
     std::chrono::steady_clock::time_point
     now() override {
       return clock;
@@ -135,6 +178,14 @@ namespace {
     std::function<dt::edge_send_t(const dt::head_guid_t &)> on_create;
     std::function<dt::edge_send_t()> on_destroy;
     std::function<void(int)> before_snapshot;
+    std::vector<dt::edge_mode_t> driver_modes { { 1920, 1080, 60 }, { 1280, 720, 60 } };
+    bool modes_unreadable {};
+    int mode_reads {};
+    int recreated {};
+    std::vector<std::pair<dt::os_display_id_t, display_device::display_mode_t>> mode_sets;
+    std::vector<std::vector<dt::edge_mode_t>> plans;
+    std::function<dt::edge_send_t(const dt::os_display_id_t &, const display_device::display_mode_t &)> on_set_mode;
+    std::function<dt::edge_send_t(const std::vector<dt::edge_mode_t> &)> on_set_modes;
   };
 
   dt::windows_native_options_t
@@ -143,9 +194,14 @@ namespace {
   }
 
   void
-  with_capability(dt::command_kind_e kind, const std::function<void(const dt::mutation_capability_t &)> &body) {
+  with_capability(dt::command_kind_e kind, const std::function<void(const dt::mutation_capability_t &)> &body, bool managed_mode = false) {
     dt::coordinator_options_t coordinator_options;
+    coordinator_options.managed_mode = managed_mode;
     coordinator_options.probes.startup_restore_quiescent = [] { return true; };
+    if (managed_mode) {
+      coordinator_options.probes.active_streams = [] { return std::size_t {}; };
+      coordinator_options.native_restore = [](const auto &, const auto &) {};
+    }
     dt::coordinator_t coordinator { coordinator_options };
     bool ran = false;
     std::exception_ptr thrown;
@@ -228,6 +284,32 @@ namespace {
       std::optional<dt::result_t<void>> result;
       with_capability(dt::command_kind_e::native_restore, [&](const auto &capability) { result = platform.remove_all_heads(capability); });
       return *result;
+    }
+
+    dt::result_t<void>
+    change(const dt::observed_display_t &head, const display_device::display_mode_t &mode) {
+      std::optional<dt::result_t<void>> result;
+      with_capability(dt::command_kind_e::reconfigure, [&](const auto &capability) { result = platform.change_head_mode(capability, head, mode); }, true);
+      return *result;
+    }
+
+    /** Creates one head and returns it as the platform lists it. */
+    dt::observed_display_t
+    created_head() {
+      const auto created = create(id<dt::head_guid_t>(0x71));
+      if (!created) throw std::runtime_error { "the fixture head was not created" };
+      const auto inventory = platform.inventory();
+      const auto *head = find(inventory, "vdd-1");
+      if (!head) throw std::runtime_error { "the fixture head is not listed" };
+      return *head;
+    }
+
+    const dt::edge_display_t &
+    the_head() const {
+      for (const auto &display : edge.displays) {
+        if (display.kind == head_class_e::driver_head) return display;
+      }
+      throw std::runtime_error { "the fake lists no head" };
     }
 
     fake_edge_t edge;
@@ -513,6 +595,170 @@ TEST_F(WindowsNative, FieldWritesAreRefused) {
   EXPECT_EQ(edge.snapshots, 0);
   EXPECT_EQ(edge.destroys, 0);
   EXPECT_TRUE(edge.creates.empty());
+}
+
+// --- Head mode change (slice A, provisional pending G1 hardware) ---------------------
+
+namespace {
+  display_device::display_mode_t
+  mode(unsigned width, unsigned height, unsigned numerator = 60, unsigned denominator = 1) {
+    return { { width, height }, { numerator, denominator } };
+  }
+
+  ::testing::AssertionResult
+  fails_with(const dt::result_t<void> &result, dt::error_code_e code, const std::string &needle) {
+    if (result) return ::testing::AssertionFailure() << "the mode change succeeded";
+    if (result.error().code != code) {
+      return ::testing::AssertionFailure() << "wrong error code " << static_cast<int>(result.error().code) << ": " << result.error().detail;
+    }
+    return mentions(result.error().detail, needle);
+  }
+}  // namespace
+
+TEST_F(WindowsNative, ChangeModeAppliesAListedModeThroughTheOsOnly) {
+  const auto head = created_head();
+  ASSERT_TRUE(change(head, mode(1280, 720)));
+  EXPECT_TRUE(edge.plans.empty());
+  ASSERT_EQ(edge.mode_sets.size(), 1u);
+  EXPECT_EQ(edge.mode_sets[0].first, dt::os_display_id_t { "vdd-1" });
+  EXPECT_EQ(the_head().layout->mode.resolution.width, 1280u);
+  EXPECT_EQ(the_head().id, dt::os_display_id_t { "vdd-1" });
+}
+
+TEST_F(WindowsNative, ChangeModeListsAnUnofferedModeFirstAndFollowsTheRecreatedHead) {
+  const auto head = created_head();
+  ASSERT_TRUE(change(head, mode(2560, 1440)));
+  ASSERT_EQ(edge.plans.size(), 1u);
+  EXPECT_EQ(edge.plans[0], (std::vector<dt::edge_mode_t> { { 2560, 1440, 60 }, { 1920, 1080, 60 }, { 1280, 720, 60 } }));
+  ASSERT_EQ(edge.mode_sets.size(), 1u);
+  EXPECT_EQ(edge.mode_sets[0].first, dt::os_display_id_t { "vdd-r1" });
+  EXPECT_EQ(the_head().layout->mode.resolution.width, 2560u);
+  EXPECT_EQ(the_head().layout->mode.resolution.height, 1440u);
+  EXPECT_EQ(the_head().container, std::optional { id<dt::head_guid_t>(0x71).value });
+}
+
+TEST_F(WindowsNative, ChangeModeRoundsTheRefreshRateForTheDriverList) {
+  const auto head = created_head();
+  ASSERT_TRUE(change(head, mode(2560, 1440, 60000, 1001)));
+  ASSERT_EQ(edge.plans.size(), 1u);
+  EXPECT_EQ(edge.plans[0].front(), (dt::edge_mode_t { 2560, 1440, 60 }));
+  ASSERT_EQ(edge.mode_sets.size(), 1u);
+  EXPECT_EQ(edge.mode_sets[0].second.refresh_rate.numerator, 60000u);
+  EXPECT_EQ(edge.mode_sets[0].second.refresh_rate.denominator, 1001u);
+}
+
+TEST_F(WindowsNative, ChangeModeKeepsTheWholeDriverListAndDropsDuplicates) {
+  const auto head = created_head();
+  edge.driver_modes = { { 1920, 1080, 60 }, { 1280, 720, 60 }, { 1280, 720, 60 } };
+  ASSERT_TRUE(change(head, mode(2560, 1440)));
+  ASSERT_EQ(edge.plans.size(), 1u);
+  EXPECT_EQ(edge.plans[0], (std::vector<dt::edge_mode_t> { { 2560, 1440, 60 }, { 1920, 1080, 60 }, { 1280, 720, 60 } }));
+}
+
+TEST_F(WindowsNative, ChangeModeRefusesToEvictFromAFullDriverList) {
+  const auto head = created_head();
+  edge.driver_modes.clear();
+  for (unsigned i = 0; i < dt::max_driver_modes; ++i) edge.driver_modes.push_back({ 800 + i, 600, 60 });
+  EXPECT_TRUE(fails_with(change(head, mode(2560, 1440)), dt::error_code_e::resource_unavailable, "mode list is full"));
+  EXPECT_TRUE(edge.plans.empty());
+  EXPECT_TRUE(edge.mode_sets.empty());
+  edge.driver_modes.pop_back();
+  ASSERT_TRUE(change(head, mode(2560, 1440)));
+  ASSERT_EQ(edge.plans.size(), 1u);
+  EXPECT_EQ(edge.plans[0].size(), dt::max_driver_modes);
+}
+
+TEST_F(WindowsNative, ChangeModeThatWasNeverSentIsDefinite) {
+  const auto head = created_head();
+  edge.on_set_mode = [](const auto &, const auto &) { return dt::edge_send_t { edge_delivery_e::not_sent, "no capability" }; };
+  EXPECT_TRUE(fails_with(change(head, mode(1280, 720)), dt::error_code_e::resource_unavailable, "no capability"));
+}
+
+TEST_F(WindowsNative, ChangeModeThatShowsAnotherRefreshRateIsUnknown) {
+  const auto head = created_head();
+  edge.on_set_mode = [&](const auto &display, const auto &requested) {
+    for (auto &listed : edge.displays) {
+      if (listed.id == display && listed.layout) listed.layout->mode = { requested.resolution, { 120, 1 } };
+    }
+    return dt::edge_send_t { edge_delivery_e::delivered, {} };
+  };
+  EXPECT_TRUE(fails_with(change(head, mode(1280, 720)), dt::error_code_e::unknown_applied_state, "does not show 1280x720@60"));
+}
+
+TEST_F(WindowsNative, ChangeModeListIsGatedOnTheDriverVersion) {
+  const auto head = created_head();
+  edge.version = "99.0.0.1";
+  EXPECT_TRUE(fails_with(change(head, mode(2560, 1440)), dt::error_code_e::resource_unavailable, "not a tagged ZakoVDD release"));
+  EXPECT_TRUE(edge.plans.empty());
+  EXPECT_TRUE(edge.mode_sets.empty());
+  edge.version.reset();
+  EXPECT_TRUE(fails_with(change(head, mode(2560, 1440)), dt::error_code_e::resource_unavailable, "could not be read"));
+  EXPECT_TRUE(edge.mode_sets.empty());
+}
+
+TEST_F(WindowsNative, ChangeModeListDeliveryMapsToTheContract) {
+  const auto head = created_head();
+  edge.on_set_modes = [](const auto &) { return dt::edge_send_t { edge_delivery_e::not_sent, "no control interface" }; };
+  EXPECT_TRUE(fails_with(change(head, mode(2560, 1440)), dt::error_code_e::resource_unavailable, "no control interface"));
+  edge.on_set_modes = [](const auto &) { return dt::edge_send_t { edge_delivery_e::uncertain, "ioctl timed out" }; };
+  EXPECT_TRUE(fails_with(change(head, mode(2560, 1440)), dt::error_code_e::unknown_applied_state, "ioctl timed out"));
+  edge.on_set_modes = [](const auto &) { return dt::edge_send_t { edge_delivery_e::delivered, {} }; };
+  EXPECT_TRUE(fails_with(change(head, mode(2560, 1440)), dt::error_code_e::unknown_applied_state, "does not offer 2560x1440@60"));
+  EXPECT_TRUE(edge.mode_sets.empty());
+}
+
+TEST_F(WindowsNative, ChangeModeThatTheOsDoesNotShowIsUnknown) {
+  const auto head = created_head();
+  edge.on_set_mode = [](const auto &, const auto &) { return dt::edge_send_t { edge_delivery_e::uncertain, "SetDisplayConfig failed" }; };
+  EXPECT_TRUE(fails_with(change(head, mode(1280, 720)), dt::error_code_e::unknown_applied_state, "SetDisplayConfig failed"));
+  edge.on_set_mode = [](const auto &, const auto &) { return dt::edge_send_t { edge_delivery_e::delivered, {} }; };
+  EXPECT_TRUE(fails_with(change(head, mode(1280, 720)), dt::error_code_e::unknown_applied_state, "does not show 1280x720@60"));
+  EXPECT_EQ(the_head().layout->mode.resolution.width, 1920u);
+}
+
+TEST_F(WindowsNative, ChangeModeNeedsReadableModesAndAHeadIdentity) {
+  const auto head = created_head();
+  edge.modes_unreadable = true;
+  EXPECT_TRUE(fails_with(change(head, mode(1280, 720)), dt::error_code_e::resource_unavailable, "could not be read"));
+  edge.modes_unreadable = false;
+  auto anonymous = head;
+  anonymous.head.reset();
+  EXPECT_TRUE(fails_with(change(anonymous, mode(1280, 720)), dt::error_code_e::missing_identity, "not a virtual display head"));
+  EXPECT_TRUE(fails_with(change(head, mode(0, 720)), dt::error_code_e::unsupported_mode, "empty"));
+  EXPECT_TRUE(edge.plans.empty());
+  EXPECT_TRUE(edge.mode_sets.empty());
+}
+
+TEST_F(WindowsNative, ChangeModeIsOnlyForAManagedReconfigure) {
+  const auto head = created_head();
+  for (const auto kind : { dt::command_kind_e::reconfigure, dt::command_kind_e::launch_prepare }) {
+    with_capability(kind, [&](const auto &capability) {
+      EXPECT_THROW((void) platform.change_head_mode(capability, head, mode(2560, 1440)), dt::capability_error_t);
+    });
+  }
+  EXPECT_TRUE(edge.plans.empty());
+  EXPECT_TRUE(edge.mode_sets.empty());
+}
+
+TEST_F(WindowsNative, TheExecutorResizesItsHeadAcrossARecreationAndStillRemovesIt) {
+  memory_store_t store;
+  dt::native_executor_t executor { store, platform, { next_uuid, 2, driver() } };
+  dt::native_outcome_t prepared;
+  with_capability(dt::command_kind_e::launch_prepare, [&](const auto &capability) {
+    prepared = executor.prepare(capability, { dt::native_profile_t::source_e::virtual_head, {} });
+  }, true);
+  ASSERT_EQ(prepared.verdict, native_verdict_e::ok) << prepared.reason;
+  dt::mode_change_outcome_t changed;
+  with_capability(dt::command_kind_e::reconfigure, [&](const auto &capability) {
+    changed = executor.change_mode(capability, { 2560, 1440 });
+  }, true);
+  ASSERT_EQ(changed.verdict, dt::mode_change_verdict_e::applied) << changed.reason;
+  EXPECT_EQ(changed.display, dt::os_display_id_t { "vdd-r1" });
+  dt::native_outcome_t restored;
+  with_capability(dt::command_kind_e::native_restore, [&](const auto &capability) { restored = executor.restore(capability); }, true);
+  EXPECT_EQ(restored.verdict, native_verdict_e::ok) << restored.reason;
+  EXPECT_EQ(edge.destroys, 1);
+  EXPECT_FALSE(store.bytes);
 }
 
 TEST_F(WindowsNative, TheOptionsMustNameADriverAndAVirtualName) {

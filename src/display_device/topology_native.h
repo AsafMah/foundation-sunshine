@@ -88,6 +88,15 @@ namespace display_device::topology {
     virtual result_t<void>
     apply_fields(const mutation_capability_t &capability, const os_display_id_t &display, const managed_values_t &values) final;
 
+    /**
+     * Put the virtual head `head` (as last observed) in `mode`, then wait (bounded) for it to be
+     * listed with that resolution. The driver may recreate the head to do so: same GUID, new
+     * incarnation, possibly a new OS identity. An error leaves the applied state unknown, so the
+     * caller re-observes the host.
+     */
+    virtual result_t<void>
+    change_head_mode(const mutation_capability_t &capability, const observed_display_t &head, const display_mode_t &mode) final;
+
   protected:
     // Keep concrete hooks nonpublic and carry the capability through to raw setters.
     // The entry guards check authority, not proof that a head belongs to this request.
@@ -99,6 +108,9 @@ namespace display_device::topology {
 
     virtual result_t<void>
     do_apply_fields(const mutation_capability_t &capability, const os_display_id_t &display, const managed_values_t &values) = 0;
+
+    virtual result_t<void>
+    do_change_head_mode(const mutation_capability_t &capability, const observed_display_t &head, const display_mode_t &mode) = 0;
   };
 
   enum class native_verdict_e : std::uint8_t {
@@ -124,6 +136,27 @@ namespace display_device::topology {
   struct native_outcome_t {
     native_verdict_e verdict { native_verdict_e::ok };
     std::optional<native_target_t> target;
+    std::string reason;
+  };
+
+  enum class mode_change_verdict_e : std::uint8_t {
+    /** The head now has the requested resolution; the journal names it as it is now. */
+    applied,
+    /** The head already had the requested resolution; nothing was written. */
+    unchanged,
+    /** The head keeps its previous mode (verified); the journal and health are unchanged. */
+    refused,
+    /** The head's state cannot be proven; the journal is kept and health is In conflict. */
+    conflict,
+  };
+
+  std::string_view
+  to_string(mode_change_verdict_e verdict) noexcept;
+
+  struct mode_change_outcome_t {
+    mode_change_verdict_e verdict { mode_change_verdict_e::refused };
+    /** The head's OS identity afterwards (set for applied, unchanged and a verified refusal). */
+    std::optional<os_display_id_t> display;
     std::string reason;
   };
 
@@ -167,6 +200,17 @@ namespace display_device::topology {
     native_health_t
     reset(const mutation_capability_t &capability);
 
+    /**
+     * @brief Change the resolution of the one virtual head this run created; refresh is kept.
+     * @details Only for a head this executor created in its current transaction and still
+     *          proves as the sole matching head. A failed change is rolled back to the previous
+     *          mode and re-verified: verified is a refusal that leaves health alone, otherwise
+     *          In conflict. A recreated head (same GUID) is re-anchored in the journal so
+     *          restore still proves and removes it.
+     */
+    mode_change_outcome_t
+    change_mode(const mutation_capability_t &capability, const resolution_t &resolution);
+
     const native_health_t &
     health() const noexcept {
       return health_;
@@ -185,6 +229,11 @@ namespace display_device::topology {
     native_outcome_t
     roll_back_head(const mutation_capability_t &capability, const journal_record_t &record,
       const observed_display_t &expected, const std::string &why);
+
+    /** Point the journal's observed creation and owned head at `head` as listed in `after`. */
+    mode_change_outcome_t
+    re_anchor(journal_record_t record, const observed_display_t &head, const inventory_t &after,
+      mode_change_verdict_e verdict, std::string reason);
 
     /** In conflict: the journal is kept. */
     native_outcome_t
@@ -244,6 +293,10 @@ namespace display_device::topology {
 
     native_outcome_t
     prepare(const mutation_capability_t &capability);
+
+    /** The executor's `change_mode`; refused without a usable profile. */
+    mode_change_outcome_t
+    change_mode(const mutation_capability_t &capability, const resolution_t &resolution);
 
   private:
     native_executor_t *executor_;

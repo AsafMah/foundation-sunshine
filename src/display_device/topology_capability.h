@@ -62,6 +62,8 @@ namespace display_device::topology {
     vdd_set_modes,
     vdd_cursor,
     adapter_restart,
+    /** Change the mode of the managed virtual head this run created (managed `reconfigure` only). */
+    native_mode,
   };
 
   std::string_view

@@ -255,6 +255,47 @@ namespace display_device::topology {
       return { native_verdict_e::refused, std::nullopt, std::move(reason) };
     }
 
+    bool
+    same_resolution(const resolution_t &a, const resolution_t &b) {
+      return a.width == b.width && a.height == b.height;
+    }
+
+    /** The sole virtual head, when it carries this driver and GUID; null otherwise. */
+    const observed_display_t *
+    sole_head_of(const native_platform_t &platform, const inventory_t &inventory, const driver_instance_id_t &driver, const head_guid_t &guid) {
+      if (!inventory.available) {
+        return nullptr;
+      }
+      const auto heads = virtual_heads(platform, inventory);
+      if (heads.size() != 1) {
+        return nullptr;
+      }
+      const auto &head = *heads.front();
+      if (!head.head || head.head->driver != driver || head.head->guid != guid || head.head->incarnation.value == 0) {
+        return nullptr;
+      }
+      return &head;
+    }
+
+    /** Refresh rates within 1 Hz are one mode, as the legacy display path and the whole-Hz driver list treat them. */
+    bool
+    same_refresh(const display_device::refresh_rate_t &a, const display_device::refresh_rate_t &b) {
+      if (a.denominator == 0 || b.denominator == 0) {
+        return false;
+      }
+      const auto left = static_cast<long double>(a.numerator) * b.denominator;
+      const auto right = static_cast<long double>(b.numerator) * a.denominator;
+      const auto scale = static_cast<long double>(a.denominator) * b.denominator;
+      return (left > right ? left - right : right - left) <= scale;
+    }
+
+    /** The head is listed with `mode`, and nothing else on the host changed. */
+    bool
+    settled(const observed_display_t *head, const display_mode_t &mode, bool others_unchanged) {
+      return head && head->layout && same_resolution(head->layout->mode.resolution, mode.resolution) &&
+             same_refresh(head->layout->mode.refresh_rate, mode.refresh_rate) && others_unchanged;
+    }
+
     /** Why a managed process without a usable profile refuses every launch. */
     std::string
     unusable(const error_t &error) {
@@ -361,6 +402,27 @@ namespace display_device::topology {
     // P1 field writes are replay only; preparing a native profile does not change host fields.
     capability.require(capability.kind() == command_kind_e::startup_recovery ? operation_e::native_recover : operation_e::native_restore);
     return do_apply_fields(capability, display, values);
+  }
+
+  result_t<void>
+  native_platform_t::change_head_mode(const mutation_capability_t &capability, const observed_display_t &head, const display_mode_t &mode) {
+    capability.require(operation_e::native_mode);
+    return do_change_head_mode(capability, head, mode);
+  }
+
+  std::string_view
+  to_string(mode_change_verdict_e verdict) noexcept {
+    switch (verdict) {
+      case mode_change_verdict_e::applied:
+        return "applied";
+      case mode_change_verdict_e::unchanged:
+        return "unchanged";
+      case mode_change_verdict_e::refused:
+        return "refused";
+      case mode_change_verdict_e::conflict:
+        return "conflict";
+    }
+    return "unknown";
   }
 
   native_executor_t::native_executor_t(journal_store_t &store, native_platform_t &platform, native_executor_options_t options):
@@ -610,6 +672,123 @@ namespace display_device::topology {
     return health_;
   }
 
+  mode_change_outcome_t
+  native_executor_t::change_mode(const mutation_capability_t &capability, const resolution_t &resolution) {
+    capability.require(operation_e::native_mode);
+    const auto refuse = [](std::string reason) {
+      return mode_change_outcome_t { mode_change_verdict_e::refused, std::nullopt, std::move(reason) };
+    };
+    const auto in_conflict = [this](std::string reason) {
+      conflict(reason);
+      return mode_change_outcome_t { mode_change_verdict_e::conflict, std::nullopt, std::move(reason) };
+    };
+    try {
+      if (health_.in_conflict) {
+        return refuse("The native topology is In conflict: " + health_.reason);
+      }
+      if (resolution.width == 0 || resolution.height == 0) {
+        return refuse("The requested resolution is empty");
+      }
+      const auto loaded = store_.load();
+      if (!loaded.present() || loaded.status != journal_load_status_e::loaded) {
+        return refuse("No virtual display of this run is present");
+      }
+      const auto &record = *loaded.record;
+      if (record.owner != owner_ || created_in_this_run_ != record.transaction) {
+        return refuse("The virtual display was not created by this run");
+      }
+      if (semantic_problem(record) || unresolved_step(record)) {
+        return refuse("The native journal does not prove a single virtual display");
+      }
+      const auto *created = observed_create(record);
+      const auto *expected = created && created->display && created->observed ? find_unique(*created->observed, *created->display) : nullptr;
+      if (record.owned_heads.size() != 1 || !expected || !expected->head) {
+        return refuse("The native journal does not prove a single virtual display");
+      }
+      const auto current = platform_.inventory();
+      if (!sole_matching_head(platform_, current, *expected)) {
+        return refuse("The virtual display no longer matches the one this run created");
+      }
+      const auto *head = find_unique(current, expected->id);
+      if (!head->layout) {
+        return refuse("The virtual display is not active");
+      }
+      const auto previous = head->layout->mode;
+      if (same_resolution(previous.resolution, resolution)) {
+        return { mode_change_verdict_e::unchanged, head->id, {} };
+      }
+
+      const auto guid = expected->head->guid;
+      const auto others = unmanaged_signature(platform_, current, record);
+      const auto unchanged_others = [&](const inventory_t &inventory) {
+        return unmanaged_signature(platform_, inventory, record) == others;
+      };
+      auto target = previous;
+      target.resolution = resolution;
+      const auto changed = platform_.change_head_mode(capability, *head, target);
+      const auto after = platform_.inventory();
+      const auto *now = sole_head_of(platform_, after, options_.driver, guid);
+      if (changed && settled(now, target, unchanged_others(after))) {
+        return re_anchor(record, *now, after, mode_change_verdict_e::applied, {});
+      }
+
+      auto why = changed ? std::string { "The virtual display did not take the requested mode" } :
+                           "Changing the virtual display mode failed: " + changed.error().detail;
+      // Only a change that was definitely never sent can be trusted not to land later.
+      const bool never_sent = !changed && changed.error().code != error_code_e::unknown_applied_state;
+      if (never_sent && settled(now, previous, unchanged_others(after))) {
+        return re_anchor(record, *now, after, mode_change_verdict_e::refused, std::move(why));
+      }
+      if (!now) {
+        return in_conflict(why + "; the virtual display can no longer be proven to be this host's");
+      }
+      const auto rolled = platform_.change_head_mode(capability, *now, previous);
+      const auto restored = platform_.inventory();
+      const auto *back = sole_head_of(platform_, restored, options_.driver, guid);
+      if (rolled && settled(back, previous, unchanged_others(restored))) {
+        return re_anchor(record, *back, restored, mode_change_verdict_e::refused, why + "; the previous mode was restored");
+      }
+      return in_conflict(why + "; the previous mode could not be restored" + (rolled ? std::string {} : ": " + rolled.error().detail));
+    }
+    catch (const std::exception &error) {
+      return in_conflict(std::string { "Changing the virtual display mode failed: " } + error.what());
+    }
+    catch (...) {
+      return in_conflict("Changing the virtual display mode failed");
+    }
+  }
+
+  mode_change_outcome_t
+  native_executor_t::re_anchor(journal_record_t record, const observed_display_t &head, const inventory_t &after,
+    mode_change_verdict_e verdict, std::string reason) {
+    auto created = std::find_if(record.steps.rbegin(), record.steps.rend(), [](const journal_step_t &step) {
+      return step.operation == journal_operation_e::create_head && step.state == journal_step_state_e::observed;
+    });
+    if (created == record.steps.rend() || record.owned_heads.empty()) {
+      const auto detail = "the native journal no longer names the virtual display it created";
+      conflict(detail);
+      return { mode_change_verdict_e::conflict, std::nullopt, detail };
+    }
+    auto &owned = record.owned_heads.front();
+    // The journal keeps its slot; it must not claim a head on another adapter, or one whose adapter is unknown.
+    if (!head.adapter || *head.adapter != owned.adapter) {
+      const auto detail = (reason.empty() ? std::string {} : reason + "; ") +
+                          "the virtual display is no longer on the adapter the native journal names";
+      conflict(detail);
+      return { mode_change_verdict_e::conflict, std::nullopt, detail };
+    }
+    created->display = head.id;
+    created->observed = after;
+    owned.identity = *head.head;
+    if (const auto saved = store_.save(record); !saved) {
+      const auto detail = (reason.empty() ? std::string {} : reason + "; ") +
+                          "the native journal could not record the virtual display as it is now: " + saved.error().detail;
+      conflict(detail);
+      return { mode_change_verdict_e::conflict, std::nullopt, detail };
+    }
+    return { verdict, head.id, std::move(reason) };
+  }
+
   native_outcome_t
   native_executor_t::reconcile(const mutation_capability_t &capability, const journal_record_t &record, bool same_run) {
     if (const auto problem = semantic_problem(record)) {
@@ -810,6 +989,15 @@ namespace display_device::topology {
       return { native_verdict_e::conflict, std::nullopt, unusable(profile_.error()) };
     }
     return executor_->prepare(capability, *profile_);
+  }
+
+  mode_change_outcome_t
+  managed_native_t::change_mode(const mutation_capability_t &capability, const resolution_t &resolution) {
+    capability.require(operation_e::native_mode);
+    if (!profile_) {
+      return { mode_change_verdict_e::refused, std::nullopt, unusable(profile_.error()) };
+    }
+    return executor_->change_mode(capability, resolution);
   }
 
   std::shared_ptr<managed_native_t>

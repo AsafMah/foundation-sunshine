@@ -165,7 +165,8 @@ namespace {
     std::size_t
     host_writes() const {
       return static_cast<std::size_t>(std::count_if(events.begin(), events.end(), [](const std::string &event) {
-        return event == "create_head" || event == "remove_all_heads" || event.starts_with("apply_fields:");
+        return event == "create_head" || event == "remove_all_heads" || event.starts_with("apply_fields:") ||
+               event.starts_with("change_head_mode:");
       }));
     }
   };
@@ -351,7 +352,30 @@ namespace {
       return {};
     }
 
+    dt::result_t<void>
+    do_change_head_mode(const dt::mutation_capability_t &capability, const dt::observed_display_t &head, const display_device::display_mode_t &mode) override {
+      if (on_mutation) on_mutation(&capability);
+      log_.add("change_head_mode:" + head.id.value);
+      mode_requests.emplace_back(head.id, mode);
+      if (on_change_mode) {
+        return on_change_mode(mode_requests.size(), head, mode);
+      }
+      set_head_mode(head.id.value, mode, recreate_on_mode);
+      return {};
+    }
+
   public:
+    /** Applies `mode` to a listed head; `recreate` gives it a new OS id and incarnations, as SETMODES may. */
+    void
+    set_head_mode(const std::string &name, const display_device::display_mode_t &mode, bool recreate) {
+      auto &target = find(host, name);
+      target.layout->mode = mode;
+      if (recreate) {
+        target.id = dt::os_display_id_t { "vdd-" + std::to_string(++created) };
+        target.incarnation = dt::source_incarnation_t { target.incarnation.value + 1 };
+        if (target.head) target.head->incarnation = dt::head_incarnation_t { target.head->incarnation.value + 1 };
+      }
+    }
     /** Inside a create, the new head carries that request's identity unless `stamp` replaces it. */
     std::string
     add_head() {
@@ -387,6 +411,10 @@ namespace {
     /** Replaces the default removal (every head goes, success). */
     std::function<dt::result_t<void>()> on_remove;
     std::function<void()> after_apply;
+    std::vector<std::pair<dt::os_display_id_t, display_device::display_mode_t>> mode_requests;
+    /** Replaces the default mode change (applied in place); receives the 1-based attempt. */
+    std::function<dt::result_t<void>(std::size_t, const dt::observed_display_t &, const display_device::display_mode_t &)> on_change_mode;
+    bool recreate_on_mode {};
     std::function<void(const dt::mutation_capability_t *)> on_mutation;
     /** Edits one snapshot; receives the 1-based read number. */
     std::function<void(int, dt::inventory_t &)> tamper;
@@ -487,6 +515,24 @@ namespace {
   concept ungated_apply = requires(Platform &platform, dt::os_display_id_t display, dt::managed_values_t values) {
     platform.apply_fields(display, values);
   };
+
+  template <class Platform>
+  concept ungated_change_mode = requires(Platform &platform, const dt::observed_display_t &head, display_device::display_mode_t mode) {
+    platform.change_head_mode(head, mode);
+  };
+
+  template <class Platform>
+  concept public_change_mode_hook = requires(Platform &platform, const dt::mutation_capability_t &capability,
+    const dt::observed_display_t &head, display_device::display_mode_t mode) {
+    platform.do_change_head_mode(capability, head, mode);
+  };
+
+  dt::result_t<void>
+  platform_change_mode(dt::native_platform_t &platform, const dt::mutation_capability_t &capability) {
+    auto head = virtual_display("vdd-1", 3840);
+    head.head = dt::head_identity_t { driver(), id<dt::head_guid_t>(0x71), dt::head_incarnation_t { 1 } };
+    return platform.change_head_mode(capability, head, mode(2560, 1440));
+  }
 
   template <class Platform>
   concept public_create_hook = requires(Platform &platform, const dt::mutation_capability_t &capability, dt::head_guid_t intent) {
@@ -819,6 +865,7 @@ TEST_F(NativeExecutor, PlatformBoundaryChecksEveryCommandKindBeforeEnteringTheBa
   platform.on_create = [](std::size_t) { return failure("create refused"); };
   platform.on_remove = [] { return failure("remove refused"); };
   platform.apply_error = true;
+  platform.on_change_mode = [](std::size_t, const auto &, const auto &) -> dt::result_t<void> { return failure("mode refused"); };
   for (const bool managed_mode : { false, true }) {
     for (const auto kind : kinds) {
       with_capability(kind, [&](const auto &capability) {
@@ -841,7 +888,8 @@ TEST_F(NativeExecutor, PlatformBoundaryChecksEveryCommandKindBeforeEnteringTheBa
         };
         check(kind == launch_prepare, [&] { return platform_create(boundary, capability); }, "create refused");
         check(kind == launch_prepare || restore, [&] { return platform_remove(boundary, capability); }, "remove refused");
-        check(kind == startup_recovery || restore, [&] { return platform_apply(boundary, capability); }, "apply refused"); }, managed_mode);
+        check(kind == startup_recovery || restore, [&] { return platform_apply(boundary, capability); }, "apply refused");
+        check(kind == reconfigure && managed_mode, [&] { return platform_change_mode(boundary, capability); }, "mode refused"); }, managed_mode);
     }
   }
 }
@@ -888,6 +936,8 @@ TEST_F(NativeExecutor, PlatformBoundaryExposesNoUngatedMutationOverload) {
   EXPECT_FALSE(public_create_hook<dt::native_platform_t>);
   EXPECT_FALSE(public_remove_hook<dt::native_platform_t>);
   EXPECT_FALSE(public_apply_hook<dt::native_platform_t>);
+  EXPECT_FALSE(ungated_change_mode<dt::native_platform_t>);
+  EXPECT_FALSE(public_change_mode_hook<dt::native_platform_t>);
 }
 
 TEST_F(NativeExecutor, PlatformCallsRetainTheOriginalCapabilityThroughRollbackAndReplay) {
@@ -1505,6 +1555,386 @@ namespace {
 
   const dt::managed_values_t moved { .position = dt::position_t { 2560, 0 } };
 }  // namespace
+
+// --- Managed head mode change (slice A, provisional pending G1 hardware) -----------
+
+namespace {
+  dt::mode_change_outcome_t
+  change_with(dt::native_executor_t &executor, unsigned width, unsigned height) {
+    dt::mode_change_outcome_t outcome;
+    with_capability(dt::command_kind_e::reconfigure, [&](const auto &capability) {
+      outcome = executor.change_mode(capability, { width, height });
+    }, true);
+    return outcome;
+  }
+
+  ::testing::AssertionResult
+  mode_verdict_is(const dt::mode_change_outcome_t &outcome, dt::mode_change_verdict_e expected) {
+    if (outcome.verdict == expected) {
+      return ::testing::AssertionSuccess();
+    }
+    return ::testing::AssertionFailure() << "expected " << dt::to_string(expected) << ", got "
+                                         << dt::to_string(outcome.verdict) << ": " << outcome.reason;
+  }
+
+  const dt::observed_display_t &
+  the_head(fake_platform_t &platform) {
+    for (const auto &display : platform.host.displays) {
+      if (platform.is_virtual_head(display)) return display;
+    }
+    throw std::runtime_error { "the fixture lists no virtual display" };
+  }
+
+  bool
+  same_mode(const display_device::display_mode_t &a, const display_device::display_mode_t &b) {
+    return a.resolution.width == b.resolution.width && a.resolution.height == b.resolution.height &&
+           a.refresh_rate.numerator == b.refresh_rate.numerator && a.refresh_rate.denominator == b.refresh_rate.denominator;
+  }
+
+  display_device::resolution_t
+  resolution_of(const dt::observed_display_t &display) {
+    return display.layout->mode.resolution;
+  }
+}  // namespace
+
+TEST_F(NativeExecutor, ChangeModeResizesTheVirtualDisplayThisRunCreated) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  const auto outcome = change_with(executor, 2560, 1440);
+  ASSERT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::applied));
+  EXPECT_EQ(outcome.display, dt::os_display_id_t { "vdd-1" });
+  ASSERT_EQ(platform.mode_requests.size(), 1u);
+  EXPECT_EQ(platform.mode_requests[0].first, dt::os_display_id_t { "vdd-1" });
+  EXPECT_TRUE(same_mode(platform.mode_requests[0].second, mode(2560, 1440)));
+  EXPECT_EQ(resolution_of(the_head(platform)).width, 2560u);
+  EXPECT_EQ(resolution_of(the_head(platform)).height, 1440u);
+  EXPECT_FALSE(executor.health().in_conflict);
+
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(NativeExecutor, ChangeModeKeepsTheRefreshRate) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  find(platform.host, "vdd-1").layout->mode.refresh_rate = { 120000, 1001 };
+  ASSERT_TRUE(mode_verdict_is(change_with(executor, 2560, 1440), dt::mode_change_verdict_e::applied));
+  ASSERT_EQ(platform.mode_requests.size(), 1u);
+  EXPECT_EQ(platform.mode_requests[0].second.refresh_rate.numerator, 120000u);
+  EXPECT_EQ(platform.mode_requests[0].second.refresh_rate.denominator, 1001u);
+}
+
+TEST_F(NativeExecutor, ChangeModeToTheCurrentResolutionTouchesNothing) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  const auto writes = log.host_writes();
+  const auto saves = store.saves;
+  const auto outcome = change_with(executor, 1920, 1080);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::unchanged));
+  EXPECT_EQ(outcome.display, dt::os_display_id_t { "vdd-1" });
+  EXPECT_EQ(log.host_writes(), writes);
+  EXPECT_EQ(store.saves, saves);
+}
+
+TEST_F(NativeExecutor, ChangeModeRefusesWithoutAVirtualDisplayOfThisRun) {
+  const auto none = change_with(executor, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(none, dt::mode_change_verdict_e::refused));
+  EXPECT_TRUE(mentions(none.reason, "No virtual display"));
+
+  ASSERT_TRUE(verdict_is(prepare_with(executor, physical_profile("os-B")), native_verdict_e::ok));
+  EXPECT_TRUE(mode_verdict_is(change_with(executor, 2560, 1440), dt::mode_change_verdict_e::refused));
+  ASSERT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  auto other = make_executor();
+  const auto foreign = change_with(other, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(foreign, dt::mode_change_verdict_e::refused));
+  EXPECT_TRUE(mentions(foreign.reason, "not created by this run"));
+  EXPECT_FALSE(other.health().in_conflict);
+  EXPECT_FALSE(executor.health().in_conflict);
+  EXPECT_TRUE(platform.mode_requests.empty());
+  EXPECT_TRUE(mode_verdict_is(change_with(executor, 0, 1440), dt::mode_change_verdict_e::refused));
+  EXPECT_TRUE(platform.mode_requests.empty());
+}
+
+TEST_F(NativeExecutor, ChangeModeRefusesAHeadThatNoLongerMatches) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  for (const auto &[name, change] : changed_head_identities()) {
+    SCOPED_TRACE(name);
+    platform.tamper = [&](int, dt::inventory_t &inventory) { change(inventory); };
+    const auto outcome = change_with(executor, 2560, 1440);
+    EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::refused));
+    EXPECT_TRUE(mentions(outcome.reason, "no longer matches"));
+  }
+  platform.tamper = {};
+  EXPECT_TRUE(platform.mode_requests.empty());
+  EXPECT_FALSE(executor.health().in_conflict);
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+}
+
+TEST_F(NativeExecutor, ChangeModeThatFailsWithoutEffectKeepsThePreviousMode) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  platform.on_change_mode = [](std::size_t, const auto &, const auto &) -> dt::result_t<void> { return failure("driver busy"); };
+  const auto outcome = change_with(executor, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::refused));
+  EXPECT_TRUE(mentions(outcome.reason, "driver busy"));
+  EXPECT_EQ(outcome.display, dt::os_display_id_t { "vdd-1" });
+  EXPECT_EQ(platform.mode_requests.size(), 1u);
+  EXPECT_EQ(resolution_of(the_head(platform)).width, 1920u);
+  EXPECT_FALSE(executor.health().in_conflict);
+
+  // The session keeps streaming and still restores cleanly.
+  platform.on_change_mode = {};
+  EXPECT_TRUE(mode_verdict_is(change_with(executor, 2560, 1440), dt::mode_change_verdict_e::applied));
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+  EXPECT_EQ(platform.head_count(), 0u);
+}
+
+TEST_F(NativeExecutor, ChangeModeWithAnUncertainOutcomeRollsBackEvenWhenNothingShowsYet) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  platform.on_change_mode = [&](std::size_t attempt, const auto &head, const auto &target) -> dt::result_t<void> {
+    if (attempt == 1) return std::unexpected(dt::error_t { dt::error_code_e::unknown_applied_state, "ioctl timed out", {} });
+    // The first request lands late, just before the rollback is written.
+    platform.set_head_mode(head.id.value, mode(2560, 1440), false);
+    platform.set_head_mode(head.id.value, target, false);
+    return {};
+  };
+  const auto outcome = change_with(executor, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::refused));
+  EXPECT_TRUE(mentions(outcome.reason, "ioctl timed out"));
+  EXPECT_TRUE(mentions(outcome.reason, "previous mode was restored"));
+  ASSERT_EQ(platform.mode_requests.size(), 2u);
+  EXPECT_TRUE(same_mode(platform.mode_requests[1].second, mode(1920, 1080)));
+  EXPECT_EQ(resolution_of(the_head(platform)).width, 1920u);
+  EXPECT_FALSE(executor.health().in_conflict);
+}
+
+TEST_F(NativeExecutor, ChangeModeThatAlsoChangesTheRefreshRateRollsBack) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  platform.on_change_mode = [&](std::size_t attempt, const auto &head, const auto &target) -> dt::result_t<void> {
+    auto shown = target;
+    if (attempt == 1) shown.refresh_rate = { 120, 1 };
+    platform.set_head_mode(head.id.value, shown, false);
+    return {};
+  };
+  const auto outcome = change_with(executor, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::refused));
+  EXPECT_TRUE(mentions(outcome.reason, "did not take the requested mode"));
+  ASSERT_EQ(platform.mode_requests.size(), 2u);
+  EXPECT_TRUE(same_mode(the_head(platform).layout->mode, mode(1920, 1080)));
+}
+
+TEST_F(NativeExecutor, ChangeModeWhoseRollbackLosesTheRefreshRateIsInConflict) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  platform.on_change_mode = [&](std::size_t attempt, const auto &head, const auto &target) -> dt::result_t<void> {
+    auto shown = target;
+    shown.refresh_rate = { 30, 1 };
+    platform.set_head_mode(head.id.value, shown, false);
+    return attempt == 1 ? failure("timed out") : dt::result_t<void> {};
+  };
+  const auto outcome = change_with(executor, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::conflict));
+  EXPECT_TRUE(mentions(outcome.reason, "could not be restored"));
+  EXPECT_TRUE(executor.health().in_conflict);
+}
+
+TEST_F(NativeExecutor, ChangeModeTreatsRefreshRatesWithinOneHertzAsTheSame) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  platform.on_change_mode = [&](std::size_t, const auto &head, const auto &target) -> dt::result_t<void> {
+    auto shown = target;
+    shown.refresh_rate = { 60000, 1001 };
+    platform.set_head_mode(head.id.value, shown, false);
+    return {};
+  };
+  EXPECT_TRUE(mode_verdict_is(change_with(executor, 2560, 1440), dt::mode_change_verdict_e::applied));
+  EXPECT_EQ(platform.mode_requests.size(), 1u);
+}
+
+namespace {
+  void
+  moves_adapter(fake_platform_t &platform, bool lose_adapter) {
+    platform.on_change_mode = [&platform, lose_adapter](std::size_t, const auto &head, const auto &target) -> dt::result_t<void> {
+      platform.set_head_mode(head.id.value, target, true);
+      for (auto &display : platform.host.displays) {
+        if (!platform.is_virtual_head(display)) continue;
+        if (lose_adapter) display.adapter.reset();
+        else display.adapter = dt::adapter_luid_t { 8 };
+      }
+      return {};
+    };
+  }
+}  // namespace
+
+TEST_F(NativeExecutor, ChangeModeOnAHeadThatMovedAdapterIsInConflictAndKeepsTheJournal) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  const auto before = store.record();
+  ASSERT_TRUE(before);
+  moves_adapter(platform, false);
+  const auto outcome = change_with(executor, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::conflict));
+  EXPECT_TRUE(mentions(outcome.reason, "no longer on the adapter"));
+  EXPECT_TRUE(executor.health().in_conflict);
+  const auto after = store.record();
+  ASSERT_TRUE(after);
+  EXPECT_EQ(after->owned_heads, before->owned_heads);
+}
+
+TEST_F(NativeExecutor, ChangeModeOnAHeadThatLostItsAdapterIsInConflictAndKeepsTheJournal) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  const auto before = store.record();
+  ASSERT_TRUE(before);
+  moves_adapter(platform, true);
+  const auto outcome = change_with(executor, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::conflict));
+  EXPECT_TRUE(mentions(outcome.reason, "no longer on the adapter"));
+  const auto after = store.record();
+  ASSERT_TRUE(after);
+  EXPECT_EQ(after->owned_heads, before->owned_heads);
+}
+
+TEST_F(NativeExecutor, ChangeModeRollsBackAHalfAppliedMode) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  platform.on_change_mode = [&](std::size_t attempt, const auto &head, const auto &target) -> dt::result_t<void> {
+    platform.set_head_mode(head.id.value, target, false);
+    if (attempt == 1) return failure("timed out confirming the mode");
+    return {};
+  };
+  const auto outcome = change_with(executor, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::refused));
+  EXPECT_TRUE(mentions(outcome.reason, "timed out confirming the mode"));
+  EXPECT_TRUE(mentions(outcome.reason, "previous mode was restored"));
+  ASSERT_EQ(platform.mode_requests.size(), 2u);
+  EXPECT_TRUE(same_mode(platform.mode_requests[1].second, mode(1920, 1080)));
+  EXPECT_EQ(resolution_of(the_head(platform)).width, 1920u);
+  EXPECT_FALSE(executor.health().in_conflict);
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+}
+
+TEST_F(NativeExecutor, ChangeModeThatReportsSuccessButShowsAnotherModeRollsBack) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  platform.on_change_mode = [&](std::size_t attempt, const auto &head, const auto &target) -> dt::result_t<void> {
+    platform.set_head_mode(head.id.value, attempt == 1 ? mode(1280, 720) : target, false);
+    return {};
+  };
+  const auto outcome = change_with(executor, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::refused));
+  EXPECT_TRUE(mentions(outcome.reason, "did not take the requested mode"));
+  EXPECT_EQ(platform.mode_requests.size(), 2u);
+  EXPECT_EQ(resolution_of(the_head(platform)).width, 1920u);
+}
+
+TEST_F(NativeExecutor, ChangeModeThatCannotBeRolledBackIsInConflict) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  platform.on_change_mode = [&](std::size_t attempt, const auto &head, const auto &target) -> dt::result_t<void> {
+    if (attempt == 1) platform.set_head_mode(head.id.value, target, false);
+    return failure(attempt == 1 ? "timed out" : "rollback refused");
+  };
+  const auto outcome = change_with(executor, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::conflict));
+  EXPECT_TRUE(mentions(outcome.reason, "could not be restored"));
+  EXPECT_TRUE(mentions(outcome.reason, "rollback refused"));
+  EXPECT_TRUE(executor.health().in_conflict);
+
+  // A conflicted executor touches nothing more.
+  const auto writes = log.host_writes();
+  EXPECT_TRUE(mode_verdict_is(change_with(executor, 1920, 1080), dt::mode_change_verdict_e::refused));
+  EXPECT_EQ(log.host_writes(), writes);
+}
+
+TEST_F(NativeExecutor, ChangeModeThatLosesTheHeadIsInConflictWithoutRollback) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  platform.on_change_mode = [&](std::size_t, const auto &, const auto &) -> dt::result_t<void> {
+    platform.drop_heads();
+    return failure("head vanished");
+  };
+  const auto outcome = change_with(executor, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::conflict));
+  EXPECT_TRUE(mentions(outcome.reason, "can no longer be proven"));
+  EXPECT_EQ(platform.mode_requests.size(), 1u);
+  EXPECT_TRUE(executor.health().in_conflict);
+}
+
+TEST_F(NativeExecutor, ChangeModeThatTurnsOffAnotherDisplayRollsBackAndIsInConflict) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  platform.on_change_mode = [&](std::size_t, const auto &head, const auto &target) -> dt::result_t<void> {
+    platform.set_head_mode(head.id.value, target, false);
+    find(platform.host, "os-B").info.device_state = state_e::inactive;
+    return {};
+  };
+  const auto outcome = change_with(executor, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::conflict));
+  ASSERT_EQ(platform.mode_requests.size(), 2u);
+  EXPECT_TRUE(same_mode(platform.mode_requests[1].second, mode(1920, 1080)));
+  EXPECT_TRUE(executor.health().in_conflict);
+}
+
+TEST_F(NativeExecutor, ChangeModeToleratesTheOsRepositioningANeighbour) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  platform.on_change_mode = [&](std::size_t, const auto &head, const auto &target) -> dt::result_t<void> {
+    platform.set_head_mode(head.id.value, target, false);
+    find(platform.host, "os-B").layout->position = { 0, 1440 };
+    return {};
+  };
+  const auto outcome = change_with(executor, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::applied));
+  EXPECT_EQ(platform.mode_requests.size(), 1u);
+  EXPECT_FALSE(executor.health().in_conflict);
+}
+
+TEST_F(NativeExecutor, ChangeModeFollowsAHeadTheDriverRecreated) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  platform.recreate_on_mode = true;
+  const auto outcome = change_with(executor, 2560, 1440);
+  ASSERT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::applied));
+  EXPECT_EQ(outcome.display, dt::os_display_id_t { "vdd-2" });
+
+  const auto record = store.record();
+  ASSERT_TRUE(record);
+  ASSERT_EQ(record->owned_heads.size(), 1u);
+  EXPECT_EQ(record->owned_heads[0].identity.incarnation, dt::head_incarnation_t { 2 });
+  const auto created = std::find_if(record->steps.rbegin(), record->steps.rend(), [](const auto &step) {
+    return step.operation == dt::journal_operation_e::create_head && step.state == step_e::observed;
+  });
+  ASSERT_NE(created, record->steps.rend());
+  EXPECT_EQ(created->display, dt::os_display_id_t { "vdd-2" });
+
+  // The re-anchored journal still proves the head, here and after a restart.
+  EXPECT_TRUE(mode_verdict_is(change_with(executor, 1920, 1080), dt::mode_change_verdict_e::applied));
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(NativeExecutor, ChangeModeOnARecreatedHeadThatCannotBeJournaledIsInConflict) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  platform.recreate_on_mode = true;
+  store.fail_save_call = store.saves + 1;
+  const auto outcome = change_with(executor, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::conflict));
+  EXPECT_TRUE(mentions(outcome.reason, "disk full"));
+  EXPECT_TRUE(executor.health().in_conflict);
+}
+
+TEST_F(NativeExecutor, ChangeModeThatThrowsIsInConflict) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  platform.on_change_mode = [](std::size_t, const auto &, const auto &) -> dt::result_t<void> { throw std::runtime_error { "edge exploded" }; };
+  const auto outcome = change_with(executor, 2560, 1440);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::conflict));
+  EXPECT_TRUE(mentions(outcome.reason, "edge exploded"));
+  EXPECT_TRUE(executor.health().in_conflict);
+}
+
+TEST_F(NativeExecutor, ChangeModeNeedsAManagedReconfigure) {
+  ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));
+  for (const bool managed_mode : { false, true }) {
+    for (const auto kind : { dt::command_kind_e::reconfigure, dt::command_kind_e::launch_prepare, dt::command_kind_e::native_restore }) {
+      if (managed_mode && kind == dt::command_kind_e::reconfigure) continue;
+      SCOPED_TRACE(std::string { dt::to_string(kind) } + (managed_mode ? "/managed" : "/legacy"));
+      with_capability(kind, [&](const auto &capability) {
+        EXPECT_THROW((void) executor.change_mode(capability, { 2560, 1440 }), dt::capability_error_t);
+      }, managed_mode);
+    }
+  }
+  EXPECT_TRUE(platform.mode_requests.empty());
+}
 
 TEST_F(NativeExecutor, RestoreRemovesTheDisplayThisRunCreated) {
   ASSERT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::ok));

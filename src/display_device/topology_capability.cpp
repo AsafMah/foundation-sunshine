@@ -95,6 +95,8 @@ namespace display_device::topology {
         return "vdd_cursor";
       case operation_e::adapter_restart:
         return "adapter_restart";
+      case operation_e::native_mode:
+        return "native_mode";
     }
     return "unknown";
   }
@@ -133,7 +135,9 @@ namespace display_device::topology {
           return operation == native_restore || operation == vdd_destroy ||
                  (!managed_mode && (legacy_restore_operation(operation) || operation == vdd_create));
         case command_kind_e::reconfigure:
-          return !managed_mode && legacy_prepare_operation(operation);
+          // Managed: only a mode change of the head this run created, never creation or whole-state writes.
+          return managed_mode ? operation == native_mode || operation == vdd_set_modes || operation == write_display_modes :
+                                legacy_prepare_operation(operation);
         case command_kind_e::shutdown_vdd_destroy:
           return !managed_mode && operation == vdd_destroy;
         case command_kind_e::rotate:

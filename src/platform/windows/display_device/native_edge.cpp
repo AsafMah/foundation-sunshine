@@ -4,12 +4,14 @@
  */
 #include "native_edge.h"
 
+#include <algorithm>
 #include <map>
 #include <thread>
 #include <vector>
 
 #include <SetupApi.h>
 
+#include "src/display_device/display_device.h"
 #include "src/display_device/vdd_ioctl.h"
 #include "src/logging.h"
 #include "windows_utils.h"
@@ -194,6 +196,39 @@ namespace display_device::topology::win32_edge {
   win32_native_edge_t::send_destroy_all(const mutation_capability_t &capability) {
     return to_edge(vdd_ioctl::send_command_gated(capability, vdd_ioctl::destroy_monitors_t {},
       [](const std::optional<std::string> &) -> std::optional<std::string> { return std::nullopt; }));
+  }
+
+  std::optional<std::vector<edge_mode_t>>
+  win32_native_edge_t::list_modes(const std::string &display_name) {
+    const auto name = widen(display_name);
+    if (name.empty()) return std::nullopt;
+    std::vector<edge_mode_t> modes;
+    DEVMODEW mode {};
+    mode.dmSize = sizeof(mode);
+    for (DWORD index = 0; EnumDisplaySettingsW(name.c_str(), index, &mode); ++index) {
+      const edge_mode_t listed { mode.dmPelsWidth, mode.dmPelsHeight, mode.dmDisplayFrequency };
+      if (std::ranges::find(modes, listed) == modes.end()) modes.push_back(listed);
+      mode = {};
+      mode.dmSize = sizeof(mode);
+    }
+    if (modes.empty()) return std::nullopt;
+    return modes;
+  }
+
+  edge_send_t
+  win32_native_edge_t::set_mode(const mutation_capability_t &capability, const os_display_id_t &display, const display_mode_t &mode) {
+    if (display_device::set_display_modes(capability, { { display.value, mode } })) return { edge_delivery_e::delivered, {} };
+    return { edge_delivery_e::uncertain, "the display mode could not be applied" };
+  }
+
+  edge_send_t
+  win32_native_edge_t::send_set_modes(const mutation_capability_t &capability, const std::vector<edge_mode_t> &modes, const version_gate_t &gate) {
+    vdd_ioctl::set_modes_t command;
+    command.modes.reserve(modes.size());
+    for (const auto &mode : modes) {
+      command.modes.push_back({ { mode.width, mode.height }, mode.refresh_hz });
+    }
+    return to_edge(vdd_ioctl::send_command_gated(capability, command, gate));
   }
 
   std::chrono::steady_clock::time_point

@@ -95,6 +95,18 @@ namespace display_device::topology {
    */
   using version_gate_t = std::function<std::optional<std::string>(const std::optional<std::string> &version)>;
 
+  struct edge_mode_t {
+    unsigned width {};
+    unsigned height {};
+    unsigned refresh_hz {};
+
+    bool
+    operator==(const edge_mode_t &) const = default;
+  };
+
+  /** The driver-wide mode list keeps at most this many modes (`vdd_mode_list::kMaxTotalModes`). */
+  inline constexpr std::size_t max_driver_modes = 96;
+
   class native_edge_t {
   public:
     virtual ~native_edge_t() = default;
@@ -109,6 +121,21 @@ namespace display_device::topology {
     /** `DESTROYMONITOR`: the driver removes every head. */
     virtual edge_send_t
     send_destroy_all(const mutation_capability_t &capability) = 0;
+
+    /** The modes the OS lists for this display, or nullopt when they cannot be read. */
+    virtual std::optional<std::vector<edge_mode_t>>
+    list_modes(const std::string &display_name) = 0;
+
+    /** Applies `mode` to one display through the OS. */
+    virtual edge_send_t
+    set_mode(const mutation_capability_t &capability, const os_display_id_t &display, const display_mode_t &mode) = 0;
+
+    /**
+     * `SETMODES`: replaces the driver-wide mode list (the first mode is preferred), only if
+     * `gate` accepts the driver. The driver may recreate its heads with the same GUIDs.
+     */
+    virtual edge_send_t
+    send_set_modes(const mutation_capability_t &capability, const std::vector<edge_mode_t> &modes, const version_gate_t &gate) = 0;
 
     virtual std::chrono::steady_clock::time_point
     now() = 0;
@@ -164,6 +191,13 @@ namespace display_device::topology {
 
     result_t<void>
     do_apply_fields(const mutation_capability_t &capability, const os_display_id_t &display, const managed_values_t &values) override;
+
+    /**
+     * Lists the mode with the driver first (`SETMODES`) when the OS does not offer it yet,
+     * then applies it to the head with the same GUID, which may have been recreated.
+     */
+    result_t<void>
+    do_change_head_mode(const mutation_capability_t &capability, const observed_display_t &head, const display_mode_t &mode) override;
 
     /** Polls until `done` holds for an available inventory or the wait ends; returns whether it held. */
     bool

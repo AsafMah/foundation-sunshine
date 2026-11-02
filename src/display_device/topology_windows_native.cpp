@@ -34,6 +34,43 @@ namespace display_device::topology {
       return std::to_string(version.parts[0]) + '.' + std::to_string(version.parts[1]) + '.' +
              std::to_string(version.parts[2]) + '.' + std::to_string(version.parts[3]);
     }
+
+    std::optional<std::string>
+    container_gate(const std::optional<std::string> &text) {
+      if (!text) return "the virtual display driver version could not be read";
+      const auto version = parse_driver_version(*text);
+      if (!version) return "the virtual display driver version \"" + *text + "\" is not a four-part version";
+      if (auto refusal = container_driver_refusal(*version)) {
+        return "the virtual display driver version " + *text + " is not accepted: " + *refusal;
+      }
+      return std::nullopt;
+    }
+
+    std::string
+    describe(const edge_mode_t &mode) {
+      return std::to_string(mode.width) + 'x' + std::to_string(mode.height) + '@' + std::to_string(mode.refresh_hz);
+    }
+
+    /** Within 1 Hz of the whole-Hz rate the driver lists, as the legacy display path compares refresh rates. */
+    bool
+    same_whole_hz(const display_device::refresh_rate_t &rate, unsigned hz) {
+      if (rate.denominator == 0) return false;
+      const auto observed = static_cast<long double>(rate.numerator);
+      const auto wanted = static_cast<long double>(hz) * rate.denominator;
+      return (observed > wanted ? observed - wanted : wanted - observed) <= rate.denominator;
+    }
+
+    const observed_display_t *
+    head_with(const inventory_t &inventory, const head_guid_t &guid) {
+      const observed_display_t *found = nullptr;
+      for (const auto &display : inventory.displays) {
+        if (display.head && display.head->guid == guid) {
+          if (found) return nullptr;
+          found = &display;
+        }
+      }
+      return found;
+    }
   }  // namespace
 
   std::optional<driver_version_t>
@@ -171,15 +208,7 @@ namespace display_device::topology {
 
   result_t<creation_delivery_e>
   windows_native_platform_t::do_create_head(const mutation_capability_t &capability, const head_guid_t &intent) {
-    const version_gate_t gate = [](const std::optional<std::string> &text) -> std::optional<std::string> {
-      if (!text) return "the virtual display driver version could not be read";
-      const auto version = parse_driver_version(*text);
-      if (!version) return "the virtual display driver version \"" + *text + "\" is not a four-part version";
-      if (auto refusal = container_driver_refusal(*version)) {
-        return "the virtual display driver version " + *text + " is not accepted: " + *refusal;
-      }
-      return std::nullopt;
-    };
+    const version_gate_t gate = container_gate;
 
     const auto sent = edge_.send_create(capability, intent, gate);
     switch (sent.delivery) {
@@ -212,5 +241,66 @@ namespace display_device::topology {
   result_t<void>
   windows_native_platform_t::do_apply_fields(const mutation_capability_t &, const os_display_id_t &, const managed_values_t &) {
     return fail(error_code_e::unsupported_mode, "P1 does not write display fields");
+  }
+
+  result_t<void>
+  windows_native_platform_t::do_change_head_mode(const mutation_capability_t &capability, const observed_display_t &head, const display_mode_t &mode) {
+    if (!head.head) return fail(error_code_e::missing_identity, "the display is not a virtual display head");
+    if (mode.resolution.width == 0 || mode.resolution.height == 0 || mode.refresh_rate.denominator == 0) {
+      return fail(error_code_e::unsupported_mode, "the requested mode is empty");
+    }
+    const auto guid = head.head->guid;
+    const edge_mode_t wanted {
+      mode.resolution.width,
+      mode.resolution.height,
+      (mode.refresh_rate.numerator + mode.refresh_rate.denominator / 2) / mode.refresh_rate.denominator,
+    };
+    const auto lists = [&](const std::optional<std::vector<edge_mode_t>> &modes) {
+      return modes && std::ranges::find(*modes, wanted) != modes->end();
+    };
+
+    const auto offered = edge_.list_modes(head.info.display_name);
+    if (!offered) return fail(error_code_e::resource_unavailable, "the virtual display's modes could not be read");
+    if (!lists(offered)) {
+      if (offered->size() >= max_driver_modes) {
+        return fail(error_code_e::resource_unavailable, "the virtual display mode list is full, so " + describe(wanted) + " was not added");
+      }
+      std::vector<edge_mode_t> plan { wanted };
+      for (const auto &existing : *offered) {
+        if (std::ranges::find(plan, existing) == plan.end()) plan.push_back(existing);
+      }
+      const auto sent = edge_.send_set_modes(capability, plan, container_gate);
+      switch (sent.delivery) {
+        case edge_delivery_e::not_sent:
+          return fail(error_code_e::resource_unavailable, "the virtual display mode list was not sent: " + sent.detail);
+        case edge_delivery_e::uncertain:
+          return fail(error_code_e::unknown_applied_state, "the virtual display mode list may have been applied: " + sent.detail);
+        case edge_delivery_e::delivered:
+          break;
+      }
+      const bool listed = wait_for([&](const inventory_t &observed) {
+        const auto *now = head_with(observed, guid);
+        return now && lists(edge_.list_modes(now->info.display_name));
+      });
+      if (!listed) return fail(error_code_e::unknown_applied_state, "the virtual display does not offer " + describe(wanted) + " after the mode list changed");
+    }
+
+    const auto listed_now = inventory();
+    const auto *target = head_with(listed_now, guid);
+    if (!target) return fail(error_code_e::unknown_applied_state, "the virtual display is no longer listed");
+    const auto set = edge_.set_mode(capability, target->id, mode);
+    if (set.delivery == edge_delivery_e::not_sent) {
+      return fail(error_code_e::resource_unavailable, "the virtual display mode was not sent: " + set.detail);
+    }
+    if (set.delivery != edge_delivery_e::delivered) {
+      return fail(error_code_e::unknown_applied_state, "the virtual display mode was not applied: " + set.detail);
+    }
+    const bool applied = wait_for([&](const inventory_t &observed) {
+      const auto *now = head_with(observed, guid);
+      return now && now->layout && now->layout->mode.resolution.width == wanted.width && now->layout->mode.resolution.height == wanted.height &&
+             same_whole_hz(now->layout->mode.refresh_rate, wanted.refresh_hz);
+    });
+    if (!applied) return fail(error_code_e::unknown_applied_state, "the virtual display does not show " + describe(wanted) + " after the mode was applied");
+    return {};
   }
 }  // namespace display_device::topology
