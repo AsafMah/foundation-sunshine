@@ -12,6 +12,7 @@
 #include "src/config.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
+#include "src/process.h"
 #include "src/rtsp.h"
 #include "src/stream.h"
 #include "topology_native.h"
@@ -92,6 +93,20 @@ namespace display_device::coordinated {
         [managed](const auto &capability) { return managed->recover(capability); },
         [managed](const auto &capability) { return managed->restore(capability); },
         [managed](const auto &capability) { return managed->reset(capability); },
+        [managed](const auto &capability) {
+          auto outcome = managed->prepare(capability);
+          if (outcome.verdict != topology::native_verdict_e::ok || !outcome.target) {
+            auto reason = std::string { topology::to_string(outcome.verdict) };
+            if (!outcome.reason.empty()) {
+              reason += ": " + outcome.reason;
+            }
+            return topology::native_prepared_t { std::nullopt, std::move(reason) };
+          }
+          return topology::native_prepared_t {
+            topology::managed_target_t { outcome.target->display.value, outcome.target->virtual_head },
+            {},
+          };
+        },
       };
     }
 
@@ -112,6 +127,7 @@ namespace display_device::coordinated {
         // Video sessions only, and without side effects: rtsp's session_count() also counts
         // control-only sessions and clears stopped ones.
         options.probes.active_streams = [] { return stream::session::has_active_video_sessions() ? std::size_t { 1 } : std::size_t { 0 }; };
+        options.probes.app_running = [] { return proc::proc.running() > 0; };
 
         topology::lifecycle_hooks_t hooks;
         hooks.native = native_hooks();
@@ -171,6 +187,11 @@ namespace display_device::coordinated {
     if (result != topology::lifecycle_cleanup_e::completed && result != topology::lifecycle_cleanup_e::skipped) {
       BOOST_LOG(warning) << "Final VDD cleanup at shutdown: " << topology::to_string(result);
     }
+  }
+
+  topology::native_prepared_t
+  prepare_native(const topology::mutation_capability_t &capability) {
+    return lifecycle().prepare_native(capability);
   }
 
   std::optional<std::string>

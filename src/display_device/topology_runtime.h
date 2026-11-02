@@ -18,6 +18,8 @@ namespace display_device::coordinated {
   /** Restore displays after already-queued work (bounded); new topology work is rejected afterwards. */
   void shutdown_restore();
   void shutdown_vdd_destroy();
+  /** Managed launches only: prepare the latched native profile on the topology worker. */
+  topology::native_prepared_t prepare_native(const topology::mutation_capability_t &capability);
 
   // User-requested routes. Each waits for its command; a refusal is returned as
   // "outcome / reason" and nothing ran. Exceptions from the mutation propagate.

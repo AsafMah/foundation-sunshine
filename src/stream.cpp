@@ -694,6 +694,8 @@ namespace stream {
     std::uint32_t launch_session_id;
     std::shared_ptr<void> nvidia_vsync_lease;
     std::function<bool()> display_activation;
+    /** Managed topology only: drop this stream's lease reference once it has fully ended. */
+    std::function<void()> display_end;
 
     // 保存 launch_session 的关键字段，用于动态参数更新
     bool enable_sops { false };
@@ -4257,6 +4259,10 @@ namespace stream {
       void
       post_stream_display_restore(std::string_view trigger) {
         namespace topology = display_device::topology;
+        // A managed topology is restored when its lease's last reference ends, never per trigger.
+        if (display_device::coordinated::coordinator().managed_mode()) {
+          return;
+        }
         const auto posted = display_device::coordinated::coordinator().post_tracked(topology::command_kind_e::stream_restore,
           [](const topology::mutation_capability_t &capability, const topology::command_context_t &) {
             display_device::session_t::get().restore_state(capability, display_device::coordinated::automatic_vdd_policy());
@@ -4497,6 +4503,10 @@ namespace stream {
       }
 
       session.nvidia_vsync_lease.reset();
+      // After the video count dropped, so the coordinator's idle probe sees this stream gone.
+      if (session.display_end) {
+        session.display_end();
+      }
       perf::end_session(session.launch_session_id);
 
       // Clean up ABR state for this client
@@ -4695,6 +4705,7 @@ namespace stream {
       session->launch_session_id = launch_session.id;
       session->nvidia_vsync_lease = launch_session.nvidia_vsync_lease;
       session->display_activation = launch_session.display_activation;
+      session->display_end = launch_session.display_end;
       session->created_at_ms = steady_now_ms();
 
       // 设置客户端名称

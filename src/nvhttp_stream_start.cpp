@@ -100,11 +100,37 @@ namespace nvhttp::stream_start {
       explicit preparation_context_t(const launch_coordination_t *coordination):
           coordination_ { coordination } {
         if (!coordination_) throw std::invalid_argument { "Display preparation requires coordinator ownership" };
-        if (coordination_->coordinator.managed_mode() ||
-            coordination_->token.flavor != topology::launch_flavor_e::legacy ||
-            !coordination_->legacy_cleanup || !coordination_->fatal_probe_timeout) {
+        if (!coordination_->fatal_probe_timeout) {
+          throw std::invalid_argument { "Display preparation requires fatal probe supervision" };
+        }
+        if (coordination_->token.flavor == topology::launch_flavor_e::managed) {
+          if (!coordination_->coordinator.managed_mode() || !coordination_->managed_prepare || coordination_->legacy_cleanup) {
+            throw std::invalid_argument { "Managed preparation requires managed ownership and a native prepare, without legacy cleanup" };
+          }
+        }
+        else if (coordination_->coordinator.managed_mode() || coordination_->token.flavor != topology::launch_flavor_e::legacy ||
+                 !coordination_->legacy_cleanup || coordination_->managed_prepare) {
           throw std::invalid_argument { "Legacy preparation requires legacy ownership, cleanup and fatal supervision" };
         }
+      }
+
+      bool
+      managed() const {
+        return coordination_->token.flavor == topology::launch_flavor_e::managed;
+      }
+
+      topology::native_prepared_t
+      prepare_native() {
+        auto output = std::make_shared<std::optional<topology::native_prepared_t>>();
+        step([output, prepare = coordination_->managed_prepare](const auto &cap, const auto &) {
+          *output = prepare(cap);
+        });
+        return std::move(output->value());
+      }
+
+      bool
+      record(const topology::managed_target_t &target) {
+        return coordination_->coordinator.record_managed_display(coordination_->token, target);
       }
 
       std::chrono::steady_clock::time_point
@@ -801,6 +827,65 @@ namespace nvhttp::stream_start {
     tree.put("root.sunshine_recoverable", recoverable ? 1 : 0);
   }
 
+#ifdef _WIN32
+  // Touch-keyboard experience: when the client (or its server profile)
+  // opts in, enable the AutoInvoke registry key group for the session.
+  // The touch digitizer itself is expected to be present already (VDD /
+  // remote-software virtual digitizer); failures degrade to a log line.
+  static void
+  start_touch_keyboard(const rtsp_stream::launch_session_t &launch_session) {
+    bool touch_effective = false;
+    if (launch_session.touch_keyboard < 0) {
+      touch_effective = config::get_client_touch_keyboard_enabled(launch_session.client_cert_uuid);
+    }
+    else {
+      touch_effective = launch_session.touch_keyboard == 1;
+    }
+    touch_kb::start_session(touch_effective);
+  }
+#endif
+
+  static void
+  adopt_managed_display(rtsp_stream::launch_session_t &launch_session, const display_device::topology::managed_target_t &target) {
+    launch_session.env["SUNSHINE_CLIENT_DISPLAY_NAME"] = target.display;
+    launch_session.display_exact = true;
+  }
+
+  static void
+  set_managed_display_error(pt::ptree &tree, const std::string &reason) {
+    set_sunshine_error(tree, 503, "The managed display topology could not be prepared: " + reason,
+      "MANAGED_DISPLAY_UNAVAILABLE", "Check the native display profile and the virtual display driver, then try again.",
+      "review_display_settings", "display", "display_configuration", true);
+  }
+
+  // Managed (native) launches stream exactly the profile's target: no legacy intent,
+  // display fallback or temporary encoder retry, since any of them would capture a
+  // display the topology does not own.
+  static bool
+  prepare_managed_display(
+    preparation_context_t &preparation,
+    pt::ptree &tree,
+    rtsp_stream::launch_session_t &launch_session) {
+    const auto prepared = preparation.prepare_native();
+    if (!prepared.display || prepared.display->display.empty()) {
+      set_managed_display_error(tree, prepared.reason.empty() ? "no target display" : prepared.reason);
+      return false;
+    }
+#ifdef _WIN32
+    start_touch_keyboard(launch_session);
+#endif
+    if (preparation.probe({ prepared.display->display, video::probe_target_policy_e::exact }) != 0) {
+      set_video_probe_error(tree);
+      return false;
+    }
+    preparation.finish();
+    if (!preparation.record(*prepared.display)) {
+      throw preparation_error_t { { topology::outcome_e::rejected, topology::reject_reason_e::stale_transaction } };
+    }
+    adopt_managed_display(launch_session, *prepared.display);
+    return true;
+  }
+
   static bool
   prepare_display(
     preparation_context_t &preparation,
@@ -821,20 +906,7 @@ namespace nvhttp::stream_start {
     }
 
 #ifdef _WIN32
-    // Touch-keyboard experience: when the client (or its server profile)
-    // opts in, enable the AutoInvoke registry key group for the session.
-    // The touch digitizer itself is expected to be present already (VDD /
-    // remote-software virtual digitizer); failures degrade to a log line.
-    {
-      bool touch_effective = false;
-      if (launch_session->touch_keyboard < 0) {
-        touch_effective = config::get_client_touch_keyboard_enabled(launch_session->client_cert_uuid);
-      }
-      else {
-        touch_effective = launch_session->touch_keyboard == 1;
-      }
-      touch_kb::start_session(touch_effective);
-    }
+    start_touch_keyboard(*launch_session);
 #endif
     auto_recovery_result_t recovery_result;
     const auto probe_target = make_probe_target(intent);
@@ -941,6 +1013,13 @@ namespace nvhttp::stream_start {
     preparation_context_t preparation { coordination };
     try {
       preparation.deadline();
+      if (preparation.managed()) {
+        if (!prepare_managed_display(preparation, tree, *launch_session)) {
+          preparation.abort();
+          return false;
+        }
+        return true;
+      }
       if (!prepare_display(preparation, tree, launch_session, is_reconfigure)) {
         preparation.abort();
         return false;
@@ -959,6 +1038,18 @@ namespace nvhttp::stream_start {
       preparation.abort();
       throw;
     }
+  }
+
+  bool
+  join_managed_display(pt::ptree &tree, rtsp_stream::launch_session_t &launch_session, topology::coordinator_t &coordinator,
+    const topology::launch_token_t &token) {
+    const auto target = coordinator.managed_display(token);
+    if (!target) {
+      set_managed_display_error(tree, "the shared topology has no prepared target");
+      return false;
+    }
+    adopt_managed_display(launch_session, *target);
+    return true;
   }
 
 }  // namespace nvhttp::stream_start

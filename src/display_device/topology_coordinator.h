@@ -134,6 +134,24 @@ namespace display_device::topology {
     std::uint64_t attachment_serial {};
   };
 
+  /** Display a managed lease prepared; every reference captures exactly this one. */
+  struct managed_target_t {
+    /** OS display id accepted by capture (CCD device id). */
+    std::string display;
+    /** Whether the target is a virtual head (vsync override applies). */
+    bool virtual_head {};
+
+    friend bool
+    operator==(const managed_target_t &, const managed_target_t &) = default;
+  };
+
+  /** Result of a managed launch preparation: `display` is set exactly when it succeeded. */
+  struct native_prepared_t {
+    std::optional<managed_target_t> display;
+    /** Why there is no display. */
+    std::string reason;
+  };
+
   struct launch_admission_t {
     std::optional<launch_token_t> token;
     reject_reason_e reason { reject_reason_e::none };
@@ -318,6 +336,12 @@ namespace display_device::topology {
     std::function<bool(std::uint32_t)> ticket_present;
     /** Number of live video sessions; required in managed mode. */
     std::function<std::size_t()> active_streams;
+    /**
+     * Whether the launched application still runs (managed only, optional). A running
+     * application holds an idle managed lease, like a paused legacy stream keeps its
+     * display, and lets a resume join it; its exit starts the release.
+     */
+    std::function<bool()> app_running;
     /** Whether a legacy restore is still deferred (for example until unlock). */
     std::function<bool()> legacy_restore_pending;
     /**
@@ -428,6 +452,17 @@ namespace display_device::topology {
     /** Reserve a reference to an existing managed topology without preparing it again. */
     launch_admission_t
     admit_managed_join(const launch_request_t &request);
+
+    /**
+     * Record the display a fully prepared managed owner will stream, once, before bind.
+     * Returns false for joiners, legacy, unprepared or non-preparing leases, or empty displays.
+     */
+    bool
+    record_managed_display(const launch_token_t &token, managed_target_t display);
+
+    /** The lease's recorded display, for any live reference of the current managed lease. */
+    std::optional<managed_target_t>
+    managed_display(const launch_token_t &token);
 
     /** Consume a bound reference, under the ticket lock before removing its ticket. */
     bool
@@ -654,6 +689,9 @@ namespace display_device::topology {
       std::uint64_t next_attachment_serial { 1 };
       std::uint64_t activity_generation {};
       std::optional<command_kind_e> restore_kind;
+      std::optional<managed_target_t> display;
+      /** Last tick saw no references while the application ran: resume may join. */
+      bool app_held {};
     };
 
     using submission_t = command_submission_t;

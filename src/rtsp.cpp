@@ -2031,12 +2031,19 @@ namespace rtsp_stream {
       configuredBitrateKbps = getArg("x-ml-video.configuredBitrateKbps"sv);
 
       // Set display_name from session environment or use global configuration
+      monitor.display_exact = session.display_exact;
       if (auto it = session.env.find("SUNSHINE_CLIENT_DISPLAY_NAME"); it != session.env.end()) {
         monitor.display_name = it->to_string();
         BOOST_LOG(info) << "Session using specified display: " << monitor.display_name;
       }
       else {
-        monitor.display_name = config::video.output_name;
+        // An exact session never substitutes the global output for its own display.
+        monitor.display_name = monitor.display_exact ? std::string {} : config::video.output_name;
+      }
+      if (monitor.display_exact && monitor.display_name.empty()) {
+        BOOST_LOG(error) << "Managed session has no display to capture"sv;
+        respond(sock, session, &option, 503, "Service Unavailable", req->sequenceNumber, {});
+        return;
       }
     }
     catch (std::out_of_range &) {

@@ -780,4 +780,212 @@ namespace {
   }
 
   INSTANTIATE_TEST_SUITE_P(Coordinated, StreamStartPolicy, ::testing::Values(true));
+
+  // Managed (native) launches: the lifecycle prepares the topology on the worker, the
+  // probe runs off-worker against exactly that display, and capture never falls back.
+  class ManagedStreamStart: public CoordinatedStreamStart {
+  protected:
+    std::shared_ptr<std::atomic_int> restores = std::make_shared<std::atomic_int>();
+    topology::native_prepared_t prepared { topology::managed_target_t { "{zako-head}", true }, {} };
+    int prepares {};
+
+    void
+    managed(std::chrono::milliseconds setup_timeout = 60s) {
+      topology::coordinator_options_t options;
+      options.managed_mode = true;
+      options.setup_timeout = setup_timeout;
+      options.probes.active_streams = []() { return std::size_t {}; };
+      options.native_restore = [restores = restores](const auto &, const auto &) { ++*restores; };
+      reset(std::move(options));
+    }
+
+    nvhttp::stream_start::launch_coordination_t
+    managed_route() {
+      auto coordination = route();
+      coordination.legacy_cleanup = {};
+      coordination.managed_prepare = [this](const topology::mutation_capability_t &cap) {
+        cap.require(topology::operation_e::native_apply);
+        EXPECT_TRUE(fake.on_worker());
+        ++prepares;
+        fake.events.push_back("native_prepare");
+        return prepared;
+      };
+      return coordination;
+    }
+
+    std::string
+    client_display() {
+      return launch->env.find("SUNSHINE_CLIENT_DISPLAY_NAME") != launch->env.end() ? launch->env["SUNSHINE_CLIENT_DISPLAY_NAME"].to_string() : "<unset>";
+    }
+  };
+
+  TEST_F(ManagedStreamStart, PreparedTargetIsProbedExactlyRecordedAndCapturedExactly) {
+    managed();
+    auto coordination = managed_route();
+    fake.probes = { probed(probe_error_e::none) };
+    ASSERT_TRUE(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination));
+    events({ "native_prepare", "touch", "probe" });
+    ASSERT_EQ(fake.probed.size(), 1);
+    EXPECT_EQ(fake.probed[0].target.output_name, "{zako-head}");
+    EXPECT_EQ(fake.probed[0].target.policy, probe_policy_e::exact);
+    EXPECT_FALSE(fake.probed[0].on_worker);
+    EXPECT_EQ(fake.intent_reads, 0) << "the managed profile, not the legacy intent, chooses the display";
+    EXPECT_TRUE(fake.configured.empty());
+    EXPECT_EQ(client_display(), "{zako-head}");
+    EXPECT_TRUE(launch->display_exact);
+    EXPECT_EQ(coordinator->managed_display(coordination.token), prepared.display);
+    EXPECT_TRUE(coordinator->bind_launch(coordination.token));
+    EXPECT_EQ(restores->load(), 0);
+  }
+
+  TEST_F(ManagedStreamStart, RefusedPreparationIsA503WithoutProbingAndRestores) {
+    managed();
+    auto coordination = managed_route();
+    prepared = { std::nullopt, "refused: the profile's head is missing" };
+    EXPECT_FALSE(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination));
+    settle();
+    events({ "native_prepare" });
+    EXPECT_EQ(tree.get<int>("root.<xmlattr>.status_code"), 503);
+    EXPECT_NE(tree.get<std::string>("root.<xmlattr>.status_message").find("the profile's head is missing"), std::string::npos);
+    EXPECT_EQ(client_display(), "<unset>");
+    EXPECT_FALSE(launch->display_exact);
+    EXPECT_FALSE(coordinator->bind_launch(coordination.token));
+    EXPECT_EQ(restores->load(), 1);
+  }
+
+  TEST_F(ManagedStreamStart, AnEmptyPreparedTargetIsA503WithoutProbingAndRestores) {
+    managed();
+    auto coordination = managed_route();
+    prepared = { topology::managed_target_t { "", true }, {} };
+    EXPECT_FALSE(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination));
+    settle();
+    events({ "native_prepare" });
+    EXPECT_EQ(tree.get<int>("root.<xmlattr>.status_code"), 503);
+    EXPECT_EQ(client_display(), "<unset>");
+    EXPECT_FALSE(launch->display_exact);
+    EXPECT_FALSE(coordinator->managed_display(coordination.token));
+    EXPECT_EQ(restores->load(), 1);
+  }
+
+  TEST_F(ManagedStreamStart, ProbeFailureOnTheExactTargetIsA503AndRestores) {
+    managed();
+    auto coordination = managed_route();
+    fake.probes = { probed(probe_error_e::no_active_display) };
+    EXPECT_FALSE(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination));
+    settle();
+    events({ "native_prepare", "touch", "probe" });
+    EXPECT_EQ(prepares, 1) << "no fallback display or temporary encoder retry";
+    EXPECT_EQ(tree.get<int>("root.<xmlattr>.status_code"), 503);
+    EXPECT_EQ(tree.get<std::string>("root.<xmlattr>.status_message"), "original probe failure original probe hint");
+    EXPECT_EQ(client_display(), "<unset>");
+    EXPECT_FALSE(coordinator->managed_display(coordination.token));
+    EXPECT_EQ(restores->load(), 1);
+  }
+
+  TEST_F(ManagedStreamStart, ThrowingPreparationRestoresAndPropagates) {
+    managed();
+    auto coordination = managed_route();
+    coordination.managed_prepare = [](const auto &) -> topology::native_prepared_t { throw std::runtime_error { "boom" }; };
+    EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination), std::runtime_error);
+    settle();
+    EXPECT_FALSE(coordinator->bind_launch(coordination.token));
+    EXPECT_EQ(restores->load(), 1);
+  }
+
+  // G1 parity: a slow game start after preparation must not tear the display down.
+  TEST_F(ManagedStreamStart, HeldManagedLaunchOutlivesASlowAppStart) {
+    managed(100ms);
+    auto coordination = managed_route();
+    fake.probes = { probed(probe_error_e::none) };
+    ASSERT_TRUE(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination));
+    ASSERT_TRUE(coordinator->hold_prepared_launch(coordination.token));
+    std::this_thread::sleep_for(300ms);
+    coordinator->tick();
+    settle();
+    EXPECT_TRUE(coordinator->bind_launch(coordination.token));
+    EXPECT_EQ(restores->load(), 0);
+  }
+
+  TEST_F(ManagedStreamStart, AJoinerCapturesTheOwnersRecordedTargetExactly) {
+    managed();
+    auto coordination = managed_route();
+    fake.probes = { probed(probe_error_e::none) };
+    ASSERT_TRUE(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination));
+    ASSERT_TRUE(coordinator->bind_launch(coordination.token));
+
+    rtsp_stream::launch_session_t joiner {};
+    joiner.id = 43;
+    const auto joined = coordinator->admit_managed_join({ joiner.id, "joiner" });
+    ASSERT_TRUE(joined);
+    boost::property_tree::ptree join_tree;
+    ASSERT_TRUE(nvhttp::stream_start::join_managed_display(join_tree, joiner, *coordinator, *joined.token));
+    EXPECT_EQ(joiner.env["SUNSHINE_CLIENT_DISPLAY_NAME"].to_string(), "{zako-head}");
+    EXPECT_TRUE(joiner.display_exact);
+    EXPECT_EQ(prepares, 1) << "joiners never prepare again";
+    EXPECT_TRUE(coordinator->bind_launch(*joined.token));
+
+    auto stale = *joined.token;
+    ++stale.transaction;
+    rtsp_stream::launch_session_t refused {};
+    boost::property_tree::ptree refused_tree;
+    EXPECT_FALSE(nvhttp::stream_start::join_managed_display(refused_tree, refused, *coordinator, stale));
+    EXPECT_EQ(refused_tree.get<int>("root.<xmlattr>.status_code"), 503);
+    EXPECT_FALSE(refused.display_exact);
+    EXPECT_TRUE(refused.env.find("SUNSHINE_CLIENT_DISPLAY_NAME") == refused.env.end());
+  }
+
+  // G1 parity: a second client launching a slow app onto a shared lease must not be expired either.
+  TEST_F(ManagedStreamStart, HeldJoinerOutlivesASlowAppStart) {
+    managed(100ms);
+    auto coordination = managed_route();
+    fake.probes = { probed(probe_error_e::none) };
+    ASSERT_TRUE(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination));
+    ASSERT_TRUE(coordinator->bind_launch(coordination.token));
+
+    rtsp_stream::launch_session_t joiner {};
+    joiner.id = 43;
+    const auto joined = coordinator->admit_managed_join({ joiner.id, "joiner" });
+    ASSERT_TRUE(joined);
+    boost::property_tree::ptree join_tree;
+    ASSERT_TRUE(nvhttp::stream_start::join_managed_display(join_tree, joiner, *coordinator, *joined.token));
+    ASSERT_TRUE(coordinator->hold_prepared_launch(*joined.token));
+    std::this_thread::sleep_for(300ms);
+    coordinator->tick();
+    settle();
+    EXPECT_TRUE(coordinator->bind_launch(*joined.token));
+    EXPECT_EQ(restores->load(), 0);
+    EXPECT_FALSE(coordinator->hold_prepared_launch(*joined.token)) << "a bound attachment is no longer preparing";
+
+    auto stale = *joined.token;
+    stale.attachment_serial += 7;
+    EXPECT_FALSE(coordinator->hold_prepared_launch(stale)) << "only a live attachment can be held";
+  }
+
+  TEST_F(ManagedStreamStart, BundlesMustMatchTheCoordinatorMode) {
+    managed();
+    auto coordination = managed_route();
+    auto missing_prepare = coordination;
+    missing_prepare.managed_prepare = {};
+    EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &missing_prepare), std::invalid_argument);
+    auto missing_fatal = coordination;
+    missing_fatal.fatal_probe_timeout = {};
+    EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &missing_fatal), std::invalid_argument);
+    auto legacy_token = coordination;
+    legacy_token.token.flavor = topology::launch_flavor_e::legacy;
+    EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &legacy_token), std::invalid_argument);
+    auto with_legacy_cleanup = coordination;
+    with_legacy_cleanup.legacy_cleanup = [](const auto &, const auto &) {};
+    EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &with_legacy_cleanup), std::invalid_argument);
+    EXPECT_EQ(prepares, 0);
+    EXPECT_TRUE(fake.events.empty());
+    EXPECT_TRUE(coordinator->abort_launch(coordination.token, {}));
+  }
+
+  TEST_F(CoordinatedStreamStart, LegacyBundlesCannotCarryAManagedPreparation) {
+    auto coordination = route();
+    coordination.managed_prepare = [](const auto &) { return topology::native_prepared_t {}; };
+    EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination), std::invalid_argument);
+    EXPECT_TRUE(fake.events.empty());
+    EXPECT_TRUE(coordinator->abort_launch(coordination.token, {}));
+  }
 }  // namespace

@@ -45,8 +45,9 @@ namespace display_device::topology {
       if (!hooks.actor.store || !hooks.actor.observe) {
         throw std::invalid_argument { "Topology lifecycle needs the actor record store and process observer" };
       }
-      if (hooks.native && (!hooks.native->health || !hooks.native->recover || !hooks.native->restore || !hooks.native->reset)) {
-        throw std::invalid_argument { "Managed topology lifecycle needs native health, recovery, restore and reset hooks" };
+      if (hooks.native && (!hooks.native->health || !hooks.native->recover || !hooks.native->restore || !hooks.native->reset ||
+                            !hooks.native->prepare)) {
+        throw std::invalid_argument { "Managed topology lifecycle needs native health, recovery, restore, reset and prepare hooks" };
       }
       return hooks;
     }
@@ -247,6 +248,45 @@ namespace display_device::topology {
       }
     }
     return std::nullopt;
+  }
+
+  native_prepared_t
+  process_lifecycle_t::prepare_native(const mutation_capability_t &capability) {
+    if (!hooks_.native) {
+      return { std::nullopt, "Managed display topology is not active" };
+    }
+    native_prepared_t prepared;
+    try {
+      prepared = hooks_.native->prepare(capability);
+    }
+    catch (const std::exception &error) {
+      prepared = { std::nullopt, std::string { "Native prepare failed: " } + error.what() };
+      coordinator_.publish_native_health(failed_native(prepared.reason));
+      return prepared;
+    }
+    catch (...) {
+      prepared = { std::nullopt, "Native prepare failed" };
+      coordinator_.publish_native_health(failed_native(prepared.reason));
+      return prepared;
+    }
+    try {
+      coordinator_.publish_native_health(hooks_.native->health());
+    }
+    catch (const std::exception &error) {
+      coordinator_.publish_native_health(failed_native(std::string { "Native health is unknown: " } + error.what()));
+      return { std::nullopt, "Native health is unknown after prepare" };
+    }
+    catch (...) {
+      coordinator_.publish_native_health(failed_native("Native health is unknown"));
+      return { std::nullopt, "Native health is unknown after prepare" };
+    }
+    if (prepared.display && prepared.display->display.empty()) {
+      return { std::nullopt, "Native prepare returned no display" };
+    }
+    if (!prepared.display && prepared.reason.empty()) {
+      prepared.reason = "Native prepare produced no display";
+    }
+    return prepared;
   }
 
   void

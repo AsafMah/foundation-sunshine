@@ -184,6 +184,8 @@ namespace video {
     // If empty, use the default display from global configuration
     std::string display_name;
 
+    // Managed topology: capture exactly display_name or nothing (no default-display fallback).
+    bool display_exact = false;
     // Optional per-display initialization capture backend override.
     // This is intentionally scoped to a single platf::display() call so encoder
     // probing can avoid mutating the global config::video.capture string.

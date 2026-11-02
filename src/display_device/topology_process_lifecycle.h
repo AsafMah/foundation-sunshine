@@ -65,6 +65,8 @@ namespace display_device::topology {
     std::function<native_health_t(const mutation_capability_t &)> restore;
     /** Administrator reset (`reset_persistence` authority). */
     std::function<native_health_t(const mutation_capability_t &)> reset;
+    /** Managed launch preparation (`launch_prepare` authority); `health` is published after it. */
+    std::function<native_prepared_t(const mutation_capability_t &)> prepare;
   };
 
   struct lifecycle_hooks_t {
@@ -136,6 +138,13 @@ namespace display_device::topology {
      */
     std::optional<std::string>
     reset_native(const mutation_capability_t &capability);
+
+    /**
+     * Prepare a managed launch under `capability` and publish the resulting health,
+     * also when the preparation throws (In conflict). Legacy mode refuses without running anything.
+     */
+    native_prepared_t
+    prepare_native(const mutation_capability_t &capability);
 
   private:
     coordinator_options_t

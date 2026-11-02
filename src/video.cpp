@@ -1891,27 +1891,20 @@ namespace video {
     // Use client-specified display_name if provided, otherwise use the selected display
     std::string target_display_name;
     auto config = capture_ctxs.front().config;
-    if (!config.display_name.empty()) {
+    if (!config.display_name.empty() || config.display_exact) {
       // config.display_name may be a device ID (e.g., {xxx-xxx-xxx}) rather than display name (e.g., \\.\DISPLAY1)
-      // Try to convert device ID to display name first
-      std::string resolved_display_name = display_device::get_display_name(config.display_name);
-      if (resolved_display_name.empty()) {
-        // If conversion failed, use the original value (might already be a display name)
-        resolved_display_name = config.display_name;
+      const auto resolved_display_name = resolve_capture_display(config.display_name, display_device::get_display_name(config.display_name));
+      const auto chosen = select_capture_display(display_names, display_p, resolved_display_name, config.display_exact);
+      if (chosen.choice == capture_display_choice_e::refused) {
+        BOOST_LOG(error) << "Managed display [" << config.display_name << "] (resolved: " << resolved_display_name << ") is not available for capture; refusing to capture another display";
+        return;
       }
-
-      // Try to find the display in the list
-      bool found = false;
-      for (int x = 0; x < display_names.size(); ++x) {
-        if (display_names[x] == resolved_display_name) {
-          display_p = x;
-          target_display_name = resolved_display_name;
-          found = true;
-          BOOST_LOG(info) << "Using client-specified display: " << target_display_name;
-          break;
-        }
+      if (chosen.choice == capture_display_choice_e::requested) {
+        display_p = chosen.index;
+        target_display_name = resolved_display_name;
+        BOOST_LOG(info) << "Using client-specified display: " << target_display_name;
       }
-      if (!found) {
+      else {
         BOOST_LOG(warning) << "Client-specified display [" << config.display_name << "] (resolved: " << resolved_display_name << ") not found, using default display";
         target_display_name = display_names[display_p];
       }
@@ -2162,33 +2155,33 @@ namespace video {
             refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
 
             // Process any pending display switch with the new list of displays
+            auto &config = capture_ctxs.front().config;
             bool user_switched = false;
             if (switch_display_event->peek()) {
-              display_p = std::clamp(*switch_display_event->pop(), 0, (int) display_names.size() - 1);
-              user_switched = true;
+              if (const auto index = accept_display_switch(*switch_display_event->pop(), display_names.size(), config.display_exact)) {
+                display_p = *index;
+                user_switched = true;
+              }
+              else {
+                BOOST_LOG(warning) << "Ignoring a display switch: this stream captures its managed display only";
+              }
             }
 
             // Use client-specified display_name if provided (only for auto-reinit, not manual switch)
-            auto &config = capture_ctxs.front().config;
             target_display_name = display_names[display_p];
-            if (!user_switched && !config.display_name.empty()) {
+            if (!user_switched && (!config.display_name.empty() || config.display_exact)) {
               // config.display_name may be a device ID - convert to display name
-              std::string resolved_display_name = display_device::get_display_name(config.display_name);
-              if (resolved_display_name.empty()) {
-                resolved_display_name = config.display_name;
+              const auto resolved_display_name = resolve_capture_display(config.display_name, display_device::get_display_name(config.display_name));
+              const auto chosen = select_capture_display(display_names, display_p, resolved_display_name, config.display_exact);
+              if (chosen.choice == capture_display_choice_e::refused) {
+                BOOST_LOG(error) << "Managed display [" << config.display_name << "] (resolved: " << resolved_display_name << ") is no longer available for capture; refusing to capture another display";
+                break;
               }
-
-              // Try to find the display in the list
-              bool found = false;
-              for (int x = 0; x < display_names.size(); ++x) {
-                if (display_names[x] == resolved_display_name) {
-                  display_p = x;
-                  target_display_name = resolved_display_name;
-                  found = true;
-                  break;
-                }
+              if (chosen.choice == capture_display_choice_e::requested) {
+                display_p = chosen.index;
+                target_display_name = resolved_display_name;
               }
-              if (!found) {
+              else {
                 BOOST_LOG(warning) << "Client-specified display [" << config.display_name << "] (resolved: " << resolved_display_name << ") not found, using default display";
               }
             }
@@ -4033,33 +4026,33 @@ namespace video {
       refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
 
       // Process any pending display switch with the new list of displays
+      auto &config = synced_session_ctxs.front()->config;
       bool user_switched = false;
       if (switch_display_event->peek()) {
-        display_p = std::clamp(*switch_display_event->pop(), 0, (int) display_names.size() - 1);
-        user_switched = true;
+        if (const auto index = accept_display_switch(*switch_display_event->pop(), display_names.size(), config.display_exact)) {
+          display_p = *index;
+          user_switched = true;
+        }
+        else {
+          BOOST_LOG(warning) << "Ignoring a display switch: this stream captures its managed display only";
+        }
       }
 
       // Use client-specified display_name if provided (only for auto-reinit, not manual switch)
-      auto &config = synced_session_ctxs.front()->config;
       std::string target_display_name = display_names[display_p];
-      if (!user_switched && !config.display_name.empty()) {
+      if (!user_switched && (!config.display_name.empty() || config.display_exact)) {
         // config.display_name may be a device ID - convert to display name
-        std::string resolved_display_name = display_device::get_display_name(config.display_name);
-        if (resolved_display_name.empty()) {
-          resolved_display_name = config.display_name;
+        const auto resolved_display_name = resolve_capture_display(config.display_name, display_device::get_display_name(config.display_name));
+        const auto chosen = select_capture_display(display_names, display_p, resolved_display_name, config.display_exact);
+        if (chosen.choice == capture_display_choice_e::refused) {
+          BOOST_LOG(error) << "Managed display [" << config.display_name << "] (resolved: " << resolved_display_name << ") is not available for capture; refusing to capture another display";
+          break;
         }
-
-        // Try to find the display in the list
-        bool found = false;
-        for (int x = 0; x < display_names.size(); ++x) {
-          if (display_names[x] == resolved_display_name) {
-            display_p = x;
-            target_display_name = resolved_display_name;
-            found = true;
-            break;
-          }
+        if (chosen.choice == capture_display_choice_e::requested) {
+          display_p = chosen.index;
+          target_display_name = resolved_display_name;
         }
-        if (!found) {
+        else {
           BOOST_LOG(warning) << "Client-specified display [" << config.display_name << "] (resolved: " << resolved_display_name << ") not found, using default display";
         }
       }

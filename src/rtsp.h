@@ -71,6 +71,12 @@ namespace rtsp_stream {
     // consumes the ticket; runs under the ticket lock, so it must be a short leaf.
     std::function<bool()> display_activation;
 
+    // Managed topology: ends this launch's reference when its stream ends. Idempotent;
+    // called once the session no longer counts as a live video session.
+    std::function<void()> display_end;
+
+    // Capture exactly SUNSHINE_CLIENT_DISPLAY_NAME; never fall back to another display.
+    bool display_exact {};
     bool host_audio;
     std::string unique_id;
     std::string client_name;

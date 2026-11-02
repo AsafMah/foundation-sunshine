@@ -878,7 +878,7 @@ namespace display_device::topology {
     if (native_.in_conflict) {
       return { std::nullopt, reject_reason_e::recovery_required };
     }
-    if (lease_->stage == lease_stage_e::preparing || lease_->attachments.empty() ||
+    if (lease_->stage == lease_stage_e::preparing || (lease_->attachments.empty() && !lease_->app_held) ||
         lease_->attachments.size() >= options_.max_managed_attachments ||
         std::any_of(lease_->attachments.begin(), lease_->attachments.end(),
           [&](const auto &ref) { return ref.launch_session_id == request.launch_session_id; })) {
@@ -940,6 +940,30 @@ namespace display_device::topology {
       }
       touch_managed_locked();
     }
+  }
+
+  bool
+  coordinator_t::record_managed_display(const launch_token_t &token, managed_target_t display) {
+    std::lock_guard lock { mutex_ };
+    if (phase_ != coordinator_phase_e::running || stopping_ || display.display.empty()) {
+      return false;
+    }
+    expire_preparing_locked();
+    if (!matches_owner_locked(token) || lease_->flavor != launch_flavor_e::managed ||
+        lease_->stage != lease_stage_e::preparing || !lease_->prepared || lease_->display) {
+      return false;
+    }
+    lease_->display = std::move(display);
+    return true;
+  }
+
+  std::optional<managed_target_t>
+  coordinator_t::managed_display(const launch_token_t &token) {
+    std::lock_guard lock { mutex_ };
+    if (!find_attachment_locked(token)) {
+      return std::nullopt;
+    }
+    return lease_->display;
   }
 
   bool
@@ -1072,21 +1096,24 @@ namespace display_device::topology {
     }
     expire_preparing_locked();
     expire_joins_locked();
-    if (!lease_ || !lease_->prepared || lease_->stage != lease_stage_e::preparing) {
+    if (!lease_ || !lease_->prepared) {
       return false;
     }
     if (lease_->flavor == launch_flavor_e::managed) {
       auto *ref = find_attachment_locked(token);
-      if (!ref || ref->stage != lease_stage_e::preparing) {
+      // The owner holds while the lease prepares; a joiner holds its own attachment of a settled lease.
+      const bool owner = token.attachment_serial == 0;
+      if (!ref || ref->stage != lease_stage_e::preparing ||
+          (owner != (lease_->stage == lease_stage_e::preparing))) {
         return false;
       }
       ref->setup_deadline = no_deadline;
-      if (token.attachment_serial == 0) {
+      if (owner) {
         lease_->setup_deadline = no_deadline;
       }
       return true;
     }
-    if (!matches_owner_locked(token)) {
+    if (lease_->stage != lease_stage_e::preparing || !matches_owner_locked(token)) {
       return false;
     }
     lease_->setup_deadline = no_deadline;
@@ -1194,6 +1221,7 @@ namespace display_device::topology {
     std::vector<attachment_t> gone;
     bool ticket_gone = false;
     std::optional<std::size_t> streams;
+    bool app_running = false;
     if (held->flavor == launch_flavor_e::managed) {
       for (const auto &ref : held->attachments) {
         if (ref.stage == lease_stage_e::bound && options_.probes.ticket_present &&
@@ -1203,6 +1231,9 @@ namespace display_device::topology {
       }
       if (held->stage != lease_stage_e::preparing && options_.probes.active_streams) {
         streams = options_.probes.active_streams();
+      }
+      if (held->stage != lease_stage_e::preparing && options_.probes.app_running) {
+        app_running = options_.probes.app_running();
       }
     }
     else if (held->stage == lease_stage_e::bound && options_.probes.ticket_present) {
@@ -1231,7 +1262,8 @@ namespace display_device::topology {
       return;
     }
     if (lease_->attachments.empty()) {
-      if (streams && *streams == 0) {
+      lease_->app_held = app_running;
+      if (streams && *streams == 0 && !app_running) {
         release_lease_locked(true, lease_->restore_kind.value_or(command_kind_e::native_restore));
       }
       return;
@@ -1242,7 +1274,7 @@ namespace display_device::topology {
       lease_->idle_since.reset();
       return;
     }
-    if (*streams != 0) {
+    if (*streams != 0 || app_running) {
       lease_->idle_since.reset();
       return;
     }

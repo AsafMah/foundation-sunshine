@@ -320,8 +320,17 @@ namespace nvhttp {
     bool
     admit(pt::ptree &tree, rtsp_stream::launch_session_t &session, std::string_view result_node) {
       auto &coordinator = display_device::coordinated::coordinator();
-      // An empty key never supersedes: certificate-less clients wait for the lease to end.
-      const auto admission = coordinator.admit_launch({ session.id, session.client_cert_uuid });
+      managed_ = coordinator.managed_mode();
+      // Managed: every stream holds a reference; join a live lease before trying to own one.
+      // A race between the two attempts fails closed as owner_busy.
+      display_device::topology::launch_admission_t admission;
+      if (managed_) {
+        admission = coordinator.admit_managed_join({ session.id, session.client_cert_uuid });
+      }
+      if (!managed_ || (!admission && admission.reason == display_device::topology::reject_reason_e::stale_transaction)) {
+        // An empty key never supersedes: certificate-less clients wait for the lease to end.
+        admission = coordinator.admit_launch({ session.id, session.client_cert_uuid });
+      }
       if (!admission) {
         BOOST_LOG(warning) << "Display topology rejected the launch: "sv
                            << display_device::topology::to_string(admission.reason);
@@ -337,7 +346,49 @@ namespace nvhttp {
       session.display_activation = [token = *token_]() {
         return display_device::coordinated::coordinator().launch_activated(token);
       };
+      if (managed_) {
+        session.display_end = [token = *token_]() {
+          try {
+            display_device::coordinated::coordinator().end_managed_launch(token);
+          }
+          catch (const std::exception &e) {
+            BOOST_LOG(error) << "Ending the managed display reference failed: "sv << e.what();
+          }
+        };
+      }
       return true;
+    }
+
+    /** Whether this request runs the managed native topology (decided at admission). */
+    bool
+    managed() const {
+      return managed_;
+    }
+
+    /** A managed reference to an already prepared lease: capture its display, prepare nothing. */
+    bool
+    joiner() const {
+      return managed_ && token_ && token_->attachment_serial != 0;
+    }
+
+    bool
+    join(pt::ptree &tree, rtsp_stream::launch_session_t &session, std::string_view result_node) {
+      if (stream_start::join_managed_display(tree, session, display_device::coordinated::coordinator(), *token_)) {
+        return true;
+      }
+      tree.put(std::string { "root." } + std::string { result_node }, 0);
+      return false;
+    }
+
+    /** Whether the stream captures a Sunshine-owned virtual head (the NVIDIA VSync lease rule). */
+    bool
+    virtual_target(const rtsp_stream::launch_session_t &session) const {
+      if (!managed_) {
+        return display_device::resolve_display_intent(config::video, session).target ==
+               display_device::display_intent_t::target_e::vdd;
+      }
+      const auto target = display_device::coordinated::coordinator().managed_display(*token_);
+      return target && target->virtual_head;
     }
 
     /** Whether a failed request must restore what preparation changed (legacy parity). */
@@ -348,6 +399,16 @@ namespace nvhttp {
 
     stream_start::launch_coordination_t
     coordination() const {
+      if (managed_) {
+        return {
+          display_device::coordinated::coordinator(), *token_, {},
+          []() { lifetime::force_terminate(EXIT_FAILURE); },
+          {}, policy_,
+          [](const display_device::topology::mutation_capability_t &capability) {
+            return display_device::coordinated::prepare_native(capability);
+          }
+        };
+      }
       return {
         display_device::coordinated::coordinator(), *token_,
         [restore = restore_, policy = policy_](const auto &capability, const auto &) {
@@ -383,6 +444,7 @@ namespace nvhttp {
     std::shared_ptr<std::atomic_bool> restore_ { std::make_shared<std::atomic_bool>(false) };
     display_device::automatic_vdd_policy_e policy_ { display_device::automatic_vdd_policy_e::suppress };
     bool bound_ {};
+    bool managed_ {};
   };
 
   bool
@@ -721,7 +783,8 @@ namespace nvhttp {
                          << ", rule_source=" << fingerprint_match.source << ']';
     }
 
-    if (rtsp_stream::session_count() == 0) {
+    // Managed topology: every stream holds a lease reference, joining the prepared display if one exists.
+    if (display_device::coordinated::coordinator().managed_mode() || rtsp_stream::session_count() == 0) {
       // We want to prepare display only if there are no active sessions at
       // the moment. This should to be done before probing encoders as it could
       // change display device's state.
@@ -729,13 +792,20 @@ namespace nvhttp {
       if (!display_launch.admit(tree, *launch_session, "gamesession")) {
         return;
       }
-      display_launch.restore_on_failure();
+      if (display_launch.joiner()) {
+        if (!display_launch.join(tree, *launch_session, "gamesession")) {
+          return;
+        }
+      }
+      else {
+        display_launch.restore_on_failure();
 
-      const auto coordination = display_launch.coordination();
-      if (!stream_start::prepare_display_and_probe_encoders(tree, launch_session, true, &coordination)) {
-        tree.put("root.gamesession", 0);
+        const auto coordination = display_launch.coordination();
+        if (!stream_start::prepare_display_and_probe_encoders(tree, launch_session, true, &coordination)) {
+          tree.put("root.gamesession", 0);
 
-        return;
+          return;
+        }
       }
       // The app start below had no deadline before the topology owner existed; keep it that way.
       if (!display_launch.hold(tree, "gamesession")) {
@@ -755,8 +825,7 @@ namespace nvhttp {
     }
 
 #ifdef _WIN32
-    if (display_device::resolve_display_intent(config::video, *launch_session).target ==
-        display_device::display_intent_t::target_e::vdd) {
+    if (display_launch.virtual_target(*launch_session)) {
       launch_session->nvidia_vsync_lease = nvprefs_instance.acquire_vsync();
     }
 #endif
@@ -910,18 +979,26 @@ namespace nvhttp {
                          << ", rule_source=" << fingerprint_match.source << ']';
     }
 
-    if (no_active_sessions) {
+    if (no_active_sessions || display_device::coordinated::coordinator().managed_mode()) {
       // Prepare before publishing the ticket so the handshake expiration
       // window starts only when the host is ready to accept RTSP.
       if (!display_launch.admit(tree, *launch_session, "resume")) {
         return;
       }
-      const auto coordination = display_launch.coordination();
-      if (!stream_start::prepare_display_and_probe_encoders(tree, launch_session, false, &coordination)) {
-        tree.put("root.resume", 0);
-        return;
+      if (display_launch.joiner()) {
+        // The running app keeps a managed lease alive; resume captures its display again.
+        if (!display_launch.join(tree, *launch_session, "resume")) {
+          return;
+        }
       }
-      display_launch.restore_on_failure();
+      else {
+        const auto coordination = display_launch.coordination();
+        if (!stream_start::prepare_display_and_probe_encoders(tree, launch_session, false, &coordination)) {
+          tree.put("root.resume", 0);
+          return;
+        }
+        display_launch.restore_on_failure();
+      }
     }
 
     auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
@@ -936,8 +1013,7 @@ namespace nvhttp {
     }
 
 #ifdef _WIN32
-    if (display_device::resolve_display_intent(config::video, *launch_session).target ==
-        display_device::display_intent_t::target_e::vdd) {
+    if (display_launch.virtual_target(*launch_session)) {
       launch_session->nvidia_vsync_lease = nvprefs_instance.acquire_vsync();
     }
 #endif

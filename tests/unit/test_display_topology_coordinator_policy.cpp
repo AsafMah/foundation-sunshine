@@ -2144,6 +2144,113 @@ namespace {
     EXPECT_EQ(restores.load(), 1);
   }
 
+  // Legacy parity: a paused application keeps its display; only its exit starts the grace period.
+  TEST(DisplayTopologyCoordinator, ARunningApplicationHoldsAnIdleManagedLease) {
+    fake_clock_t clock;
+    std::atomic_bool app { true };
+    std::atomic_int restores {};
+    auto options = make_options(clock, true);
+    options.probes.active_streams = []() { return std::size_t { 0 }; };
+    options.probes.app_running = [&]() { return app.load(); };
+    options.native_restore = counting(restores);
+    coordinator_t coordinator { std::move(options) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto launch = coordinator.admit_launch({ 112, "cert:a" });
+    ASSERT_TRUE(launch);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *launch.token));
+    ASSERT_TRUE(coordinator.launch_activated(*launch.token));
+
+    coordinator.tick();
+    clock.advance(10s);
+    coordinator.tick();
+    EXPECT_TRUE(coordinator.status().lease) << "released while the application was still running";
+    app = false;
+    coordinator.tick();
+    clock.advance(499ms);
+    coordinator.tick();
+    EXPECT_TRUE(coordinator.status().lease) << "the application's exit must start, not skip, the grace period";
+    clock.advance(1ms);
+    coordinator.tick();
+    EXPECT_FALSE(coordinator.status().lease);
+    ASSERT_TRUE(flush(coordinator).completed());
+    EXPECT_EQ(restores.load(), 1);
+  }
+
+  TEST(DisplayTopologyCoordinator, ResumeJoinsALeaseHeldOnlyByItsRunningApplication) {
+    fake_clock_t clock;
+    std::atomic_bool app { true };
+    std::atomic_int restores {};
+    auto options = make_options(clock, true);
+    options.probes.active_streams = []() { return std::size_t { 0 }; };
+    options.probes.app_running = [&]() { return app.load(); };
+    options.native_restore = counting(restores);
+    coordinator_t coordinator { std::move(options) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 113, "cert:a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(prepare_and_bind(coordinator, *owner.token));
+    ASSERT_TRUE(coordinator.launch_activated(*owner.token));
+    ASSERT_TRUE(coordinator.end_managed_launch(*owner.token));
+    ASSERT_TRUE(coordinator.status().lease) << "the paused application keeps its display";
+    EXPECT_EQ(coordinator.status().lease->attachments, 0u);
+
+    const auto resumed = coordinator.admit_managed_join({ 114, "cert:a" });
+    ASSERT_TRUE(resumed) << to_string(resumed.reason);
+    ASSERT_TRUE(coordinator.bind_launch(*resumed.token));
+    ASSERT_TRUE(coordinator.launch_activated(*resumed.token));
+    ASSERT_TRUE(coordinator.end_managed_launch(*resumed.token));
+    ASSERT_TRUE(coordinator.status().lease);
+    app = false;
+    coordinator.tick();
+    EXPECT_FALSE(coordinator.status().lease) << "a quiescent lease ends with its application";
+    EXPECT_EQ(coordinator.admit_managed_join({ 115, "cert:a" }).reason, reject_reason_e::stale_transaction);
+    ASSERT_TRUE(flush(coordinator).completed());
+    EXPECT_EQ(restores.load(), 1);
+  }
+
+  TEST(DisplayTopologyCoordinator, OnlyThePreparedOwnerRecordsTheManagedTargetAndJoinersReadIt) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock, true) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const managed_target_t target { "{zako-head}", true };
+    const auto owner = coordinator.admit_launch({ 501, "a" });
+    ASSERT_TRUE(owner);
+    EXPECT_FALSE(coordinator.record_managed_display(*owner.token, target)) << "nothing was prepared yet";
+    EXPECT_FALSE(coordinator.managed_display(*owner.token));
+    ASSERT_TRUE(coordinator.run_launch_prepare(*owner.token, {}).completed());
+    auto stale = *owner.token;
+    ++stale.transaction;
+    EXPECT_FALSE(coordinator.record_managed_display(stale, target));
+    EXPECT_FALSE(coordinator.record_managed_display(*owner.token, { "", false })) << "an empty display is never a target";
+    ASSERT_TRUE(coordinator.record_managed_display(*owner.token, target));
+    EXPECT_EQ(coordinator.managed_display(*owner.token), target);
+    EXPECT_FALSE(coordinator.managed_display(stale));
+    ASSERT_TRUE(coordinator.bind_launch(*owner.token));
+    EXPECT_FALSE(coordinator.record_managed_display(*owner.token, { "{other}", false })) << "a bound lease keeps its target";
+    ASSERT_TRUE(coordinator.launch_activated(*owner.token));
+
+    const auto join = coordinator.admit_managed_join({ 502, "b" });
+    ASSERT_TRUE(join);
+    EXPECT_FALSE(coordinator.record_managed_display(*join.token, { "{other}", false })) << "a joiner never prepares";
+    EXPECT_EQ(coordinator.managed_display(*join.token), target);
+    ASSERT_TRUE(coordinator.abort_launch(*join.token, {}));
+    EXPECT_FALSE(coordinator.managed_display(*join.token)) << "an ended reference no longer reads the target";
+    ASSERT_TRUE(coordinator.end_managed_launch(*owner.token));
+    EXPECT_FALSE(coordinator.managed_display(*owner.token));
+  }
+
+  TEST(DisplayTopologyCoordinator, ALegacyLeaseHasNoManagedTarget) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock, false) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 503, "a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(coordinator.run_launch_prepare(*owner.token, {}).completed());
+    EXPECT_FALSE(coordinator.record_managed_display(*owner.token, { "{zako-head}", true }));
+    EXPECT_FALSE(coordinator.managed_display(*owner.token));
+    EXPECT_TRUE(coordinator.abort_launch(*owner.token, {}));
+  }
+
   TEST(DisplayTopologyCoordinator, EndManagedLeasePostsTheRestoreExactlyOnce) {
     fake_clock_t clock;
     std::vector<command_kind_e> restore_kinds;

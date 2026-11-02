@@ -159,6 +159,8 @@ namespace display_device::topology {
       native_health_t native_reset;
       std::function<void()> native_recover_extra;
       std::function<void()> native_restore_extra;
+      native_prepared_t native_prepared { managed_target_t { "{zako-head}", true }, {} };
+      std::function<void()> native_prepare_extra;
 
       ~fixture_t() {
         observation = process_observation_e::exited;
@@ -270,6 +272,12 @@ namespace display_device::topology {
           capability.require(operation_e::reset_persistence);
           saw(capability.kind(), "native_reset");
           return native_reset;
+        };
+        result.prepare = [this](const mutation_capability_t &capability) {
+          capability.require(operation_e::native_apply);
+          saw(capability.kind(), "native_prepare");
+          if (native_prepare_extra) native_prepare_extra();
+          return native_prepared;
         };
         return result;
       }
@@ -536,6 +544,7 @@ namespace display_device::topology {
         [](auto &n) { n.recover = nullptr; },
         [](auto &n) { n.restore = nullptr; },
         [](auto &n) { n.reset = nullptr; },
+        [](auto &n) { n.prepare = nullptr; },
       };
       for (std::size_t index = 0; index < removals.size(); ++index) {
         fixture_t f;
@@ -711,6 +720,76 @@ namespace display_device::topology {
         [&](const mutation_capability_t &capability, const command_context_t &) { failure = lifecycle.reset_native(capability); });
       EXPECT_TRUE(ran.completed());
       EXPECT_FALSE(failure) << *failure;
+    }
+
+    namespace {
+      struct prepared_in_launch_t {
+        native_prepared_t prepared { std::nullopt, "not run" };
+        native_health_t published;
+      };
+
+      prepared_in_launch_t
+      prepare_in_launch(process_lifecycle_t &lifecycle) {
+        auto &coordinator = lifecycle.coordinator();
+        const auto admission = coordinator.admit_launch({ 7, "cert:a" });
+        EXPECT_TRUE(admission) << to_string(admission.reason);
+        prepared_in_launch_t result;
+        if (admission) {
+          EXPECT_TRUE(coordinator.run_launch_prepare(*admission.token, [&](const mutation_capability_t &capability, const command_context_t &) {
+            result.prepared = lifecycle.prepare_native(capability);
+            result.published = coordinator.status().native;
+          }).completed());
+          coordinator.abort_launch(*admission.token, {});
+        }
+        return result;
+      }
+    }  // namespace
+
+    TEST(ProcessLifecycleManaged, PrepareNativeReturnsTheTargetAndPublishesTheNewHealth) {
+      fixture_t f;
+      auto &lifecycle = f.make_managed();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      f.native_initial = { true, false, "journaled" };
+      const auto [prepared, published] = prepare_in_launch(lifecycle);
+      EXPECT_EQ(prepared.display, (managed_target_t { "{zako-head}", true })) << prepared.reason;
+      EXPECT_EQ(f.seen_kinds().back(), kind::launch_prepare);
+      const auto events = f.log.events();
+      EXPECT_EQ(std::count(events.begin(), events.end(), "native_prepare"), 1);
+      EXPECT_TRUE(same_health(published, f.native_initial)) << "the prepare's journal is published before the launch proceeds";
+    }
+
+    TEST(ProcessLifecycleManaged, ARefusedNativePrepareHasNoTargetAndKeepsItsReason) {
+      fixture_t f;
+      f.native_prepared = { std::nullopt, "no virtual display driver" };
+      auto &lifecycle = f.make_managed();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      const auto prepared = prepare_in_launch(lifecycle).prepared;
+      EXPECT_FALSE(prepared.display);
+      EXPECT_EQ(prepared.reason, "no virtual display driver");
+    }
+
+    TEST(ProcessLifecycleManaged, AThrowingNativePrepareIsInConflictAndHasNoTarget) {
+      fixture_t f;
+      f.native_prepare_extra = []() { throw std::runtime_error { "prepare exploded" }; };
+      auto &lifecycle = f.make_managed();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      const auto [prepared, published] = prepare_in_launch(lifecycle);
+      EXPECT_FALSE(prepared.display);
+      EXPECT_NE(prepared.reason.find("prepare exploded"), std::string::npos) << prepared.reason;
+      EXPECT_TRUE(published.in_conflict);
+    }
+
+    TEST(ProcessLifecycleManaged, LegacyPrepareNativeRefusesWithoutRunningAnything) {
+      fixture_t f;
+      auto &lifecycle = f.make();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      native_prepared_t prepared;
+      const auto ran = lifecycle.coordinator().run(kind::reset_persistence,
+        [&](const mutation_capability_t &capability, const command_context_t &) { prepared = lifecycle.prepare_native(capability); });
+      EXPECT_TRUE(ran.completed());
+      EXPECT_FALSE(prepared.display);
+      EXPECT_FALSE(prepared.reason.empty());
+      EXPECT_EQ(f.log.events(), (std::vector<std::string> { "startup" }));
     }
 
   }  // namespace
