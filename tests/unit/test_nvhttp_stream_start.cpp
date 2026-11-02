@@ -50,6 +50,8 @@ namespace {
     std::deque<video::probe_result_t> probes;
     std::vector<configure_call_t> configured;
     std::vector<probe_call_t> probed;
+    std::deque<video::probe_result_t> joiner_admissions;
+    std::vector<video::probe_target_t> joiners_admitted;
     std::vector<std::string> events;
     std::vector<bool> touch;
     std::vector<display_device::automatic_vdd_policy_e> policies;
@@ -198,6 +200,18 @@ namespace video {
     probe_outcome_t outcome;
     outcome.status = probe_encoders(std::move(target));
     outcome.result = last_encoder_probe_result;
+    outcome.encoder_generation = 7;
+    if (outcome.status == 0) outcome.admission = admission::pending_t::unaccounted();
+    return outcome;
+  }
+
+  probe_outcome_t
+  admit_existing(const probe_target_t &target) {
+    fake.events.push_back("admit_existing");
+    fake.joiners_admitted.push_back(target);
+    probe_outcome_t outcome;
+    outcome.result = consume(fake.joiner_admissions, "joiner admission");
+    outcome.status = outcome.result ? 0 : -1;
     outcome.encoder_generation = 7;
     if (outcome.status == 0) outcome.admission = admission::pending_t::unaccounted();
     return outcome;
@@ -934,13 +948,28 @@ namespace {
 
     rtsp_stream::launch_session_t joiner {};
     joiner.id = 43;
+    joiner.width = 1280;
+    joiner.height = 720;
+    joiner.fps = 60;
     const auto joined = coordinator->admit_managed_join({ joiner.id, "joiner" });
     ASSERT_TRUE(joined);
     boost::property_tree::ptree join_tree;
+    const auto probes_before = fake.probed.size();
+    fake.joiner_admissions = { probed(probe_error_e::none) };
     ASSERT_TRUE(nvhttp::stream_start::join_managed_display(join_tree, joiner, *coordinator, *joined.token));
     EXPECT_EQ(joiner.env["SUNSHINE_CLIENT_DISPLAY_NAME"].to_string(), "{zako-head}");
     EXPECT_TRUE(joiner.display_exact);
-    EXPECT_FALSE(joiner.video_admission) << "joiners are not admitted yet; an enforced budget refuses their capture";
+    EXPECT_EQ(fake.probed.size(), probes_before) << "a joiner never reprobes: that would stale the owner's admission";
+    ASSERT_EQ(fake.joiners_admitted.size(), 1u);
+    EXPECT_EQ(fake.joiners_admitted[0].output_name, "{zako-head}");
+    EXPECT_EQ(fake.joiners_admitted[0].policy, video::probe_target_policy_e::exact);
+    ASSERT_TRUE(fake.joiners_admitted[0].mode);
+    EXPECT_EQ(fake.joiners_admitted[0].mode->width, 1280u);
+    EXPECT_EQ(fake.joiners_admitted[0].mode->height, 720u);
+    EXPECT_EQ(fake.joiners_admitted[0].mode->fps, 60u);
+    ASSERT_TRUE(joiner.video_admission) << "the joiner carries its own admission";
+    EXPECT_EQ(joiner.video_admission->encoder_generation, 7u);
+    EXPECT_TRUE(joiner.video_admission->pending.commit());
     EXPECT_EQ(prepares, 1) << "joiners never prepare again";
     EXPECT_TRUE(coordinator->bind_launch(*joined.token));
 
@@ -967,6 +996,7 @@ namespace {
     const auto joined = coordinator->admit_managed_join({ joiner.id, "joiner" });
     ASSERT_TRUE(joined);
     boost::property_tree::ptree join_tree;
+    fake.joiner_admissions = { probed(probe_error_e::none) };
     ASSERT_TRUE(nvhttp::stream_start::join_managed_display(join_tree, joiner, *coordinator, *joined.token));
     ASSERT_TRUE(coordinator->hold_prepared_launch(*joined.token));
     std::this_thread::sleep_for(300ms);
@@ -1007,5 +1037,33 @@ namespace {
     EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination), std::invalid_argument);
     EXPECT_TRUE(fake.events.empty());
     EXPECT_TRUE(coordinator->abort_launch(coordination.token, {}));
+  }
+}  // namespace
+
+namespace {
+  TEST_F(ManagedStreamStart, ARefusedJoinerIsA503AndCapturesNothing) {
+    managed();
+    auto coordination = managed_route();
+    fake.probes = { probed(probe_error_e::none) };
+    ASSERT_TRUE(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination));
+    ASSERT_TRUE(coordinator->bind_launch(coordination.token));
+    const auto published = video::last_encoder_probe_result.message;
+
+    rtsp_stream::launch_session_t joiner {};
+    joiner.id = 43;
+    const auto joined = coordinator->admit_managed_join({ joiner.id, "joiner" });
+    ASSERT_TRUE(joined);
+    auto refusal = probed(probe_error_e::no_working_encoder);
+    refusal.message = "The live admission budget refused the requested display: full";
+    fake.joiner_admissions = { refusal };
+    boost::property_tree::ptree join_tree;
+    EXPECT_FALSE(nvhttp::stream_start::join_managed_display(join_tree, joiner, *coordinator, *joined.token));
+    EXPECT_EQ(join_tree.get<int>("root.<xmlattr>.status_code"), 503);
+    EXPECT_NE(join_tree.get<std::string>("root.<xmlattr>.status_message").find(refusal.message), std::string::npos) << "the joiner's own refusal, not the global result";
+    EXPECT_EQ(video::last_encoder_probe_result.message, published) << "a joiner never publishes";
+    EXPECT_FALSE(joiner.display_exact);
+    EXPECT_TRUE(joiner.env.find("SUNSHINE_CLIENT_DISPLAY_NAME") == joiner.env.end());
+    EXPECT_FALSE(joiner.video_admission);
+    EXPECT_FALSE(fake.joiners_admitted[0].mode) << "no launch mode, no mode";
   }
 }  // namespace

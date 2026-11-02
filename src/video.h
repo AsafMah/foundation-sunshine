@@ -718,6 +718,15 @@ namespace video {
   probe_outcome_t
   probe_encoders_with_outcome(std::optional<probe_target_t> target = std::nullopt);
 
+  /**
+   * @brief Admit an exact target against the current encoder selection without
+   * reprobing: a joiner of an already prepared topology. Never changes the
+   * chosen encoder or last_encoder_probe_result, so a ticket granted to the
+   * launch it joins stays valid.
+   */
+  probe_outcome_t
+  admit_existing(const probe_target_t &target);
+
   namespace testing {
     /** Install the live admission budget; null disables accounting (the production default). */
     void

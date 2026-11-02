@@ -849,3 +849,63 @@ TEST(VideoAdmissionTicket, AReprobeBeforeTheFirstStreamAttachesStalesItsTicket) 
   ticket.reset();
   EXPECT_EQ(budget.sessions(0x10), 0u);
 }
+TEST(VideoJoinerAdmission, AJoinerIsAdmittedOnTheOwnersSelectionBeforeItCaptures) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 } }, { { "FAKE_A", 0x10 } } };
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 2, ample_rate } } } };
+  scoped_global_probe_t global { 0 };
+
+  auto owner = video::probe_encoders_with_outcome(exact_target("FAKE_A"));
+  ASSERT_EQ(owner.status, 0) << owner.result.message;
+  const auto published = video::last_encoder_probe_result.message;
+  const auto generation = video::testing::encoder_generation();
+
+  // Nothing captures yet: the owner's stream has not attached.
+  auto joiner = video::admit_existing(exact_target("FAKE_A", video::probe_mode_t { 1280, 720, 60 }));
+  ASSERT_EQ(joiner.status, 0) << joiner.result.message;
+  EXPECT_EQ(video::testing::encoder_generation(), generation) << "a joiner never reselects";
+  EXPECT_EQ(joiner.encoder_generation, owner.encoder_generation);
+  EXPECT_EQ(video::last_encoder_probe_result.message, published) << "a joiner never publishes";
+  EXPECT_EQ(budget.sessions(0x10), 2u);
+
+  auto owner_capture = video::testing::attach_capture(ticketed_config("FAKE_A", ticket_from(owner)));
+  ASSERT_TRUE(owner_capture) << "the joiner did not stale the owner's ticket";
+  auto joiner_capture = video::testing::attach_capture(ticketed_config("FAKE_A", ticket_from(joiner)));
+  ASSERT_TRUE(joiner_capture);
+  expect_only(*joiner_capture, 1);
+  EXPECT_EQ(platform.opened("FAKE_A"), 1) << "both share the one source";
+  EXPECT_EQ(budget.sessions(0x10), 2u);
+  joiner_capture.reset();
+  EXPECT_EQ(budget.sessions(0x10), 1u);
+  owner_capture.reset();
+  EXPECT_EQ(budget.sessions(0x10), 0u);
+}
+
+TEST(VideoJoinerAdmission, AJoinerOverTheBudgetIsRefused) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 } }, { { "FAKE_A", 0x10 } } };
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 1, ample_rate } } } };
+  scoped_global_probe_t global { 0 };
+
+  auto owner = video::probe_encoders_with_outcome(exact_target("FAKE_A"));
+  ASSERT_EQ(owner.status, 0) << owner.result.message;
+  const auto generation = video::testing::encoder_generation();
+  auto joiner = video::admit_existing(exact_target("FAKE_A"));
+  EXPECT_NE(joiner.status, 0);
+  EXPECT_NE(joiner.result.message.find("budget"), std::string::npos) << joiner.result.message;
+  EXPECT_FALSE(joiner.admission.commit());
+  EXPECT_EQ(video::testing::encoder_generation(), generation);
+  EXPECT_EQ(budget.sessions(0x10), 1u);
+}
+
+TEST(VideoJoinerAdmission, AJoinerWithoutAChosenEncoderIsRefused) {
+  if (!video::testing::chosen_encoder_name().empty()) {
+    GTEST_SKIP() << "An encoder was already chosen by an earlier test";
+  }
+  const auto generation = video::testing::encoder_generation();
+  auto joiner = video::admit_existing(exact_target("FAKE_A"));
+  EXPECT_NE(joiner.status, 0);
+  EXPECT_EQ(joiner.result.error, video::probe_error_e::no_working_encoder);
+  EXPECT_FALSE(joiner.admission.commit());
+  EXPECT_EQ(video::testing::encoder_generation(), generation);
+}

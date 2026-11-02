@@ -335,8 +335,7 @@ namespace nvhttp::stream_start {
     }
 
     void
-    set_video_probe_error(pt::ptree &tree) {
-      const auto &probe_result = video::last_encoder_probe_result;
+    set_video_probe_error(pt::ptree &tree, const video::probe_result_t &probe_result) {
       const std::string status_message = probe_result.message.empty() ?
                                            "Sunshine could not initialize display capture or video encoding." :
                                            probe_result.message;
@@ -354,6 +353,11 @@ namespace nvhttp::stream_start {
         "video",
         "encoder_probe",
         true);
+    }
+
+    void
+    set_video_probe_error(pt::ptree &tree) {
+      set_video_probe_error(tree, video::last_encoder_probe_result);
     }
 
     bool
@@ -870,6 +874,25 @@ namespace nvhttp::stream_start {
     launch_session.display_exact = true;
   }
 
+  // The exact target a managed launch is admitted on, with the launch's mode when it has one.
+  static video::probe_target_t
+  managed_probe_target(const rtsp_stream::launch_session_t &launch_session, const std::string &display) {
+    video::probe_target_t target { display, video::probe_target_policy_e::exact };
+    if (launch_session.width > 0 && launch_session.height > 0 && launch_session.fps > 0) {
+      target.mode = video::probe_mode_t { static_cast<std::uint32_t>(launch_session.width), static_cast<std::uint32_t>(launch_session.height),
+        static_cast<std::uint32_t>(launch_session.fps) };
+    }
+    return target;
+  }
+
+  static void
+  carry_admission(rtsp_stream::launch_session_t &launch_session, video::probe_outcome_t &outcome) {
+    auto ticket = std::make_shared<video::admission_ticket_t>();
+    ticket->pending = std::move(outcome.admission);
+    ticket->encoder_generation = outcome.encoder_generation;
+    launch_session.video_admission = std::move(ticket);
+  }
+
   static void
   set_managed_display_error(pt::ptree &tree, const std::string &reason) {
     set_sunshine_error(tree, 503, "The managed display topology could not be prepared: " + reason,
@@ -893,12 +916,7 @@ namespace nvhttp::stream_start {
 #ifdef _WIN32
     start_touch_keyboard(launch_session);
 #endif
-    video::probe_target_t target { prepared.display->display, video::probe_target_policy_e::exact };
-    if (launch_session.width > 0 && launch_session.height > 0 && launch_session.fps > 0) {
-      target.mode = video::probe_mode_t { static_cast<std::uint32_t>(launch_session.width), static_cast<std::uint32_t>(launch_session.height),
-        static_cast<std::uint32_t>(launch_session.fps) };
-    }
-    auto outcome = preparation.probe_admitted(std::move(target));
+    auto outcome = preparation.probe_admitted(managed_probe_target(launch_session, prepared.display->display));
     if (outcome.status != 0) {
       set_video_probe_error(tree);
       return false;
@@ -908,10 +926,7 @@ namespace nvhttp::stream_start {
       throw preparation_error_t { { topology::outcome_e::rejected, topology::reject_reason_e::stale_transaction } };
     }
     adopt_managed_display(launch_session, *prepared.display);
-    auto ticket = std::make_shared<video::admission_ticket_t>();
-    ticket->pending = std::move(outcome.admission);
-    ticket->encoder_generation = outcome.encoder_generation;
-    launch_session.video_admission = std::move(ticket);
+    carry_admission(launch_session, outcome);
     return true;
   }
 
@@ -1077,7 +1092,15 @@ namespace nvhttp::stream_start {
       set_managed_display_error(tree, "the shared topology has no prepared target");
       return false;
     }
+    // Admitted against the selection the owner was probed on; a reprobe here
+    // would stale the owner's own admission.
+    auto outcome = video::admit_existing(managed_probe_target(launch_session, target->display));
+    if (outcome.status != 0) {
+      set_video_probe_error(tree, outcome.result);
+      return false;
+    }
     adopt_managed_display(launch_session, *target);
+    carry_admission(launch_session, outcome);
     return true;
   }
 

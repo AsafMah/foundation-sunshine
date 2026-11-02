@@ -5372,6 +5372,13 @@ namespace video {
     return outcome.status;
   }
 
+  probe_outcome_t
+  admit_existing(const probe_target_t &target) {
+    // The launch it joins was probed on this selection; whether or not that
+    // stream is capturing yet, admit like a live admission.
+    return probe_live(target);
+  }
+
   namespace {
   int
   probe_encoders_global(std::optional<probe_target_t> target) {
