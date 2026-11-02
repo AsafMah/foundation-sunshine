@@ -181,6 +181,34 @@ namespace video {
   std::expected<void, std::string>
   commit_replacement(const std::shared_ptr<admission_ticket_t> &ticket, admission::pending_t replacement);
 
+  struct exact_move_state_t;
+
+  /**
+   * Fences an exact capture through a managed head mode change that may re-create
+   * the head under a new display id. It keeps the live capture of that display
+   * running while held, and that capture waits for a missing display instead of
+   * ending; `retarget` moves that capture, and its source, to the head's new
+   * display. Released without a retarget, a display that is gone ends the
+   * capture as before.
+   */
+  class exact_capture_move_t {
+  public:
+    explicit exact_capture_move_t(std::string display);
+    ~exact_capture_move_t();
+    exact_capture_move_t(const exact_capture_move_t &) = delete;
+    exact_capture_move_t &
+    operator=(const exact_capture_move_t &) = delete;
+
+    /** Refused unless the capture held at construction still captures the current display, or when another capture owns @p display. */
+    std::expected<void, std::string>
+    retarget(const std::string &display);
+
+  private:
+    std::string _display;
+    std::shared_ptr<exact_move_state_t> _state;
+    std::shared_ptr<void> _source;  ///< A ref of the held capture.
+  };
+
   /**
    * Whether the encoder follows a host display size change. A managed (exact)
    * head only changes size on the client's request, so it always follows; other

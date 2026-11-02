@@ -23,8 +23,8 @@ namespace {
   // Each fake source stamps its id into every image's width.
   class fake_display_t: public platf::display_t {
   public:
-    explicit fake_display_t(int id, std::function<void()> on_close = {}):
-        _id { id }, _on_close { std::move(on_close) } {}
+    explicit fake_display_t(int id, std::function<void()> on_close = {}, std::shared_ptr<std::atomic_bool> gone = {}):
+        _id { id }, _on_close { std::move(on_close) }, _gone { std::move(gone) } {}
 
     ~fake_display_t() override {
       if (_on_close) {
@@ -35,6 +35,10 @@ namespace {
     platf::capture_e
     capture(const push_captured_image_cb_t &push, const pull_free_image_cb_t &pull, bool *) override {
       while (true) {
+        if (_gone && _gone->load()) {
+          // The output went away, as DXGI reports access lost.
+          return platf::capture_e::reinit;
+        }
         std::shared_ptr<platf::img_t> img;
         if (!pull(img)) {
           return platf::capture_e::ok;
@@ -60,6 +64,7 @@ namespace {
   private:
     int _id;
     std::function<void()> _on_close;
+    std::shared_ptr<std::atomic_bool> _gone;
   };
 
   class fake_capture_platform_t {
@@ -78,9 +83,14 @@ namespace {
           if (it == _sources.end()) {
             return nullptr;
           }
-          return std::make_shared<fake_display_t>(it->second, [this] { closed(); });
+          auto &gone = _gone[name];
+          if (!gone) {
+            gone = std::make_shared<std::atomic_bool>(false);
+          }
+          return std::make_shared<fake_display_t>(it->second, [this] { closed(); }, gone);
         },
         [this](platf::mem_type_e) {
+          std::lock_guard lg { _lock };
           std::vector<std::string> names;
           for (const auto &[name, id] : _sources) {
             names.push_back(name);
@@ -113,6 +123,26 @@ namespace {
       _on_close = std::move(callback);
     }
 
+    // The head behind @p from is re-created under @p to (empty: it does not come back).
+    void
+    move_source(const std::string &from, const std::string &to, int id) {
+      std::lock_guard lg { _lock };
+      _sources.erase(from);
+      if (const auto it = _gone.find(from); it != _gone.end()) {
+        it->second->store(true);
+        _gone.erase(it);
+      }
+      if (!to.empty()) {
+        _sources[to] = id;
+      }
+    }
+
+    void
+    add_source(const std::string &name, int id) {
+      std::lock_guard lg { _lock };
+      _sources[name] = id;
+    }
+
   private:
     void
     closed() {
@@ -131,6 +161,7 @@ namespace {
     std::map<std::string, std::uint64_t> _adapters;
     std::mutex _lock;
     std::map<std::string, int> _opened;
+    std::map<std::string, std::shared_ptr<std::atomic_bool>> _gone;
     bool _installed_mail = false;
   };
 
@@ -1224,4 +1255,207 @@ TEST(VideoJoinerAdmission, AJoinerWithoutAChosenEncoderIsRefused) {
   EXPECT_EQ(joiner.result.error, video::probe_error_e::no_working_encoder);
   EXPECT_FALSE(joiner.admission.commit());
   EXPECT_EQ(video::testing::encoder_generation(), generation);
+}
+namespace {
+  // True once @p attachment delivers frames of @p id.
+  bool
+  switches_to(video::testing::capture_attachment_t &attachment, int id) {
+    for (int i = 0; i < 500; ++i) {
+      const auto source = next_source(attachment);
+      if (source == id) {
+        return true;
+      }
+      if (source == -1) {
+        return false;
+      }
+    }
+    return false;
+  }
+
+  // True when @p attachment stops delivering frames, having delivered only @p id.
+  bool
+  ends_on(video::testing::capture_attachment_t &attachment, int id) {
+    for (int i = 0; i < 500; ++i) {
+      const auto source = next_source(attachment);
+      if (source == -1) {
+        return true;
+      }
+      if (source != id) {
+        return false;
+      }
+    }
+    return false;
+  }
+}  // namespace
+
+TEST(VideoCaptureRetarget, AHeldCaptureFollowsItsHeadToItsNewDisplay) {
+  fake_capture_platform_t platform { { { "MOVE1_OLD", 1 } } };
+  auto capture = video::testing::attach_capture(exact_config("MOVE1_OLD"));
+  ASSERT_TRUE(capture);
+  expect_only(*capture, 1);
+  {
+    video::exact_capture_move_t move { "MOVE1_OLD" };
+    platform.move_source("MOVE1_OLD", "MOVE1_NEW", 2);
+    std::this_thread::sleep_for(100ms);
+    const auto moved = move.retarget("MOVE1_NEW");
+    ASSERT_TRUE(moved) << moved.error();
+    EXPECT_TRUE(switches_to(*capture, 2));
+  }
+  expect_only(*capture, 2);
+  EXPECT_EQ(platform.opened("MOVE1_NEW"), 1);
+}
+
+TEST(VideoCaptureRetarget, ARetargetBeforeTheNewDisplayAppearsWaitsForIt) {
+  fake_capture_platform_t platform { { { "MOVE2_OLD", 1 } } };
+  auto capture = video::testing::attach_capture(exact_config("MOVE2_OLD"));
+  ASSERT_TRUE(capture);
+  expect_only(*capture, 1);
+  {
+    video::exact_capture_move_t move { "MOVE2_OLD" };
+    const auto moved = move.retarget("MOVE2_NEW");
+    ASSERT_TRUE(moved) << moved.error();
+    platform.move_source("MOVE2_OLD", "", 0);
+    std::this_thread::sleep_for(200ms);
+    platform.add_source("MOVE2_NEW", 2);
+    EXPECT_TRUE(switches_to(*capture, 2));
+  }
+  expect_only(*capture, 2);
+}
+
+TEST(VideoCaptureRetarget, WithoutAHoldAVanishedHeadEndsTheCapture) {
+  fake_capture_platform_t platform { { { "MOVE3_OLD", 1 } } };
+  auto capture = video::testing::attach_capture(exact_config("MOVE3_OLD"));
+  ASSERT_TRUE(capture);
+  expect_only(*capture, 1);
+  platform.move_source("MOVE3_OLD", "MOVE3_NEW", 2);
+  EXPECT_TRUE(ends_on(*capture, 1));
+  EXPECT_EQ(platform.opened("MOVE3_NEW"), 0);
+}
+
+TEST(VideoCaptureRetarget, AHoldReleasedWithoutARetargetEndsTheCapture) {
+  fake_capture_platform_t platform { { { "MOVE4_OLD", 1 } } };
+  auto capture = video::testing::attach_capture(exact_config("MOVE4_OLD"));
+  ASSERT_TRUE(capture);
+  expect_only(*capture, 1);
+  {
+    video::exact_capture_move_t move { "MOVE4_OLD" };
+    platform.move_source("MOVE4_OLD", "MOVE4_NEW", 2);
+    std::this_thread::sleep_for(300ms);
+  }
+  EXPECT_TRUE(ends_on(*capture, 1));
+  EXPECT_EQ(platform.opened("MOVE4_NEW"), 0);
+}
+
+TEST(VideoCaptureRetarget, ARetargetOntoAnotherLiveCaptureIsRefused) {
+  fake_capture_platform_t platform { { { "MOVE5_A", 1 }, { "MOVE5_B", 2 } } };
+  auto a = video::testing::attach_capture(exact_config("MOVE5_A"));
+  ASSERT_TRUE(a);
+  expect_only(*a, 1);
+  auto b = video::testing::attach_capture(exact_config("MOVE5_B"));
+  ASSERT_TRUE(b);
+  expect_only(*b, 2);
+  {
+    video::exact_capture_move_t move { "MOVE5_A" };
+    const auto moved = move.retarget("MOVE5_B");
+    ASSERT_FALSE(moved);
+    EXPECT_NE(moved.error().find("another capture"), std::string::npos) << moved.error();
+  }
+  expect_only(*a, 1);
+  expect_only(*b, 2);
+}
+
+TEST(VideoCaptureRetarget, ARetargetWithoutALiveCaptureIsRefused) {
+  fake_capture_platform_t platform { { { "MOVE6_OLD", 1 } } };
+  {
+    video::exact_capture_move_t move { "MOVE6_OLD" };
+    const auto moved = move.retarget("MOVE6_NEW");
+    ASSERT_FALSE(moved);
+    EXPECT_NE(moved.error().find("no exact capture"), std::string::npos) << moved.error();
+  }
+  {
+    auto ended = video::testing::attach_capture(exact_config("MOVE6_OLD"));
+    ASSERT_TRUE(ended);
+    expect_only(*ended, 1);
+  }
+  // Its capture ended: the idle source is not moved.
+  video::exact_capture_move_t move { "MOVE6_OLD" };
+  const auto moved = move.retarget("MOVE6_NEW");
+  ASSERT_FALSE(moved);
+  EXPECT_NE(moved.error().find("no exact capture"), std::string::npos) << moved.error();
+  auto capture = video::testing::attach_capture(exact_config("MOVE6_OLD"));
+  ASSERT_TRUE(capture);
+  expect_only(*capture, 1);
+}
+
+TEST(VideoCaptureRetarget, AJoinerOnTheNewDisplaySharesTheMovedCapture) {
+  fake_capture_platform_t platform { { { "MOVE7_OLD", 1 } } };
+  auto capture = video::testing::attach_capture(exact_config("MOVE7_OLD"));
+  ASSERT_TRUE(capture);
+  expect_only(*capture, 1);
+  {
+    video::exact_capture_move_t move { "MOVE7_OLD" };
+    platform.move_source("MOVE7_OLD", "MOVE7_NEW", 2);
+    const auto moved = move.retarget("MOVE7_NEW");
+    ASSERT_TRUE(moved) << moved.error();
+    // Joins at once, possibly before the capture thread has followed.
+    auto joiner = video::testing::attach_capture(exact_config("MOVE7_NEW"));
+    ASSERT_TRUE(joiner);
+    EXPECT_TRUE(switches_to(*joiner, 2));
+    EXPECT_TRUE(switches_to(*capture, 2));
+  }
+  EXPECT_EQ(platform.opened("MOVE7_NEW"), 1);
+}
+TEST(VideoCaptureRetarget, AFollowDoesNotWaitForTheOldOutputToReportLoss) {
+  fake_capture_platform_t platform { { { "MOVE8_OLD", 1 } } };
+  auto capture = video::testing::attach_capture(exact_config("MOVE8_OLD"));
+  ASSERT_TRUE(capture);
+  expect_only(*capture, 1);
+  {
+    video::exact_capture_move_t move { "MOVE8_OLD" };
+    // The old output keeps delivering frames, as if access loss were never reported.
+    platform.add_source("MOVE8_NEW", 2);
+    const auto moved = move.retarget("MOVE8_NEW");
+    ASSERT_TRUE(moved) << moved.error();
+    EXPECT_TRUE(switches_to(*capture, 2));
+  }
+  expect_only(*capture, 2);
+}
+TEST(VideoCaptureRetarget, AHeldCaptureOutlivesItsLastSession) {
+  fake_capture_platform_t platform { { { "MOVE9_OLD", 1 } } };
+  auto capture = video::testing::attach_capture(exact_config("MOVE9_OLD"));
+  ASSERT_TRUE(capture);
+  expect_only(*capture, 1);
+  video::exact_capture_move_t move { "MOVE9_OLD" };
+  capture.reset();
+  // The move still holds the capture it fences, so it can still move it.
+  platform.add_source("MOVE9_NEW", 2);
+  const auto moved = move.retarget("MOVE9_NEW");
+  ASSERT_TRUE(moved) << moved.error();
+  auto joiner = video::testing::attach_capture(exact_config("MOVE9_NEW"));
+  ASSERT_TRUE(joiner);
+  EXPECT_TRUE(switches_to(*joiner, 2));
+  EXPECT_EQ(platform.opened("MOVE9_OLD"), 1);
+  EXPECT_EQ(platform.opened("MOVE9_NEW"), 1);
+}
+
+TEST(VideoCaptureRetarget, AMoveIsRefusedOnceItsCaptureWasReplaced) {
+  fake_capture_platform_t platform { { { "MOVE10_OLD", 1 }, { "MOVE10_NEW", 2 }, { "MOVE10_OTHER", 3 } } };
+  auto first = video::testing::attach_capture(exact_config("MOVE10_OLD"));
+  ASSERT_TRUE(first);
+  expect_only(*first, 1);
+  video::exact_capture_move_t stale { "MOVE10_OLD" };
+  {
+    video::exact_capture_move_t move { "MOVE10_OLD" };
+    const auto moved = move.retarget("MOVE10_NEW");
+    ASSERT_TRUE(moved) << moved.error();
+  }
+  // A new capture now runs under the old name; the stale move does not own it.
+  auto second = video::testing::attach_capture(exact_config("MOVE10_OLD"));
+  ASSERT_TRUE(second);
+  expect_only(*second, 1);
+  const auto moved = stale.retarget("MOVE10_OTHER");
+  ASSERT_FALSE(moved);
+  EXPECT_NE(moved.error().find("not the one held"), std::string::npos) << moved.error();
+  expect_only(*second, 1);
+  EXPECT_EQ(platform.opened("MOVE10_OTHER"), 0);
 }

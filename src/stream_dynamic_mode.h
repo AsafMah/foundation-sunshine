@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdint>
+#include <expected>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -111,16 +112,19 @@ namespace stream::dynamic_mode {
    * - `run_exclusive(body) -> bool`: runs `body` only while this is the only video session.
    * - `reserve(w, h) -> std::expected<P, std::string>`: admits the new mode while the old one stays held.
    * - `change(w, h) -> head_change_t`: the topology owner's head mode change.
+   * - `retarget(display) -> std::expected<void, std::string>`: moves the session's capture to the head's new
+   *   display (a head re-created by its driver comes back under a new display id).
    * - `commit(P &&) -> std::expected<void, std::string>`: swaps the session's admission to the new mode.
    * - `apply(w, h)`: the session follows (config, perf, IDR).
    *
-   * Nothing past a refusal runs. Once the head may have changed, any failure (conflict, a moved head, a refused
-   * commit) changes it back to the old mode on the same display; if that cannot be proven the outcome is `failed`.
+   * Nothing past a refusal runs. A head that moved is followed before the commit. Once the head may have changed,
+   * any failure (conflict, a move the capture cannot follow, a refused commit) changes it back to the old mode, on
+   * the display the capture then follows; if that cannot be proven the outcome is `failed`.
    */
-  template <class Exclusive, class Reserve, class Change, class Commit, class Apply>
+  template <class Exclusive, class Reserve, class Change, class Retarget, class Commit, class Apply>
   outcome_t
   change_managed_resolution(const request_t &request, int width, int height, const std::string &display,
-    Exclusive &&run_exclusive, Reserve &&reserve, Change &&change, Commit &&commit, Apply &&apply) {
+    Exclusive &&run_exclusive, Reserve &&reserve, Change &&change, Retarget &&retarget, Commit &&commit, Apply &&apply) {
     const auto mode = [](int w, int h) {
       return std::to_string(w) + 'x' + std::to_string(h);
     };
@@ -148,24 +152,38 @@ namespace stream::dynamic_mode {
         return;
       }
       // The head may have changed: every failure from here on must prove the
-      // previous mode on the same display, or the stream cannot continue.
+      // previous mode on the display the capture follows, or the stream cannot continue.
+      std::string current = display;
+      const auto follow = [&](const std::string &moved) -> std::expected<void, std::string> {
+        if (moved == current) return {};
+        if (moved.empty()) return std::unexpected(std::string { "the head's display is unknown" });
+        if (auto followed = retarget(moved); !followed) {
+          return std::unexpected("the capture cannot follow the head from [" + current + "] to [" + moved + "]: " + followed.error());
+        }
+        current = moved;
+        return {};
+      };
       const auto restore = [&](const std::string &why) {
         const auto restored = change(static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height));
-        if ((restored.verdict == head_verdict_e::applied || restored.verdict == head_verdict_e::unchanged) && restored.display == display) {
-          outcome = { decision_e::refused_managed, keeping + why + "; previous mode restored)" };
+        std::string detail = restored.reason;
+        if (restored.verdict == head_verdict_e::applied || restored.verdict == head_verdict_e::unchanged) {
+          if (auto followed = follow(restored.display); followed) {
+            outcome = { decision_e::refused_managed, keeping + why + "; previous mode restored)" };
+            return;
+          }
+          else {
+            detail = followed.error();
+          }
         }
-        else {
-          outcome = { decision_e::failed, "Managed native display mode change to " + mode(request.width, request.height) + " failed (" + why +
-                                            ") and the previous mode was not restored" +
-                                            (restored.reason.empty() ? std::string {} : ": " + restored.reason) };
-        }
+        outcome = { decision_e::failed, "Managed native display mode change to " + mode(request.width, request.height) + " failed (" + why +
+                                          ") and the previous mode was not restored" + (detail.empty() ? std::string {} : ": " + detail) };
       };
       if (changed.verdict == head_verdict_e::conflict) {
         restore("head: " + changed.reason);
         return;
       }
-      if (changed.display != display) {
-        restore("the head moved from [" + display + "] to [" + changed.display + "]; the stream cannot follow it yet");
+      if (auto followed = follow(changed.display); !followed) {
+        restore(followed.error());
         return;
       }
       if (auto committed = commit(std::move(*pending)); !committed) {
@@ -173,7 +191,8 @@ namespace stream::dynamic_mode {
         return;
       }
       apply(request.width, request.height);
-      outcome = { decision_e::applied, "Managed native display mode changed: " + mode(width, height) + " -> " + mode(request.width, request.height) };
+      outcome = { decision_e::applied, "Managed native display mode changed: " + mode(width, height) + " -> " + mode(request.width, request.height) +
+                                         (current == display ? std::string {} : " (the head moved from [" + display + "] to [" + current + "])") };
     });
     return outcome;
   }

@@ -1164,6 +1164,37 @@ namespace video {
 
   using captured_frame_event_t = std::shared_ptr<safe::event_t<captured_frame_t>>;
 
+  // An exact source's managed head mode change (see exact_capture_move_t).
+  struct exact_move_state_t {
+    std::mutex lock;
+    int holds {};
+    std::optional<std::string> retarget;
+
+    bool
+    held() {
+      std::lock_guard lg { lock };
+      return holds > 0;
+    }
+
+    bool
+    retarget_pending() {
+      std::lock_guard lg { lock };
+      return retarget.has_value();
+    }
+
+    bool
+    retarget_pending_to(const std::string &display) {
+      std::lock_guard lg { lock };
+      return retarget == display;
+    }
+
+    std::optional<std::string>
+    take_retarget() {
+      std::lock_guard lg { lock };
+      return std::exchange(retarget, std::nullopt);
+    }
+  };
+
   struct capture_ctx_t {
     captured_frame_event_t images;
     config_t config;
@@ -1180,6 +1211,8 @@ namespace video {
     sync_util::sync_t<pyrowave::capture_policy_t> capture_policy;
     const encoder_t *encoder_p;
     sync_util::sync_t<std::weak_ptr<platf::display_t>> display_wp;
+    // Exact sources only: their managed head's mode change fence.
+    std::shared_ptr<exact_move_state_t> exact_move;
   };
 
   struct capture_thread_sync_ctx_t {
@@ -1201,37 +1234,121 @@ namespace video {
 
   using capture_source_ref_t = decltype(capture_thread_async.ref());
 
-  // One capture thread per exact managed source, keyed by the requested display.
-  // Entries are never erased: live refs point into them, and the set is bounded
-  // by the distinct managed displays this process has captured.
+  // One capture thread per exact managed source, keyed by the display it captures.
+  // Entries are never destroyed: live refs point into them, and the set is bounded
+  // by the distinct managed displays this process has captured. A retarget re-keys
+  // a live entry to its head's new display.
   class exact_capture_sources_t {
   public:
     capture_source_ref_t
     acquire(const std::string &display_name) {
-      safe::shared_t<capture_thread_async_ctx_t> *source;
-      {
-        std::lock_guard lg { _lock };
-        auto &entry = _sources[display_name];
-        if (!entry) {
-          entry = std::make_unique<safe::shared_t<capture_thread_async_ctx_t>>(start_capture_async, end_capture_async);
-        }
-        source = entry.get();
+      // The ref is taken under the lock so a concurrent retarget can never retire
+      // an entry between its lookup and its ref (starting only spawns the thread).
+      std::lock_guard lg { _lock };
+      auto &entry = _sources[display_name];
+      if (!entry.source) {
+        entry.move = std::make_shared<exact_move_state_t>();
+        entry.source = std::make_unique<safe::shared_t<capture_thread_async_ctx_t>>(
+          [move = entry.move](capture_thread_async_ctx_t &ctx) {
+            ctx.exact_move = move;
+            return start_capture_async(ctx);
+          },
+          end_capture_async);
       }
-      return source->ref();
+      return entry.source->ref();
     }
 
     bool
     any_live() {
       std::lock_guard lg { _lock };
-      return std::ranges::any_of(_sources, [](auto &entry) { return entry.second->has_ref(); });
+      return std::ranges::any_of(_sources, [](auto &entry) { return entry.second.source->has_ref(); });
+    }
+
+    // The live capture of @p display_name, retained, with its move fence; empty when none runs.
+    std::pair<std::shared_ptr<exact_move_state_t>, std::shared_ptr<void>>
+    hold_live(const std::string &display_name) {
+      std::lock_guard lg { _lock };
+      const auto it = _sources.find(display_name);
+      if (it == _sources.end()) {
+        return {};
+      }
+      auto ref = it->second.source->try_ref();
+      if (!ref) {
+        return {};
+      }
+      return { it->second.move, std::make_shared<capture_source_ref_t>(std::move(ref)) };
+    }
+
+    std::expected<void, std::string>
+    retarget(const std::string &from, const std::string &to, const std::shared_ptr<exact_move_state_t> &held) {
+      std::lock_guard lg { _lock };
+      const auto it = _sources.find(from);
+      if (it == _sources.end() || !it->second.source->has_ref()) {
+        return std::unexpected("no exact capture of [" + from + "] is running");
+      }
+      if (!held || it->second.move != held) {
+        return std::unexpected("the capture of [" + from + "] is not the one held for this change");
+      }
+      if (from == to) {
+        return {};
+      }
+      if (const auto other = _sources.find(to); other != _sources.end()) {
+        if (other->second.source->has_ref()) {
+          return std::unexpected("another capture already captures [" + to + "]");
+        }
+        // Its last ref may still be joining the thread inside it: retire it, never destroy it.
+        _retired.push_back(std::move(other->second));
+        _sources.erase(other);
+      }
+      auto node = _sources.extract(it);
+      node.key() = to;
+      const auto moved = _sources.insert(std::move(node));
+      {
+        std::lock_guard move_lock { moved.position->second.move->lock };
+        moved.position->second.move->retarget = to;
+      }
+      return {};
     }
 
   private:
+    struct entry_t {
+      std::shared_ptr<exact_move_state_t> move;
+      std::unique_ptr<safe::shared_t<capture_thread_async_ctx_t>> source;
+    };
+
     std::mutex _lock;
-    std::map<std::string, std::unique_ptr<safe::shared_t<capture_thread_async_ctx_t>>> _sources;
+    std::map<std::string, entry_t> _sources;
+    std::vector<entry_t> _retired;
   };
 
   exact_capture_sources_t exact_capture_sources;
+
+  exact_capture_move_t::exact_capture_move_t(std::string display):
+      _display { std::move(display) } {
+    std::tie(_state, _source) = exact_capture_sources.hold_live(_display);
+    if (_state) {
+      std::lock_guard lg { _state->lock };
+      ++_state->holds;
+    }
+  }
+
+  exact_capture_move_t::~exact_capture_move_t() {
+    if (_state) {
+      std::lock_guard lg { _state->lock };
+      --_state->holds;
+    }
+    // The capture ref is released after the hold; if it is the last, the capture ends here.
+    _source.reset();
+  }
+
+  std::expected<void, std::string>
+  exact_capture_move_t::retarget(const std::string &display) {
+    auto moved = exact_capture_sources.retarget(_display, display, _state);
+    if (moved) {
+      _display = display;
+    }
+    return moved;
+  }
 
   // The capture thread a session attaches to. Legacy sessions share the single
   // global capture thread; exact sessions never share another source's thread.
@@ -2081,7 +2198,8 @@ namespace video {
     safe::signal_t &reinit_event,
     std::atomic_bool &force_system_capture,
     sync_util::sync_t<pyrowave::capture_policy_t> &capture_policy,
-    const encoder_t &encoder) {
+    const encoder_t &encoder,
+    std::shared_ptr<exact_move_state_t> exact_move) {
     std::vector<capture_ctx_t> capture_ctxs;
 
     auto fg = util::fail_guard([&]() {
@@ -2109,7 +2227,20 @@ namespace video {
     // An exact source captures only its managed display: it never accepts a
     // session for another display and never consumes the global display switch.
     const bool exact_source = capture_ctxs.front().config.display_exact;
-    const std::string exact_source_name = capture_ctxs.front().config.display_name;
+    std::string exact_source_name = capture_ctxs.front().config.display_name;
+    // A retarget moves an exact source, and the sessions on it, to its head's new display.
+    const auto follow_retarget = [&]() {
+      if (!exact_source || !exact_move) {
+        return;
+      }
+      if (auto moved = exact_move->take_retarget()) {
+        BOOST_LOG(info) << "Managed display moved from ["sv << exact_source_name << "] to ["sv << *moved << "]; following it"sv;
+        exact_source_name = *moved;
+        for (auto &capture_ctx : capture_ctxs) {
+          capture_ctx.config.display_name = exact_source_name;
+        }
+      }
+    };
 
     auto reset_capture_display = [&](std::shared_ptr<platf::display_t> &display,
                                      const std::string &name, const config_t &client_config) {
@@ -2192,7 +2323,10 @@ namespace video {
           return false;
         }
 
-        if ((exact_source || capture_ctx->config.display_exact) &&
+        // A joiner may already name the display a pending retarget moves this capture to.
+        const auto joins_the_move = exact_source && exact_move && capture_ctx->config.display_exact &&
+                                    exact_move->retarget_pending_to(capture_ctx->config.display_name);
+        if ((exact_source || capture_ctx->config.display_exact) && !joins_the_move &&
             (capture_ctx->config.display_exact != exact_source || capture_ctx->config.display_name != exact_source_name)) {
           BOOST_LOG(error) << "Refusing to attach a session for display [" << capture_ctx->config.display_name
                            << "] to the capture of [" << exact_source_name << "]";
@@ -2341,6 +2475,11 @@ namespace video {
           return false;
         }
 
+        if (exact_source && exact_move && exact_move->retarget_pending()) {
+          artificial_reinit = true;
+          return false;
+        }
+
         // 先接入新会话，再分发本次真实画面。若本次只是捕获超时，则给新会话
         // 补发上一张真实画面，保证它与现有会话看到同一个活动显示器内容。
         if (!append_pending_capture_contexts(frame_captured ? std::shared_ptr<platf::img_t> {} : latest_captured_img)) {
@@ -2430,6 +2569,7 @@ namespace video {
 
             // Refresh display names since a display removal might have caused the reinitialization
             refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
+            follow_retarget();
 
             // Process any pending display switch with the new list of displays
             auto &config = capture_ctxs.front().config;
@@ -2451,6 +2591,11 @@ namespace video {
               const auto resolved_display_name = resolve_capture_display(config.display_name, display_device::get_display_name(config.display_name));
               const auto chosen = select_capture_display(display_names, display_p, resolved_display_name, config.display_exact);
               if (chosen.choice == capture_display_choice_e::refused) {
+                if (exact_move && exact_move->held()) {
+                  // Its head is changing mode and may come back under a new display id.
+                  std::this_thread::sleep_for(20ms);
+                  continue;
+                }
                 BOOST_LOG(error) << "Managed display [" << config.display_name << "] (resolved: " << resolved_display_name << ") is no longer available for capture; refusing to capture another display";
                 break;
               }
@@ -6020,7 +6165,8 @@ namespace video {
       std::ref(capture_thread_ctx.reinit_event),
       std::ref(capture_thread_ctx.force_system_capture),
       std::ref(capture_thread_ctx.capture_policy),
-      std::ref(*capture_thread_ctx.encoder_p)
+      std::ref(*capture_thread_ctx.encoder_p),
+      capture_thread_ctx.exact_move
     };
 
     return 0;

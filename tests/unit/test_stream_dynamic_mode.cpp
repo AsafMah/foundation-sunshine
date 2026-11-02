@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <expected>
 #include <limits>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -146,6 +147,8 @@ namespace {
     std::vector<head_change_t> changes { { head_verdict_e::applied, "\\\\.\\DISPLAY9", {} } };
     std::size_t next_change = 0;
     std::expected<void, std::string> committed {};
+    // Displays the capture cannot follow; any other retarget succeeds.
+    std::map<std::string, std::string> unfollowable;
     int live_pending = 0;
 
     // A move-only pending that counts how many reservations are alive (dropping one rolls it back).
@@ -180,6 +183,11 @@ namespace {
           trace.push_back("change " + std::to_string(w) + "x" + std::to_string(h));
           const auto i = std::min(next_change++, changes.size() - 1);
           return changes[i];
+        },
+        [this](const std::string &display) -> std::expected<void, std::string> {
+          trace.push_back("retarget " + display);
+          if (const auto it = unfollowable.find(display); it != unfollowable.end()) return std::unexpected(it->second);
+          return {};
         },
         [this](pending_t &&pending) -> std::expected<void, std::string> {
           pending_t consumed { std::move(pending) };
@@ -248,23 +256,66 @@ namespace {
     EXPECT_EQ(fake.live_pending, 0);
   }
 
-  TEST(StreamDynamicModeManaged, HeadThatMovedDisplaysIsChangedBackAndNeverCommitted) {
+  TEST(StreamDynamicModeManaged, AMovedHeadIsFollowedBeforeTheCommit) {
     managed_fake_t fake;
-    fake.changes = { { head_verdict_e::applied, "\\\\.\\DISPLAY10", {} }, { head_verdict_e::applied, "\\\\.\\DISPLAY10", {} } };
+    fake.changes = { { head_verdict_e::applied, "\\\\.\\DISPLAY10", {} } };
     const auto outcome = fake.run(2560, 1440);
-    EXPECT_EQ(outcome.decision, decision_e::failed) << "the old display is gone, so the stream cannot be kept";
-    EXPECT_NE(outcome.message.find("DISPLAY10"), std::string::npos);
-    EXPECT_EQ(fake.trace, (std::vector<std::string> { "exclusive", "reserve 2560x1440", "change 2560x1440", "change 1920x1080" }));
+    EXPECT_EQ(outcome.decision, decision_e::applied);
+    EXPECT_NE(outcome.message.find("1920x1080 -> 2560x1440"), std::string::npos);
+    EXPECT_NE(outcome.message.find("moved from [\\\\.\\DISPLAY9] to [\\\\.\\DISPLAY10]"), std::string::npos) << outcome.message;
+    EXPECT_EQ(fake.trace, (std::vector<std::string> { "exclusive", "reserve 2560x1440", "change 2560x1440", "retarget \\\\.\\DISPLAY10", "commit 7", "apply 2560x1440" }));
     EXPECT_EQ(fake.live_pending, 0);
   }
 
-  TEST(StreamDynamicModeManaged, HeadThatMovedAndCameBackIsRestored) {
+  TEST(StreamDynamicModeManaged, AMovedHeadTheCaptureCannotFollowIsChangedBackAndNeverCommitted) {
     managed_fake_t fake;
+    fake.unfollowable["\\\\.\\DISPLAY10"] = "another capture owns it";
     fake.changes = { { head_verdict_e::applied, "\\\\.\\DISPLAY10", {} }, { head_verdict_e::applied, "\\\\.\\DISPLAY9", {} } };
     const auto outcome = fake.run(2560, 1440);
     EXPECT_EQ(outcome.decision, decision_e::refused_managed);
     EXPECT_NE(outcome.message.find("keeping 1920x1080"), std::string::npos);
-    EXPECT_EQ(fake.trace.back(), "change 1920x1080");
+    EXPECT_NE(outcome.message.find("another capture owns it"), std::string::npos) << outcome.message;
+    EXPECT_NE(outcome.message.find("previous mode restored"), std::string::npos);
+    EXPECT_EQ(fake.trace, (std::vector<std::string> { "exclusive", "reserve 2560x1440", "change 2560x1440", "retarget \\\\.\\DISPLAY10", "change 1920x1080" }));
+    EXPECT_EQ(fake.live_pending, 0);
+  }
+
+  TEST(StreamDynamicModeManaged, AMovedHeadWhoseRestoreCannotBeFollowedFails) {
+    managed_fake_t fake;
+    fake.unfollowable["\\\\.\\DISPLAY10"] = "another capture owns it";
+    fake.changes = { { head_verdict_e::applied, "\\\\.\\DISPLAY10", {} }, { head_verdict_e::applied, "\\\\.\\DISPLAY10", {} } };
+    const auto outcome = fake.run(2560, 1440);
+    EXPECT_EQ(outcome.decision, decision_e::failed) << "the old display is gone and the capture cannot follow the head";
+    EXPECT_NE(outcome.message.find("DISPLAY10"), std::string::npos);
+    EXPECT_EQ(fake.trace, (std::vector<std::string> { "exclusive", "reserve 2560x1440", "change 2560x1440", "retarget \\\\.\\DISPLAY10", "change 1920x1080", "retarget \\\\.\\DISPLAY10" }));
+  }
+
+  TEST(StreamDynamicModeManaged, AHeadWithAnUnknownDisplayIsNeverFollowed) {
+    managed_fake_t fake;
+    fake.changes = { { head_verdict_e::applied, {}, {} }, { head_verdict_e::applied, "\\\\.\\DISPLAY9", {} } };
+    const auto outcome = fake.run(2560, 1440);
+    EXPECT_EQ(outcome.decision, decision_e::refused_managed);
+    EXPECT_NE(outcome.message.find("previous mode restored"), std::string::npos);
+    EXPECT_EQ(fake.trace, (std::vector<std::string> { "exclusive", "reserve 2560x1440", "change 2560x1440", "change 1920x1080" }));
+  }
+
+  TEST(StreamDynamicModeManaged, ARestoreThatMovesTheHeadAgainIsFollowed) {
+    managed_fake_t fake;
+    fake.committed = std::unexpected(std::string { "encoder generation moved" });
+    fake.changes = { { head_verdict_e::applied, "\\\\.\\DISPLAY10", {} }, { head_verdict_e::applied, "\\\\.\\DISPLAY11", {} } };
+    const auto outcome = fake.run(2560, 1440);
+    EXPECT_EQ(outcome.decision, decision_e::refused_managed);
+    EXPECT_NE(outcome.message.find("previous mode restored"), std::string::npos);
+    EXPECT_EQ(fake.trace, (std::vector<std::string> { "exclusive", "reserve 2560x1440", "change 2560x1440", "retarget \\\\.\\DISPLAY10", "commit 7",
+                            "change 1920x1080", "retarget \\\\.\\DISPLAY11" }));
+  }
+
+  TEST(StreamDynamicModeManaged, AConflictRestoredOntoAMovedHeadIsFollowed) {
+    managed_fake_t fake;
+    fake.changes = { { head_verdict_e::conflict, {}, "re-verify timed out" }, { head_verdict_e::applied, "\\\\.\\DISPLAY10", {} } };
+    const auto outcome = fake.run(2560, 1440);
+    EXPECT_EQ(outcome.decision, decision_e::refused_managed);
+    EXPECT_EQ(fake.trace.back(), "retarget \\\\.\\DISPLAY10");
   }
 
   TEST(StreamDynamicModeManaged, CommitFailureRestoresThePreviousMode) {
@@ -288,11 +339,17 @@ namespace {
     EXPECT_EQ(fake.trace.back(), "change 1920x1080");
   }
 
-  TEST(StreamDynamicModeManaged, RestoreToAnotherDisplayIsNotARestore) {
+  TEST(StreamDynamicModeManaged, RestoreToADisplayTheCaptureCannotFollowIsNotARestore) {
     managed_fake_t fake;
     fake.committed = std::unexpected(std::string { "x" });
+    fake.unfollowable["\\\\.\\DISPLAY10"] = "no live capture";
     fake.changes = { { head_verdict_e::applied, "\\\\.\\DISPLAY9", {} }, { head_verdict_e::applied, "\\\\.\\DISPLAY10", {} } };
     EXPECT_EQ(fake.run(2560, 1440).decision, decision_e::failed);
+    managed_fake_t unknown;
+    unknown.committed = std::unexpected(std::string { "x" });
+    unknown.changes = { { head_verdict_e::applied, "\\\\.\\DISPLAY9", {} }, { head_verdict_e::applied, {}, {} } };
+    EXPECT_EQ(unknown.run(2560, 1440).decision, decision_e::failed);
+    EXPECT_EQ(unknown.trace.back(), "change 1920x1080") << "an unknown display is never retargeted";
   }
 
   TEST(StreamDynamicModeManaged, OtherStreamsActiveRefusesWithoutAnything) {

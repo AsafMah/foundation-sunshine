@@ -2162,6 +2162,8 @@ namespace stream {
         if (session->config.monitor.display_exact) {
           namespace dm = stream::dynamic_mode;
           const auto ticket = session->config.monitor.admission;
+          // Holds this capture through a head re-creation, so it can follow the head.
+          video::exact_capture_move_t move { session->config.monitor.display_name };
           const auto outcome = dm::change_managed_resolution(request, session->config.monitor.width, session->config.monitor.height,
             session->config.monitor.display_name,
             [](auto &&body) { return stream::session::run_display_reconfiguration_if_single_video_session(body); },
@@ -2187,6 +2189,13 @@ namespace stream {
               head.display = changed.display;
               head.reason = changed.reason;
               return head;
+            },
+            [&move, session](const std::string &display) -> std::expected<void, std::string> {
+              auto moved = move.retarget(display);
+              if (moved) {
+                session->config.monitor.display_name = display;
+              }
+              return moved;
             },
             [&ticket](video::admission::pending_t &&pending) { return video::commit_replacement(ticket, std::move(pending)); },
             [session](int w, int h) {
