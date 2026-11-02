@@ -559,7 +559,7 @@ namespace display_device::topology {
       EXPECT_FALSE(lifecycle.managed());
       EXPECT_FALSE(lifecycle.coordinator().status().managed_mode);
       const auto ran = lifecycle.coordinator().run(kind::reset_persistence,
-        [&](const mutation_capability_t &capability, const command_context_t &) { lifecycle.reset_native(capability); });
+        [&](const mutation_capability_t &capability, const command_context_t &) { EXPECT_FALSE(lifecycle.reset_native(capability)); });
       EXPECT_TRUE(ran.completed());
       EXPECT_EQ(f.log.events(), (std::vector<std::string> { "startup" }));
     }
@@ -666,10 +666,51 @@ namespace display_device::topology {
       auto &lifecycle = f.make_managed();
       ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
       const auto ran = lifecycle.coordinator().run(kind::reset_persistence,
-        [&](const mutation_capability_t &capability, const command_context_t &) { lifecycle.reset_native(capability); });
+        [&](const mutation_capability_t &capability, const command_context_t &) { EXPECT_FALSE(lifecycle.reset_native(capability)); });
       EXPECT_TRUE(ran.completed());
       EXPECT_TRUE(same_health(lifecycle.coordinator().status().native, f.native_reset));
       EXPECT_EQ(f.log.events().back(), "native_reset");
+    }
+
+    TEST(ProcessLifecycleManaged, AResetThatKeepsTheJournalIsReportedAsFailed) {
+      fixture_t f;
+      f.native_recovered = { true, true, "unresolved" };
+      f.native_reset = { true, true, "Could not remove the journal: access denied" };
+      auto &lifecycle = f.make_managed();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      std::optional<std::string> failure;
+      const auto ran = lifecycle.coordinator().run(kind::reset_persistence,
+        [&](const mutation_capability_t &capability, const command_context_t &) { failure = lifecycle.reset_native(capability); });
+      EXPECT_TRUE(ran.completed());
+      ASSERT_TRUE(failure);
+      EXPECT_NE(failure->find("access denied"), std::string::npos) << *failure;
+    }
+
+    TEST(ProcessLifecycleManaged, AFailedResetWithoutAReasonStillExplainsItself) {
+      fixture_t f;
+      f.native_recovered = { true, true, "unresolved" };
+      f.native_reset = { true, true, "" };
+      auto &lifecycle = f.make_managed();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      std::optional<std::string> failure;
+      const auto ran = lifecycle.coordinator().run(kind::reset_persistence,
+        [&](const mutation_capability_t &capability, const command_context_t &) { failure = lifecycle.reset_native(capability); });
+      EXPECT_TRUE(ran.completed());
+      ASSERT_TRUE(failure);
+      EXPECT_NE(failure->find("journal"), std::string::npos) << *failure;
+    }
+
+    TEST(ProcessLifecycleManaged, AnInvalidProfileThatStaysInConflictAfterAClearedResetIsNotAFailedReset) {
+      fixture_t f;
+      f.native_initial = { false, true, "Invalid display_topology_profile" };
+      f.native_reset = { false, true, "Invalid display_topology_profile" };
+      auto &lifecycle = f.make_managed();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      std::optional<std::string> failure { "not run" };
+      const auto ran = lifecycle.coordinator().run(kind::reset_persistence,
+        [&](const mutation_capability_t &capability, const command_context_t &) { failure = lifecycle.reset_native(capability); });
+      EXPECT_TRUE(ran.completed());
+      EXPECT_FALSE(failure) << *failure;
     }
 
   }  // namespace

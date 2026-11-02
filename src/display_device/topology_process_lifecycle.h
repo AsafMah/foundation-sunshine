@@ -129,15 +129,19 @@ namespace display_device::topology {
       return hooks_.native.has_value();
     }
 
-    /** In managed mode, run the native reset under `capability` and publish its health; otherwise nothing. */
-    void
+    /**
+     * In managed mode, run the native reset under `capability` and publish its health; otherwise nothing.
+     * @return Why the reset failed when the journal is still present; nullopt otherwise. A profile that
+     *         keeps the process In conflict after the journal was cleared is not a failed reset.
+     */
+    std::optional<std::string>
     reset_native(const mutation_capability_t &capability);
 
   private:
     coordinator_options_t
     with_native(coordinator_options_t options);
     /** Run a native hook and publish its health; an exception publishes In conflict and propagates. */
-    void
+    native_health_t
     run_native(const mutation_capability_t &capability,
       const std::function<native_health_t(const mutation_capability_t &)> &hook, const char *failure);
     lifecycle_cleanup_e

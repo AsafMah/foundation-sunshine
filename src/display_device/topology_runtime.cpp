@@ -13,11 +13,18 @@
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "src/rtsp.h"
+#include "src/stream.h"
+#include "topology_native.h"
 #include "topology_process_lifecycle.h"
 #include "topology_toggle.h"
 #include "vdd_utils.h"
 #ifdef _WIN32
+  #include "src/globals.h"
+  #include "src/platform/windows/display_device/native_edge.h"
   #include "src/platform/windows/topology_actor_observer.h"
+  #include "src/uuid.h"
+  #include "topology_journal_store.h"
+  #include "topology_windows_native.h"
 #endif
 
 namespace display_device::coordinated {
@@ -30,6 +37,62 @@ namespace display_device::coordinated {
       (void) receipt;
       return topology::process_observation_e::inaccessible;
 #endif
+    }
+
+    /** nullptr fails a managed profile closed: native topology is Windows-only. */
+    std::shared_ptr<topology::native_executor_t>
+    make_native_executor() {
+#ifdef _WIN32
+      struct bundle_t {
+        topology::file_journal_store_t store { platf::appdata() / "display_topology_journal.json" };
+        topology::win32_edge::win32_native_edge_t edge;
+        topology::windows_native_platform_t platform { edge, { topology::zako_vdd_driver, ZAKO_NAME } };
+        topology::native_executor_t executor {
+          store,
+          platform,
+          {
+            [] {
+              const auto uuid = uuid_util::uuid_t::generate();
+              topology::uuid_bytes_t bytes;
+              std::copy(std::begin(uuid.b8), std::end(uuid.b8), bytes.begin());
+              return bytes;
+            },
+            2,
+            topology::zako_vdd_driver,
+          },
+        };
+      };
+      auto bundle = std::make_shared<bundle_t>();
+      return { bundle, &bundle->executor };
+#else
+      return nullptr;
+#endif
+    }
+
+    /**
+     * The `display_topology_profile` latched for this process: nullptr is legacy mode.
+     * Leaked with the lifecycle that uses it.
+     */
+    const std::shared_ptr<topology::managed_native_t> &
+    native_binding() {
+      static auto *const instance = new std::shared_ptr<topology::managed_native_t> {
+        topology::bind_native_profile(config::video.display_topology_profile, make_native_executor)
+      };
+      return *instance;
+    }
+
+    std::optional<topology::native_lifecycle_hooks_t>
+    native_hooks() {
+      const auto &managed = native_binding();
+      if (!managed) {
+        return std::nullopt;
+      }
+      return topology::native_lifecycle_hooks_t {
+        [managed] { return managed->health(); },
+        [managed](const auto &capability) { return managed->recover(capability); },
+        [managed](const auto &capability) { return managed->restore(capability); },
+        [managed](const auto &capability) { return managed->reset(capability); },
+      };
     }
 
     /**
@@ -46,8 +109,12 @@ namespace display_device::coordinated {
         options.probes.startup_restore_quiescent = [] { return !rtsp_stream::session_starting_or_active(); };
         options.probes.legacy_restore_pending = [] { return session_t::get().restore_pending(); };
         options.probes.ticket_present = [](std::uint32_t id) { return rtsp_stream::launch_ticket_present(id); };
+        // Video sessions only, and without side effects: rtsp's session_count() also counts
+        // control-only sessions and clears stopped ones.
+        options.probes.active_streams = [] { return stream::session::has_active_video_sessions() ? std::size_t { 1 } : std::size_t { 0 }; };
 
         topology::lifecycle_hooks_t hooks;
+        hooks.native = native_hooks();
         hooks.startup_restore = [](const auto &capability, const auto &) {
           session_t::get().restore_state(capability, automatic_vdd_policy());
         };
@@ -111,11 +178,15 @@ namespace display_device::coordinated {
     auto done = topology::run_for_value(coordinator(), topology::command_kind_e::reset_persistence,
       [](const topology::mutation_capability_t &capability) {
         session_t::get().reset_persistence(capability, automatic_vdd_policy());
-        return true;
+        return lifecycle().reset_native(capability);
       });
     if (!done) {
       BOOST_LOG(warning) << "Display device reset was not run: " << done.error().detail;
       return std::move(done.error().detail);
+    }
+    if (*done) {
+      BOOST_LOG(warning) << "Display device reset left the native topology journal: " << **done;
+      return std::move(*done);
     }
     return std::nullopt;
   }

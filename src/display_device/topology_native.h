@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -248,5 +249,17 @@ namespace display_device::topology {
     native_executor_t *executor_;
     result_t<native_profile_t> profile_;
   };
+
+  /** Builds the executor (and what it uses) of a managed process; may throw or return null. */
+  using native_executor_factory_t = std::function<std::shared_ptr<native_executor_t>()>;
+
+  /**
+   * @brief Latch the `display_topology_profile` setting of this process.
+   * @return nullptr for a blank setting (legacy mode; `make_executor` is not called).
+   *         Otherwise a managed binding that keeps the executor alive. A setting that does not
+   *         parse, or an executor that cannot be built, leaves it In conflict: never legacy.
+   */
+  std::shared_ptr<managed_native_t>
+  bind_native_profile(std::string_view setting, const native_executor_factory_t &make_executor);
 
 }  // namespace display_device::topology

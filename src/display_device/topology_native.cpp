@@ -254,6 +254,15 @@ namespace display_device::topology {
     refusal(std::string reason) {
       return { native_verdict_e::refused, std::nullopt, std::move(reason) };
     }
+
+    /** Why a managed process without a usable profile refuses every launch. */
+    std::string
+    unusable(const error_t &error) {
+      if (error.code == error_code_e::resource_unavailable) {
+        return error.detail;
+      }
+      return "Invalid display_topology_profile: " + error.detail;
+    }
   }  // namespace
 
   std::string_view
@@ -762,7 +771,7 @@ namespace display_device::topology {
     auto health = executor_ ? executor_->health() : native_health_t {};
     if (!profile_ && !health.in_conflict) {
       health.in_conflict = true;
-      health.reason = "Invalid display_topology_profile: " + profile_.error().detail;
+      health.reason = unusable(profile_.error());
     }
     return health;
   }
@@ -798,9 +807,41 @@ namespace display_device::topology {
   managed_native_t::prepare(const mutation_capability_t &capability) {
     capability.require(operation_e::native_apply);
     if (!profile_) {
-      return { native_verdict_e::conflict, std::nullopt, "Invalid display_topology_profile: " + profile_.error().detail };
+      return { native_verdict_e::conflict, std::nullopt, unusable(profile_.error()) };
     }
     return executor_->prepare(capability, *profile_);
+  }
+
+  std::shared_ptr<managed_native_t>
+  bind_native_profile(std::string_view setting, const native_executor_factory_t &make_executor) {
+    auto parsed = parse_native_profile(setting);
+    if (parsed && !*parsed) {
+      return nullptr;
+    }
+    std::shared_ptr<native_executor_t> executor;
+    std::string unavailable;
+    try {
+      executor = make_executor ? make_executor() : nullptr;
+      if (!executor) {
+        unavailable = "Native display topology is not available on this host";
+      }
+    }
+    catch (const std::exception &error) {
+      unavailable = std::string { "Native display topology is not available: " } + error.what();
+    }
+    catch (...) {
+      unavailable = "Native display topology is not available";
+    }
+    result_t<native_profile_t> profile = parsed ? result_t<native_profile_t> { **parsed } : std::unexpected(parsed.error());
+    if (profile && !executor) {
+      profile = std::unexpected(error_t { error_code_e::resource_unavailable, unavailable, std::nullopt });
+    }
+    struct bound_t {
+      std::shared_ptr<native_executor_t> executor;
+      managed_native_t managed;
+    };
+    auto bound = std::make_shared<bound_t>(bound_t { executor, managed_native_t { executor.get(), std::move(profile) } });
+    return { bound, &bound->managed };
   }
 
 }  // namespace display_device::topology

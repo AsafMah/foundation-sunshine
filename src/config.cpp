@@ -512,7 +512,8 @@ namespace config {
     "auto"s,  // capture_compute_shader (automatic capability and benefit detection)
     false,  // wgc_disable_secure_desktop (disabled by default for security)
     true,  // dynamic_resolution_follow_display (default: on; matches existing behavior. Set false for legacy clients like PSVita Moonlight.)
-  };
+        {},  // display_topology_profile (blank: legacy display handling)
+      };
 
   audio_t audio {
     {},  // audio_sink
@@ -1401,6 +1402,7 @@ namespace config {
     }
     bool_f(vars, "wgc_disable_secure_desktop", video.wgc_disable_secure_desktop);
     bool_f(vars, "dynamic_resolution_follow_display", video.dynamic_resolution_follow_display);
+    string_f(vars, "display_topology_profile", video.display_topology_profile);
     bool_f(vars, "vdd_keep_enabled", video.vdd_keep_enabled);
     bool_f(vars, "vdd_headless_create", video.vdd_headless_create_enabled);
     bool_f(vars, "vdd_reuse", video.vdd_reuse);

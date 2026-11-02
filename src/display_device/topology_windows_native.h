@@ -128,6 +128,14 @@ namespace display_device::topology {
   std::optional<std::string>
   container_driver_refusal(const driver_version_t &version);
 
+  /**
+   * The identity journaled for ZakoVDD heads. It names the driver, not a device instance,
+   * so it must never change: a journal written by one run is matched by the next.
+   */
+  inline constexpr driver_instance_id_t zako_vdd_driver {
+    uuid_bytes_t { 0x5A, 0x4B, 0x0D, 0x1E, 0x7C, 0x3F, 0x4E, 0x2A, 0x9B, 0x61, 0x2D, 0x8F, 0x0C, 0x4A, 0x7E, 0x93 }
+  };
+
   struct windows_native_options_t {
     driver_instance_id_t driver;
     /** Friendly name of the driver's heads (`ZAKO_NAME`). */

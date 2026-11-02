@@ -2700,3 +2700,93 @@ TEST_F(NativeExecutor, AValidProfileReportsAndResetsAnEarlierRunsJournal) {
   EXPECT_TRUE(healthy(managed_reset(managed)));
   EXPECT_FALSE(store.bytes);
 }
+
+// --- Latching the setting ------------------------------------------------------------
+
+namespace {
+  constexpr std::string_view virtual_setting = R"({"version":1,"monitors":[{"source":"virtual"}]})";
+  constexpr std::string_view physical_b_setting = R"({"version":1,"monitors":[{"source":"physical","display":"os-B"}]})";
+  constexpr std::string_view unparsable_setting = R"({"version":1,"monitors":[{"source":"primary"}]})";
+}  // namespace
+
+TEST_F(NativeExecutor, ABlankSettingIsLegacyAndBuildsNothing) {
+  int built = 0;
+  for (const std::string_view setting : { "", " ", " \t\r\n " }) {
+    EXPECT_FALSE(dt::bind_native_profile(setting, [&] {
+      ++built;
+      return std::shared_ptr<dt::native_executor_t> { &executor, [](auto *) {} };
+    }));
+  }
+  EXPECT_EQ(built, 0);
+}
+
+TEST_F(NativeExecutor, AValidSettingIsBoundToTheBuiltExecutor) {
+  int built = 0;
+  const auto managed = dt::bind_native_profile(physical_b_setting, [&] {
+    ++built;
+    return std::shared_ptr<dt::native_executor_t> { &executor, [](auto *) {} };
+  });
+  ASSERT_TRUE(managed);
+  EXPECT_EQ(built, 1);
+  EXPECT_TRUE(healthy(managed->health()));
+  const auto outcome = managed_prepare(*managed);
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok));
+  EXPECT_TRUE(outcome.target == (dt::native_target_t { dt::os_display_id_t { "os-B" }, false }));
+}
+
+TEST_F(NativeExecutor, AnUnparsableSettingIsManagedInConflictAndStillReconcilesAnEarlierJournal) {
+  store.put(head_journal(step_e::attempted));
+  const auto managed = dt::bind_native_profile(unparsable_setting, [&] {
+    return std::shared_ptr<dt::native_executor_t> { &executor, [](auto *) {} };
+  });
+  ASSERT_TRUE(managed) << "never legacy";
+  const auto recovered = managed_recover(*managed);
+  EXPECT_TRUE(recovered.in_conflict);
+  EXPECT_TRUE(recovered.journal_present);
+  EXPECT_TRUE(managed_reset(*managed).in_conflict) << "the setting keeps it In conflict";
+  EXPECT_FALSE(store.bytes) << "reset still forgot the journal";
+  EXPECT_TRUE(verdict_is(managed_prepare(*managed), native_verdict_e::conflict));
+  EXPECT_EQ(log.host_writes(), 0u);
+}
+
+TEST(NativeManaged, AnUnparsableSettingWithoutAnExecutorIsStillInConflict) {
+  for (const auto &factory : std::vector<dt::native_executor_factory_t> {
+         [] { return std::shared_ptr<dt::native_executor_t> {}; },
+         []() -> std::shared_ptr<dt::native_executor_t> { throw std::runtime_error { "no edge" }; },
+       }) {
+    const auto managed = dt::bind_native_profile(unparsable_setting, factory);
+    ASSERT_TRUE(managed);
+    EXPECT_TRUE(managed->health().in_conflict);
+    EXPECT_TRUE(mentions(managed->health().reason, "display_topology_profile")) << managed->health().reason;
+    EXPECT_TRUE(verdict_is(managed_prepare(*managed), native_verdict_e::conflict));
+  }
+}
+
+TEST(NativeManaged, AValidSettingWhoseExecutorCannotBeBuiltIsInConflict) {
+  const auto thrown = dt::bind_native_profile(virtual_setting, []() -> std::shared_ptr<dt::native_executor_t> {
+    throw std::runtime_error { "no edge" };
+  });
+  ASSERT_TRUE(thrown) << "never legacy";
+  EXPECT_TRUE(thrown->health().in_conflict);
+  EXPECT_TRUE(mentions(thrown->health().reason, "no edge")) << thrown->health().reason;
+  EXPECT_FALSE(mentions(thrown->health().reason, "Invalid")) << "the setting itself is valid";
+  EXPECT_TRUE(verdict_is(managed_prepare(*thrown), native_verdict_e::conflict));
+
+  const auto missing = dt::bind_native_profile(virtual_setting, [] { return std::shared_ptr<dt::native_executor_t> {}; });
+  ASSERT_TRUE(missing);
+  EXPECT_TRUE(missing->health().in_conflict);
+  EXPECT_TRUE(mentions(missing->health().reason, "not available")) << missing->health().reason;
+  EXPECT_TRUE(verdict_is(managed_prepare(*missing), native_verdict_e::conflict));
+}
+
+TEST_F(NativeExecutor, TheBindingKeepsTheExecutorAlive) {
+  bool released = false;
+  auto managed = dt::bind_native_profile(virtual_setting, [&] {
+    return std::shared_ptr<dt::native_executor_t> { &executor, [&](auto *) { released = true; } };
+  });
+  ASSERT_TRUE(managed);
+  EXPECT_FALSE(released);
+  EXPECT_TRUE(verdict_is(managed_prepare(*managed), native_verdict_e::ok));
+  managed.reset();
+  EXPECT_TRUE(released);
+}

@@ -135,7 +135,7 @@ namespace display_device::topology {
     return options;
   }
 
-  void
+  native_health_t
   process_lifecycle_t::run_native(const mutation_capability_t &capability,
     const std::function<native_health_t(const mutation_capability_t &)> &hook, const char *failure) {
     native_health_t health;
@@ -150,7 +150,8 @@ namespace display_device::topology {
       coordinator_.publish_native_health(failed_native(failure));
       throw;
     }
-    coordinator_.publish_native_health(std::move(health));
+    coordinator_.publish_native_health(health);
+    return health;
   }
 
   bool
@@ -237,11 +238,15 @@ namespace display_device::topology {
     return lifecycle_cleanup_e::failed;
   }
 
-  void
+  std::optional<std::string>
   process_lifecycle_t::reset_native(const mutation_capability_t &capability) {
     if (hooks_.native) {
-      run_native(capability, hooks_.native->reset, "Native reset failed");
+      const auto health = run_native(capability, hooks_.native->reset, "Native reset failed");
+      if (health.journal_present) {
+        return health.reason.empty() ? std::string { "The native display topology journal is still present" } : health.reason;
+      }
     }
+    return std::nullopt;
   }
 
   void
