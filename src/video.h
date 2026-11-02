@@ -13,6 +13,8 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -672,4 +674,30 @@ namespace video {
    */
   int
   probe_encoders(std::optional<probe_target_t> target = std::nullopt);
+
+  namespace testing {
+    using capture_display_factory_t = std::function<std::shared_ptr<platf::display_t>(platf::mem_type_e, const std::string &, const config_t &)>;
+    using capture_display_names_t = std::function<std::vector<std::string>(platf::mem_type_e)>;
+
+    /**
+     * Replace the platform display edge of the capture path (platf::display and
+     * platf::display_names). Empty functions restore the platform. Also selects
+     * the software encoder's device type when no encoder has been probed.
+     */
+    void
+    set_capture_platform(capture_display_factory_t display, capture_display_names_t names);
+
+    /** A capture session attached exactly as capture_async attaches, without an encoder. */
+    class capture_attachment_t {
+    public:
+      virtual ~capture_attachment_t() = default;
+      /** The next captured image, or null on timeout or when the source stopped. */
+      virtual std::shared_ptr<platf::img_t>
+      pop(std::chrono::milliseconds timeout) = 0;
+    };
+
+    /** Null when the capture source refuses the session. */
+    std::unique_ptr<capture_attachment_t>
+    attach_capture(const config_t &config);
+  }  // namespace testing
 }  // namespace video

@@ -1188,6 +1188,44 @@ namespace video {
   auto capture_thread_async = safe::make_shared<capture_thread_async_ctx_t>(start_capture_async, end_capture_async);
   auto capture_thread_sync = safe::make_shared<capture_thread_sync_ctx_t>(start_capture_sync, end_capture_sync);
 
+  using capture_source_ref_t = decltype(capture_thread_async.ref());
+
+  // One capture thread per exact managed source, keyed by the requested display.
+  // Entries are never erased: live refs point into them, and the set is bounded
+  // by the distinct managed displays this process has captured.
+  class exact_capture_sources_t {
+  public:
+    capture_source_ref_t
+    acquire(const std::string &display_name) {
+      safe::shared_t<capture_thread_async_ctx_t> *source;
+      {
+        std::lock_guard lg { _lock };
+        auto &entry = _sources[display_name];
+        if (!entry) {
+          entry = std::make_unique<safe::shared_t<capture_thread_async_ctx_t>>(start_capture_async, end_capture_async);
+        }
+        source = entry.get();
+      }
+      return source->ref();
+    }
+
+  private:
+    std::mutex _lock;
+    std::map<std::string, std::unique_ptr<safe::shared_t<capture_thread_async_ctx_t>>> _sources;
+  };
+
+  exact_capture_sources_t exact_capture_sources;
+
+  // The capture thread a session attaches to. Legacy sessions share the single
+  // global capture thread; exact sessions never share another source's thread.
+  capture_source_ref_t
+  acquire_capture_source(const config_t &config) {
+    if (config.display_exact) {
+      return exact_capture_sources.acquire(config.display_name);
+    }
+    return capture_thread_async.ref();
+  }
+
 #ifdef _WIN32
   encoder_t nvenc {
     "nvenc"sv,
@@ -1740,12 +1778,39 @@ namespace video {
     return encoder ? std::string { encoder->name } : std::string {};
   }
 
+  namespace {
+    // Test-only replacement of the platform display edge; empty means the platform.
+    std::mutex capture_platform_lock;
+    testing::capture_display_factory_t capture_display_override;
+    testing::capture_display_names_t capture_display_names_override;
+
+    std::shared_ptr<platf::display_t>
+    capture_platform_display(platf::mem_type_e type, const std::string &display_name, const config_t &config) {
+      testing::capture_display_factory_t factory;
+      {
+        std::lock_guard lg { capture_platform_lock };
+        factory = capture_display_override;
+      }
+      return factory ? factory(type, display_name, config) : platf::display(type, display_name, config);
+    }
+
+    std::vector<std::string>
+    capture_platform_display_names(platf::mem_type_e type) {
+      testing::capture_display_names_t names;
+      {
+        std::lock_guard lg { capture_platform_lock };
+        names = capture_display_names_override;
+      }
+      return names ? names(type) : platf::display_names(type);
+    }
+  }  // namespace
+
   void
   reset_display(std::shared_ptr<platf::display_t> &disp, const platf::mem_type_e &type, const std::string &display_name, const config_t &config) {
     // We try this twice, in case we still get an error on reinitialization
     for (int x = 0; x < 2; ++x) {
       disp.reset();
-      disp = platf::display(type, display_name, config);
+      disp = capture_platform_display(type, display_name, config);
       if (disp) {
         BOOST_LOG(debug) << "[reset_display] 成功重置显示器: " << display_name;
         break;
@@ -1776,7 +1841,7 @@ namespace video {
 
     // Refresh the display names
     auto old_display_names = std::move(display_names);
-    display_names = platf::display_names(dev_type);
+    display_names = capture_platform_display_names(dev_type);
 
     // If we now have no displays, let's put the old display array back and fail
     if (display_names.empty() && !old_display_names.empty()) {
@@ -1851,6 +1916,11 @@ namespace video {
       return;
     }
     capture_ctxs.emplace_back(std::move(*initial_capture_ctx));
+
+    // An exact source captures only its managed display: it never accepts a
+    // session for another display and never consumes the global display switch.
+    const bool exact_source = capture_ctxs.front().config.display_exact;
+    const std::string exact_source_name = capture_ctxs.front().config.display_name;
 
     auto reset_capture_display = [&](std::shared_ptr<platf::display_t> &display,
                                      const std::string &name, const config_t &client_config) {
@@ -1933,9 +2003,19 @@ namespace video {
           return false;
         }
 
+        if ((exact_source || capture_ctx->config.display_exact) &&
+            (capture_ctx->config.display_exact != exact_source || capture_ctx->config.display_name != exact_source_name)) {
+          BOOST_LOG(error) << "Refusing to attach a session for display [" << capture_ctx->config.display_name
+                           << "] to the capture of [" << exact_source_name << "]";
+          capture_ctx->images->stop();
+          continue;
+        }
+
         // 同一个捕获线程中的会话共享当前显示器。手动切换显示器后加入的会话
         // 必须继承当前目标，避免后续重新初始化跳回它启动时选择的显示器。
-        capture_ctx->config.display_name = target_display_name;
+        if (!exact_source) {
+          capture_ctx->config.display_name = target_display_name;
+        }
         publish_capture_target(capture_ctx->config, *disp);
         if (initial_img) {
           // 锁屏或静态桌面可能长时间没有新的 Desktop Duplication 帧。
@@ -2090,7 +2170,15 @@ namespace video {
           }
         }
 
-        if (switch_display_event->peek()) {
+        if (exact_source) {
+          // Nothing else consumes a switch while no legacy capture (async or sync)
+          // runs; drop it so a later legacy stream does not apply a stale request.
+          if (switch_display_event->peek() && !capture_thread_async.has_ref() && !capture_thread_sync.has_ref() &&
+              switch_display_event->pop(0ms)) {
+            BOOST_LOG(warning) << "Ignoring a display switch: this stream captures its managed display only";
+          }
+        }
+        else if (switch_display_event->peek()) {
           artificial_reinit = true;
           return false;
         }
@@ -2157,7 +2245,7 @@ namespace video {
             // Process any pending display switch with the new list of displays
             auto &config = capture_ctxs.front().config;
             bool user_switched = false;
-            if (switch_display_event->peek()) {
+            if (!exact_source && switch_display_event->peek()) {
               if (const auto index = accept_display_switch(*switch_display_event->pop(), display_names.size(), config.display_exact)) {
                 display_p = *index;
                 user_switched = true;
@@ -4258,7 +4346,7 @@ namespace video {
       shutdown_event->raise(true);
     });
 
-    auto ref = capture_thread_async.ref();
+    auto ref = acquire_capture_source(config);
     if (!ref) {
       return;
     }
@@ -5471,6 +5559,61 @@ namespace video {
   }
   void
   end_capture_sync(capture_thread_sync_ctx_t &ctx) {}
+
+  namespace testing {
+    void
+    set_capture_platform(capture_display_factory_t display, capture_display_names_t names) {
+      {
+        std::lock_guard lg { capture_platform_lock };
+        capture_display_override = std::move(display);
+        capture_display_names_override = std::move(names);
+      }
+      static encoder_t *probed_encoder = nullptr;
+      static bool substituted = false;
+      if (capture_display_override && !chosen_encoder) {
+        probed_encoder = chosen_encoder;
+        chosen_encoder = &software;
+        substituted = true;
+      }
+      else if (!capture_display_override && substituted) {
+        chosen_encoder = probed_encoder;
+        substituted = false;
+      }
+    }
+
+    namespace {
+      class attachment_t: public capture_attachment_t {
+      public:
+        attachment_t(capture_source_ref_t ref, captured_frame_event_t images):
+            _ref { std::move(ref) }, _images { std::move(images) } {}
+
+        ~attachment_t() override {
+          _images->stop();
+        }
+
+        std::shared_ptr<platf::img_t>
+        pop(std::chrono::milliseconds timeout) override {
+          auto frame = _images->pop(timeout);
+          return frame ? frame->image : nullptr;
+        }
+
+      private:
+        capture_source_ref_t _ref;
+        captured_frame_event_t _images;
+      };
+    }  // namespace
+
+    std::unique_ptr<capture_attachment_t>
+    attach_capture(const config_t &config) {
+      auto ref = acquire_capture_source(config);
+      if (!ref) {
+        return nullptr;
+      }
+      auto images = std::make_shared<captured_frame_event_t::element_type>();
+      ref->capture_ctx_queue->raise(capture_ctx_t { images, config });
+      return std::make_unique<attachment_t>(std::move(ref), std::move(images));
+    }
+  }  // namespace testing
 
   platf::mem_type_e
   map_base_dev_type(AVHWDeviceType type) {
