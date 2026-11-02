@@ -292,24 +292,188 @@ namespace {
   // Whole-token match: `cap.require(` must not match `other_cap.require(`, `holder.cap.require(`,
   // `holder->cap.require(` or `ns::cap.require(`, and `SDC_APPLY` must not match `SDC_APPLY_X`.
   bool
+  token_at(const std::string &text, const std::string &token, std::size_t at) {
+    if (ident_char(token.front()) && at > 0) {
+      const char prev = text[at - 1];
+      if (ident_char(prev) || prev == '.' || (prev == '>' && at > 1 && text[at - 2] == '-') || (prev == ':' && at > 1 && text[at - 2] == ':')) {
+        return false;
+      }
+    }
+    const auto after = at + token.size();
+    return !(ident_char(token.back()) && after < text.size() && ident_char(text[after]));
+  }
+
+  bool
   contains(const std::string &text, const std::string &token) {
     if (token.empty()) {
       return true;
     }
     for (auto at = text.find(token); at != std::string::npos; at = text.find(token, at + 1)) {
-      if (ident_char(token.front()) && at > 0) {
-        const char prev = text[at - 1];
-        if (ident_char(prev) || prev == '.' || (prev == '>' && at > 1 && text[at - 2] == '-') || (prev == ':' && at > 1 && text[at - 2] == ':')) {
-          continue;
-        }
+      if (token_at(text, token, at)) {
+        return true;
       }
-      const auto after = at + token.size();
-      if (ident_char(token.back()) && after < text.size() && ident_char(text[after])) {
+    }
+    return false;
+  }
+
+  std::size_t
+  previous_non_space(const std::string &t, std::size_t i) {
+    while (i > 0 && std::isspace(static_cast<unsigned char>(t[i - 1]))) {
+      --i;
+    }
+    return i == 0 ? std::string::npos : i - 1;
+  }
+
+  char
+  next_non_space_char(const std::string &t, std::size_t i) {
+    while (i < t.size() && std::isspace(static_cast<unsigned char>(t[i]))) {
+      ++i;
+    }
+    return i < t.size() ? t[i] : '\0';
+  }
+
+  /**
+   * True when `cap.require(` in `before` (closed blocks already blanked) always runs: it starts a statement
+   * (after `{`, `;`, `}` or the body's opening) outside any parentheses, so no braceless control head, label,
+   * operator or for-header governs it.
+   */
+  bool
+  requires_unconditionally(const std::string &before, const std::string &cap) {
+    const auto token = cap + ".require(";
+    for (auto at = before.find(token); at != std::string::npos; at = before.find(token, at + 1)) {
+      if (!token_at(before, token, at)) {
         continue;
+      }
+      int depth = 0;
+      for (std::size_t i = 0; i < at; ++i) {
+        depth += before[i] == '(' ? 1 : before[i] == ')' ? -1 : 0;
+      }
+      const auto prev = previous_non_space(before, at);
+      if (depth == 0 && (prev == std::string::npos || before[prev] == '{' || before[prev] == ';' || before[prev] == '}')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool
+  member_accessed(const std::string &t, std::size_t at) {
+    const auto prev = previous_non_space(t, at);
+    return prev != std::string::npos && (t[prev] == '.' || (t[prev] == '>' && prev > 0 && t[prev - 1] == '-'));
+  }
+
+  /**
+   * True when the identifier at [at, end) is called: `f()`, `f.operator()()`, or `std::invoke(f` / `std::invoke(x.f`.
+   * Only zero-argument calls count, matching actor_process_factory_t, so `filter->process(input)` is not one.
+   */
+  bool
+  invoked(const std::string &t, std::size_t at, std::size_t end) {
+    auto j = end;
+    while (j < t.size() && std::isspace(static_cast<unsigned char>(t[j]))) {
+      ++j;
+    }
+    if (j < t.size() && t[j] == '(') {
+      auto k = j + 1;
+      while (k < t.size() && std::isspace(static_cast<unsigned char>(t[k]))) {
+        ++k;
+      }
+      return k < t.size() && t[k] == ')';
+    }
+    if (j < t.size() && (t[j] == '.' || t.compare(j, 2, "->") == 0)) {
+      j += t[j] == '.' ? 1 : 2;
+      // Exactly `operator ( ) ( )`; `operator bool()` and `operator=(` are not calls of the factory.
+      for (const auto *piece : { "operator", "(", ")", "(", ")" }) {
+        while (j < t.size() && std::isspace(static_cast<unsigned char>(t[j]))) {
+          ++j;
+        }
+        const std::string p = piece;
+        if (t.compare(j, p.size(), p) != 0 || (ident_char(p.back()) && j + p.size() < t.size() && ident_char(t[j + p.size()]))) {
+          return false;
+        }
+        j += p.size();
       }
       return true;
     }
-    return false;
+    // Walk back over the member-access chain (`a.b->f`) to the opening of an enclosing invoke call.
+    auto begin = at;
+    while (member_accessed(t, begin)) {
+      auto p = previous_non_space(t, begin);
+      p = t[p] == '.' ? p : p - 1;
+      auto q = previous_non_space(t, p);
+      if (q == std::string::npos || !ident_char(t[q])) {
+        return false;
+      }
+      while (q > 0 && ident_char(t[q - 1])) {
+        --q;
+      }
+      begin = q;
+    }
+    const auto paren = previous_non_space(t, begin);
+    if (paren == std::string::npos || t[paren] != '(') {
+      return false;
+    }
+    const auto name_end = previous_non_space(t, paren);
+    if (name_end == std::string::npos || !ident_char(t[name_end])) {
+      return false;
+    }
+    auto name_begin = name_end;
+    while (name_begin > 0 && ident_char(t[name_begin - 1])) {
+      --name_begin;
+    }
+    const auto name = t.substr(name_begin, name_end - name_begin + 1);
+    return name == "invoke";
+  }
+
+  /** Every identifier declared with type actor_process_factory_t (members, parameters, locals), across all sources. */
+  std::set<std::string>
+  factory_names(const std::map<std::string, std::string> &sources) {
+    static const std::string type = "actor_process_factory_t";
+    std::set<std::string> names;
+    for (const auto &[file, source] : sources) {
+      const auto t = strip(source);
+      for (auto at = t.find(type); at != std::string::npos; at = t.find(type, at + 1)) {
+        if (!token_at(t, type, at) && !(at > 1 && t[at - 1] == ':' && t[at - 2] == ':')) {
+          continue;
+        }
+        auto i = at + type.size();
+        const auto skip = [&] {
+          while (i < t.size() && (std::isspace(static_cast<unsigned char>(t[i])) || t[i] == '&' || t[i] == '*')) {
+            ++i;
+          }
+        };
+        skip();
+        if (t.compare(i, 5, "const") == 0 && i + 5 < t.size() && !ident_char(t[i + 5])) {
+          i += 5;
+          skip();
+        }
+        auto e = i;
+        while (e < t.size() && ident_char(t[e])) {
+          ++e;
+        }
+        // `T f(...)` declares a function returning a factory, not a stored one.
+        if (e == i || next_non_space_char(t, e) == '(') {
+          continue;
+        }
+        names.insert(t.substr(i, e - i));
+        // Later declarators of the same declaration (`T a, b;`); a parameter list's next `type name` stops the walk.
+        while (next_non_space_char(t, e) == ',') {
+          i = t.find(',', e) + 1;
+          while (i < t.size() && (std::isspace(static_cast<unsigned char>(t[i])) || t[i] == '&' || t[i] == '*')) {
+            ++i;
+          }
+          e = i;
+          while (e < t.size() && ident_char(t[e])) {
+            ++e;
+          }
+          const char next = next_non_space_char(t, e);
+          if (e == i || (next != ',' && next != ';' && next != '=' && next != '{')) {
+            break;
+          }
+          names.insert(t.substr(i, e - i));
+        }
+      }
+    }
+    return names;
   }
 
   struct scan_t {
@@ -352,7 +516,8 @@ namespace {
   }
 
   void
-  scan_file(const std::string &file, const std::string &source, const std::vector<allowance_t> &allowances, scan_t &scan) {
+  scan_file(const std::string &file, const std::string &source, const std::vector<allowance_t> &allowances, const std::set<std::string> &factories,
+    scan_t &scan) {
     const auto t = strip(source);
     const auto with_directives = strip(source, true);
     std::vector<function_t> fs;
@@ -369,8 +534,14 @@ namespace {
       const auto word = with_directives.substr(i, end - i);
       const auto at = i;
       i = end;
+      bool factory = false;
       if (!primitives.contains(word)) {
-        continue;
+        // A stored process factory launches when called. Names are matched by spelling, so any unqualified call of one fails closed.
+        if (!factories.contains(word) || !invoked(with_directives, at, end) ||
+            (!member_accessed(with_directives, at) && at > 1 && with_directives[at - 1] == ':' && with_directives[at - 2] == ':')) {
+          continue;
+        }
+        factory = true;
       }
       const auto line = static_cast<std::size_t>(std::count(t.begin(), t.begin() + at, '\n')) + 1;
       if (t[at] != with_directives[at]) {
@@ -409,7 +580,7 @@ namespace {
       }
       ++scan.seen[word];
       const auto &f = *chain.front();
-      const bool direct = word == "IOCTL_VDD_COMMAND" || next_non_space(t, end) == '(';
+      const bool direct = factory || word == "IOCTL_VDD_COMMAND" || next_non_space(t, end) == '(';
       const function_t *owner = &f;
       std::vector<std::string> capabilities;
       std::vector<std::string> envelopes;
@@ -426,17 +597,20 @@ namespace {
         }
       }
       // A require() inside a block that closed before the write (a branch, a nested lambda) does not dominate it.
+      // The closing brace is kept so a statement following the block still starts a statement.
       auto before = t.substr(f.open, at - f.open);
       for (std::size_t k = 1, depth = 0, start = 0; k < before.size(); ++k) {
         if (before[k] == '{' && depth++ == 0) {
           start = k;
         }
         else if (before[k] == '}' && depth > 0 && --depth == 0) {
-          std::fill(before.begin() + start, before.begin() + k + 1, ' ');
+          std::fill(before.begin() + start, before.begin() + k, ' ');
         }
       }
-      const bool gated = std::any_of(capabilities.begin(), capabilities.end(), [&](const auto &c) { return contains(before, c + ".require("); }) ||
-                         std::any_of(envelopes.begin(), envelopes.end(), [&](const auto &e) { return contains(before, e + ".authorized_bytes()"); });
+      // A preceding goto can jump over any require to a later label, so it voids them all.
+      const bool jumps = contains(t.substr(f.open, at - f.open), "goto");
+      const bool gated = !jumps && (std::any_of(capabilities.begin(), capabilities.end(), [&](const auto &c) { return requires_unconditionally(before, c); }) ||
+                         std::any_of(envelopes.begin(), envelopes.end(), [&](const auto &e) { return contains(before, e + ".authorized_bytes()"); }));
       if (gated && direct) {
         continue;
       }
@@ -495,13 +669,16 @@ namespace {
       "Builds an unlaunched plan; topology::restart_adapter requires adapter_restart before launching it." },
     { "display_device/vdd_utils.cpp", "make_adapter_restart_plan", "adapter_restart_command", { "plan.process" }, {},
       "Command text for the same inert plan." },
+    { "display_device/topology_actor_body.cpp", "run_process", "make", { "context.retain(process)" }, {},
+      "Runs only inside the actor body built by make_process_actor_body, which is itself a gated primitive." },
   };
 
   scan_t
   scan_sources(const std::map<std::string, std::string> &sources, const std::vector<allowance_t> &allowances) {
     scan_t scan;
+    const auto factories = factory_names(sources);
     for (const auto &[file, source] : sources) {
-      scan_file(file, source, allowances, scan);
+      scan_file(file, source, allowances, factories, scan);
     }
     return scan;
   }
@@ -603,6 +780,116 @@ TEST(DisplayRawMutationGateScanner, LambdasMustRequireInsideTheirOwnBody) {
   EXPECT_EQ(scan.violations[0].line, 4u);
   EXPECT_EQ(scan.violations[1].function, "hidden");
   EXPECT_EQ(scan.violations[2].function, "branch");
+}
+
+// Only a require() that runs unconditionally dominates: a full statement, outside parentheses and not under a braceless control head.
+TEST(DisplayRawMutationGateScanner, ConditionalRequiresWithoutBracesDoNotDominate) {
+  const auto scan = scan_sources({ { "a.cpp", R"(
+    void braceless(const topology::mutation_capability_t &cap, bool x) {
+      if (x) cap.require(topology::operation_e::rotate);
+      SetDisplayConfig(0, nullptr, 0, nullptr, 0);
+    }
+    void otherwise(const topology::mutation_capability_t &cap, bool x) {
+      if (x) { log(); } else cap.require(topology::operation_e::rotate);
+      SetDisplayConfig(0, nullptr, 0, nullptr, 0);
+    }
+    void loop(const topology::mutation_capability_t &cap, int n) {
+      for (int i = 0; i < n; ++i) cap.require(topology::operation_e::rotate);
+      SetDisplayConfig(0, nullptr, 0, nullptr, 0);
+    }
+    void looped(const topology::mutation_capability_t &cap, int n) {
+      while (n--) cap.require(topology::operation_e::rotate);
+      SetDisplayConfig(0, nullptr, 0, nullptr, 0);
+    }
+    void done(const topology::mutation_capability_t &cap) {
+      do cap.require(topology::operation_e::rotate); while (false);
+      SetDisplayConfig(0, nullptr, 0, nullptr, 0);
+    }
+    void shortcut(const topology::mutation_capability_t &cap, bool x) {
+      x && (cap.require(topology::operation_e::rotate), true);
+      SetDisplayConfig(0, nullptr, 0, nullptr, 0);
+    }
+    void chosen(const topology::mutation_capability_t &cap, bool x) {
+      x ? cap.require(topology::operation_e::rotate) : skip();
+      SetDisplayConfig(0, nullptr, 0, nullptr, 0);
+    }
+    void stepped(const topology::mutation_capability_t &cap) {
+      for (;; cap.require(topology::operation_e::rotate)) { break; }
+      SetDisplayConfig(0, nullptr, 0, nullptr, 0);
+    }
+    void labelled(const topology::mutation_capability_t &cap, int x) {
+      switch (x) { case 1: cap.require(topology::operation_e::rotate); case 2: SetDisplayConfig(0, nullptr, 0, nullptr, 0); }
+    }
+    void jumped(const topology::mutation_capability_t &cap, bool skip) {
+      if (skip) goto raw;
+      cap.require(topology::operation_e::rotate);
+    raw:
+      SetDisplayConfig(0, nullptr, 0, nullptr, 0);
+    }
+    void after_branch(const topology::mutation_capability_t &cap, bool x) {
+      if (x) { log(); } else { other(); }
+      cap.require(topology::operation_e::rotate);
+      SetDisplayConfig(0, nullptr, 0, nullptr, 0);
+    }
+    void nested(const topology::mutation_capability_t &cap, bool x) {
+      if (x) { cap.require(topology::operation_e::rotate); SetDisplayConfig(0, nullptr, 0, nullptr, 0); }
+    })" } },
+    {});
+  std::vector<std::string> rejected;
+  for (const auto &v : scan.violations) {
+    rejected.push_back(v.function);
+  }
+  EXPECT_EQ(rejected, (std::vector<std::string> { "braceless", "otherwise", "loop", "looped", "done", "shortcut", "chosen", "stepped", "labelled", "jumped" }))
+    << describe(scan.violations);
+}
+
+// A stored actor_process_factory_t launches a process when invoked, whatever the spelling of the call.
+// Names are matched by spelling, so a bare call of any factory name fails closed even where it is not the factory.
+TEST(DisplayRawMutationGateScanner, StoredProcessFactoryInvocationsNeedTheCapability) {
+  const auto scan = scan_sources({ { "plan.h", R"(
+    struct plan_t {
+      topology::actor_process_factory_t fallback, process;
+    };
+    topology::actor_process_factory_t choose();)" },
+    { "a.cpp", R"(
+    void direct(plan_t &plan) { plan.process(); }
+    void pointer(plan_t *plan) { auto p = plan->process ( ); }
+    void spelled(plan_t &plan) { plan.process.operator ( ) ( ); }
+    void invoked(plan_t &plan) { std::invoke(plan.process); }
+    void second(plan_t &plan) { plan.fallback(); }
+    void param(const topology::actor_process_factory_t &make) { auto p = make(); }
+    void param_spelled(topology::actor_process_factory_t make) { make.operator()(); }
+    void local() {
+      topology::actor_process_factory_t launch = choose();
+      launch();
+    }
+    struct owner_t {
+      topology::actor_process_factory_t member;
+      void run() { member(); }
+    };
+    void gated(const topology::mutation_capability_t &cap, plan_t &plan) {
+      cap.require(topology::operation_e::adapter_restart);
+      plan.process();
+    }
+    void inert(plan_t &plan, plan_t &other, filter_t *filter) {
+      if (!plan.process) return;
+      if (plan.process.operator bool()) log();
+      plan.process.operator=(other.process);
+      auto moved = std::move(plan.process);
+      auto a = handle_t::make();
+      auto c = filter->process(input);
+      auto d = choose();
+    })" } },
+    {});
+  std::vector<std::string> rejected;
+  for (const auto &v : scan.violations) {
+    rejected.push_back(v.function + ':' + v.primitive);
+  }
+  EXPECT_EQ(rejected, (std::vector<std::string> { "direct:process", "pointer:process", "spelled:process", "invoked:process", "second:fallback", "param:make",
+                        "param_spelled:make", "local:launch", "run:member" }))
+    << describe(scan.violations);
+  EXPECT_EQ(scan.seen.at("process"), 5);
+  EXPECT_EQ(scan.seen.at("make"), 2);
 }
 
 // Bodies the parser cannot recognise must fail closed instead of being mistaken for declarations.
@@ -727,7 +1014,7 @@ TEST(DisplayRawMutationGate, EveryRawDisplayAndVddWriteInSourcesIsCapabilityGate
   }
   // The scanner must still see the known writers; a silent miss would make the gate vacuous.
   for (const auto *expected : { "SetDisplayConfig", "ChangeDisplaySettingsExW", "DisplayConfigSetDeviceInfo", "DeviceIoControl", "IOCTL_VDD_COMMAND",
-         "make_owned_actor_process", "adapter_restart_command", "make_process_actor_body" }) {
+         "make_owned_actor_process", "adapter_restart_command", "make_process_actor_body", "make" }) {
     const auto found = scan.seen.find(expected);
     EXPECT_TRUE(found != scan.seen.end() && found->second > 0) << expected;
   }
