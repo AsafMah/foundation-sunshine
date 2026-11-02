@@ -14,17 +14,31 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 
 using namespace std::chrono_literals;
 
 namespace {
-  // Each fake source stamps its id into every image's width.
+  // How a fake source paces and sizes its frames.
+  struct fake_shape_t {
+    std::chrono::milliseconds period { 2ms };
+    // Nonzero: every frame is width x height and the source id rides only in the image's tag.
+    int width = 0;
+    int height = 0;
+  };
+
+  // Identity independent of the frame's dimensions.
+  struct tagged_img_t: platf::img_t {
+    int tag = -1;
+  };
+
+  // Each fake source stamps its id into every image's tag, and into its width unless sized.
   class fake_display_t: public platf::display_t {
   public:
-    explicit fake_display_t(int id, std::function<void()> on_close = {}, std::shared_ptr<std::atomic_bool> gone = {}):
-        _id { id }, _on_close { std::move(on_close) }, _gone { std::move(gone) } {}
+    explicit fake_display_t(int id, std::function<void()> on_close = {}, std::shared_ptr<std::atomic_bool> gone = {}, fake_shape_t shape = {}):
+        _id { id }, _on_close { std::move(on_close) }, _gone { std::move(gone) }, _shape { shape } {}
 
     ~fake_display_t() override {
       if (_on_close) {
@@ -43,17 +57,24 @@ namespace {
         if (!pull(img)) {
           return platf::capture_e::ok;
         }
-        img->width = _id;
+        if (_shape.width) {
+          img->width = _shape.width;
+          img->height = _shape.height;
+        }
+        else {
+          img->width = _id;
+        }
+        static_cast<tagged_img_t &>(*img).tag = _id;
         if (!push(std::move(img), true)) {
           return platf::capture_e::ok;
         }
-        std::this_thread::sleep_for(2ms);
+        std::this_thread::sleep_for(_shape.period);
       }
     }
 
     std::shared_ptr<platf::img_t>
     alloc_img() override {
-      return std::make_shared<platf::img_t>();
+      return std::make_shared<tagged_img_t>();
     }
 
     int
@@ -65,6 +86,7 @@ namespace {
     int _id;
     std::function<void()> _on_close;
     std::shared_ptr<std::atomic_bool> _gone;
+    fake_shape_t _shape;
   };
 
   class fake_capture_platform_t {
@@ -87,7 +109,9 @@ namespace {
           if (!gone) {
             gone = std::make_shared<std::atomic_bool>(false);
           }
-          return std::make_shared<fake_display_t>(it->second, [this] { closed(); }, gone);
+          const auto shape = _shapes.find(name);
+          return std::make_shared<fake_display_t>(it->second, [this] { closed(); }, gone,
+            shape == _shapes.end() ? fake_shape_t {} : shape->second);
         },
         [this](platf::mem_type_e) {
           std::lock_guard lg { _lock };
@@ -143,6 +167,23 @@ namespace {
       _sources[name] = id;
     }
 
+    // Applies to displays opened from now on.
+    void
+    shape(const std::string &name, fake_shape_t shape) {
+      std::lock_guard lg { _lock };
+      _shapes[name] = shape;
+    }
+
+    // The output reports loss, as on a device reset, and comes back under the same name.
+    void
+    reset_source(const std::string &name) {
+      std::lock_guard lg { _lock };
+      if (const auto it = _gone.find(name); it != _gone.end()) {
+        it->second->store(true);
+        _gone.erase(it);
+      }
+    }
+
   private:
     void
     closed() {
@@ -162,6 +203,7 @@ namespace {
     std::mutex _lock;
     std::map<std::string, int> _opened;
     std::map<std::string, std::shared_ptr<std::atomic_bool>> _gone;
+    std::map<std::string, fake_shape_t> _shapes;
     bool _installed_mail = false;
   };
 
@@ -294,6 +336,191 @@ TEST(VideoCaptureSources, ExactSourceDropsASwitchNoLegacyCaptureWillTake) {
   expect_only(*exact, 3);
   EXPECT_EQ(platform.opened("FAKE_C"), 1);
   EXPECT_EQ(platform.opened("FAKE_A"), 0);
+}
+
+namespace {
+  int
+  tag_of(const std::shared_ptr<platf::img_t> &img) {
+    return img ? static_cast<const tagged_img_t &>(*img).tag : -1;
+  }
+
+  struct tally_t {
+    std::map<int, int> tags;
+    std::set<std::pair<int, int>> sizes;
+    int frames = 0;
+    std::chrono::milliseconds max_gap {};
+  };
+
+  // Everything one session receives for @p duration, or, given @p done, until
+  // it is set and then @p duration more. The largest gap counts the silence
+  // before the first frame and after the last one.
+  tally_t
+  watch(video::testing::capture_attachment_t &attachment, std::chrono::milliseconds duration, const std::atomic<bool> *done = nullptr) {
+    tally_t tally;
+    const auto gap = [&](auto from, auto to) {
+      tally.max_gap = std::max(tally.max_gap, std::chrono::duration_cast<std::chrono::milliseconds>(to - from));
+    };
+    const auto start = std::chrono::steady_clock::now();
+    auto tail_from = start;
+    auto last = start;
+    while (true) {
+      const auto now = std::chrono::steady_clock::now();
+      if (done && !done->load()) {
+        tail_from = now;
+      }
+      else if (now - tail_from >= duration) {
+        break;
+      }
+      const auto img = attachment.pop(50ms);
+      const auto arrived = std::chrono::steady_clock::now();
+      if (!img) {
+        continue;
+      }
+      ++tally.tags[tag_of(img)];
+      tally.sizes.emplace(img->width, img->height);
+      ++tally.frames;
+      gap(last, arrived);
+      last = arrived;
+    }
+    gap(last, std::chrono::steady_clock::now());
+    return tally;
+  }
+
+  // The next frame's tag, waiting through a reinitialization.
+  bool
+  resumes(video::testing::capture_attachment_t &attachment, int tag) {
+    for (int i = 0; i < 100; ++i) {
+      if (tag_of(attachment.pop(50ms)) == tag) {
+        return true;
+      }
+    }
+    return false;
+  }
+}  // namespace
+
+// G2 (provisional pending G1 hardware): two managed sources stay isolated
+// through the real capture threads.
+TEST(VideoSourceIsolation, SourcesAtDifferentRatesNeverCross) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } } };
+  // Windows sleeps at the default ~15.6 ms timer, so A runs near 64 fps and B near 9.
+  platform.shape("FAKE_A", { .period = 2ms });
+  platform.shape("FAKE_B", { .period = 100ms });
+
+  auto a = video::testing::attach_capture(exact_config("FAKE_A"));
+  auto b = video::testing::attach_capture(exact_config("FAKE_B"));
+  ASSERT_TRUE(a && b);
+  tally_t seen_b;
+  std::thread watcher { [&] { seen_b = watch(*b, 800ms); } };
+  const auto seen_a = watch(*a, 800ms);
+  watcher.join();
+
+  EXPECT_EQ(seen_a.tags, (std::map<int, int> { { 1, seen_a.frames } }));
+  EXPECT_EQ(seen_b.tags, (std::map<int, int> { { 2, seen_b.frames } }));
+  // Each session runs at its own source's cadence.
+  EXPECT_GE(seen_b.frames, 4);
+  EXPECT_LE(seen_b.frames, 16);
+  EXPECT_GT(seen_a.frames, 3 * seen_b.frames);
+}
+
+TEST(VideoSourceIsolation, SameSizedSourcesStayDistinct) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } } };
+  platform.shape("FAKE_A", { .width = 1920, .height = 1080 });
+  platform.shape("FAKE_B", { .width = 1920, .height = 1080 });
+
+  auto a = video::testing::attach_capture(exact_config("FAKE_A"));
+  auto b = video::testing::attach_capture(exact_config("FAKE_B"));
+  ASSERT_TRUE(a && b);
+  tally_t seen_b;
+  std::thread watcher { [&] { seen_b = watch(*b, 400ms); } };
+  const auto seen_a = watch(*a, 400ms);
+  watcher.join();
+
+  const std::set<std::pair<int, int>> same { { 1920, 1080 } };
+  EXPECT_EQ(seen_a.sizes, same);
+  EXPECT_EQ(seen_b.sizes, same);
+  EXPECT_GT(seen_a.frames, 0);
+  EXPECT_GT(seen_b.frames, 0);
+  EXPECT_EQ(seen_a.tags, (std::map<int, int> { { 1, seen_a.frames } }));
+  EXPECT_EQ(seen_b.tags, (std::map<int, int> { { 2, seen_b.frames } }));
+}
+
+TEST(VideoSourceIsolation, AResetOnOneSourceNeverPausesTheOther) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } } };
+
+  auto a = video::testing::attach_capture(exact_config("FAKE_A"));
+  auto b = video::testing::attach_capture(exact_config("FAKE_B"));
+  ASSERT_TRUE(a && b);
+  ASSERT_TRUE(resumes(*a, 1));
+  ASSERT_TRUE(resumes(*b, 2));
+
+  tally_t seen_b;
+  std::atomic<bool> recovered { false };
+  std::thread watcher { [&] { seen_b = watch(*b, 200ms, &recovered); } };
+  for (int i = 0; i < 3; ++i) {
+    std::this_thread::sleep_for(150ms);
+    platform.reset_source("FAKE_A");
+    EXPECT_TRUE(resumes(*a, 1)) << "reset " << i;
+  }
+  recovered = true;
+  watcher.join();
+
+  EXPECT_EQ(platform.opened("FAKE_A"), 4);
+  EXPECT_EQ(platform.opened("FAKE_B"), 1);
+  EXPECT_EQ(seen_b.tags, (std::map<int, int> { { 2, seen_b.frames } }));
+  EXPECT_GE(seen_b.frames, 10);
+  EXPECT_LT(seen_b.max_gap, 150ms);
+}
+
+TEST(VideoSourceIsolation, AVanishedSourceEndsOnlyItsOwnCapture) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } } };
+
+  auto a = video::testing::attach_capture(exact_config("FAKE_A"));
+  auto b = video::testing::attach_capture(exact_config("FAKE_B"));
+  ASSERT_TRUE(a && b);
+  ASSERT_TRUE(resumes(*a, 1));
+  ASSERT_TRUE(resumes(*b, 2));
+
+  platform.move_source("FAKE_A", "", 1);
+  const auto seen_b = watch(*b, 400ms);
+  EXPECT_FALSE(resumes(*a, 1));
+  EXPECT_EQ(seen_b.tags, (std::map<int, int> { { 2, seen_b.frames } }));
+  EXPECT_GE(seen_b.frames, 5);
+  EXPECT_LT(seen_b.max_gap, 150ms);
+  EXPECT_EQ(platform.opened("FAKE_B"), 1);
+}
+
+TEST(VideoSourceIsolation, AnUnconsumedSourceNeverStallsTheOther) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } } };
+
+  auto a = video::testing::attach_capture(exact_config("FAKE_A"));
+  auto b = video::testing::attach_capture(exact_config("FAKE_B"));
+  ASSERT_TRUE(a && b);
+  // Nothing pops A while B is watched.
+  const auto seen_b = watch(*b, 500ms);
+  EXPECT_EQ(seen_b.tags, (std::map<int, int> { { 2, seen_b.frames } }));
+  EXPECT_GE(seen_b.frames, 20);
+  EXPECT_LT(seen_b.max_gap, 150ms);
+  EXPECT_TRUE(resumes(*a, 1));
+}
+
+TEST(VideoSourceIsolation, AnOsWideInvalidationResetsBothAndEachRecoversItsOwn) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } } };
+
+  auto a = video::testing::attach_capture(exact_config("FAKE_A"));
+  auto b = video::testing::attach_capture(exact_config("FAKE_B"));
+  ASSERT_TRUE(a && b);
+  ASSERT_TRUE(resumes(*a, 1));
+  ASSERT_TRUE(resumes(*b, 2));
+
+  // A device-wide loss reaches every output at once.
+  platform.reset_source("FAKE_A");
+  platform.reset_source("FAKE_B");
+  ASSERT_TRUE(resumes(*a, 1));
+  ASSERT_TRUE(resumes(*b, 2));
+  EXPECT_EQ(platform.opened("FAKE_A"), 2);
+  EXPECT_EQ(platform.opened("FAKE_B"), 2);
+  EXPECT_EQ(watch(*a, 200ms).tags.count(2), 0);
+  EXPECT_EQ(watch(*b, 200ms).tags.count(1), 0);
 }
 
 TEST(VideoCaptureSources, ExactSessionRefusesAMissingSource) {
@@ -1458,4 +1685,92 @@ TEST(VideoCaptureRetarget, AMoveIsRefusedOnceItsCaptureWasReplaced) {
   EXPECT_NE(moved.error().find("not the one held"), std::string::npos) << moved.error();
   expect_only(*second, 1);
   EXPECT_EQ(platform.opened("MOVE10_OTHER"), 0);
+}
+
+namespace {
+  // A ticketed exact capture of @p display, or null when its admission is refused.
+  std::unique_ptr<video::testing::capture_attachment_t>
+  admit_and_attach(const std::string &display, bool *budget_refusal = nullptr) {
+    auto outcome = video::probe_encoders_with_outcome(exact_target(display));
+    if (budget_refusal) {
+      *budget_refusal = outcome.budget_refusal;
+    }
+    if (outcome.status != 0) {
+      return nullptr;
+    }
+    return video::testing::attach_capture(ticketed_config(display, ticket_from(outcome)));
+  }
+
+  constexpr std::uint64_t rate_1080p60 = 1920ull * 1088 * 60;
+}  // namespace
+
+// G2 (provisional pending G1 hardware): two managed sources on one adapter
+// each hold their own lease, stay isolated, and the budget bounds a third.
+TEST(VideoSourceIsolation, TwoBudgetedSourcesHoldOneSessionEachAndAThirdIsRefused) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 }, { "FAKE_C", 3 } },
+    { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 }, { "FAKE_C", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 2, ample_rate } } } };
+
+  auto b = admit_and_attach("FAKE_B");
+  ASSERT_TRUE(b);
+  auto c = admit_and_attach("FAKE_C");
+  ASSERT_TRUE(c);
+  EXPECT_EQ(budget.sessions(0x10), 2u);
+  expect_only(*b, 2);
+  expect_only(*c, 3);
+
+  bool refusal = false;
+  EXPECT_FALSE(admit_and_attach("FAKE_B", &refusal));
+  EXPECT_TRUE(refusal);
+  EXPECT_EQ(budget.sessions(0x10), 2u);
+
+  // A reset on B keeps both leases and never pauses C.
+  tally_t seen_c;
+  std::atomic<bool> recovered { false };
+  std::thread watcher { [&] { seen_c = watch(*c, 200ms, &recovered); } };
+  std::this_thread::sleep_for(100ms);
+  platform.reset_source("FAKE_B");
+  EXPECT_TRUE(resumes(*b, 2));
+  recovered = true;
+  EXPECT_EQ(budget.sessions(0x10), 2u);
+  watcher.join();
+  EXPECT_EQ(seen_c.tags, (std::map<int, int> { { 3, seen_c.frames } }));
+  EXPECT_GE(seen_c.frames, 5);
+  EXPECT_LT(seen_c.max_gap, 150ms);
+
+  // Ending B frees exactly its own session.
+  b.reset();
+  EXPECT_EQ(budget.sessions(0x10), 1u);
+  expect_only(*c, 3);
+  auto again = admit_and_attach("FAKE_B");
+  ASSERT_TRUE(again);
+  expect_only(*again, 2);
+  EXPECT_EQ(budget.sessions(0x10), 2u);
+}
+
+TEST(VideoSourceIsolation, TwoBudgetedSourcesEachHoldTheirOwnPixelRate) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 }, { "FAKE_C", 3 } },
+    { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 }, { "FAKE_C", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 8, 2 * rate_1080p60 } } } };
+
+  auto b = admit_and_attach("FAKE_B");
+  ASSERT_TRUE(b);
+  auto c = admit_and_attach("FAKE_C");
+  ASSERT_TRUE(c);
+  EXPECT_EQ(budget.budget->held(admission::resource_kind_e::pixel_rate, 0x10), 2 * rate_1080p60);
+
+  bool refusal = false;
+  EXPECT_FALSE(admit_and_attach("FAKE_B", &refusal));
+  EXPECT_TRUE(refusal) << "the pixel rate, not the session count, is exhausted";
+  EXPECT_EQ(budget.sessions(0x10), 2u);
+
+  c.reset();
+  EXPECT_EQ(budget.budget->held(admission::resource_kind_e::pixel_rate, 0x10), rate_1080p60);
+  expect_only(*b, 2);
 }
