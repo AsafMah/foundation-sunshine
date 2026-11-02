@@ -97,6 +97,8 @@ namespace display_device::topology {
         return "adapter_restart";
       case operation_e::native_mode:
         return "native_mode";
+      case operation_e::native_activate:
+        return "native_activate";
     }
     return "unknown";
   }
@@ -127,7 +129,7 @@ namespace display_device::topology {
         case command_kind_e::legacy_startup_restore:
           return legacy_restore_operation(operation);
         case command_kind_e::launch_prepare:
-          return operation == native_apply ||
+          return operation == native_apply || (managed_mode && operation == native_activate) ||
                  (managed_mode ? operation == vdd_create || operation == vdd_destroy : legacy_prepare_operation(operation));
         case command_kind_e::launch_failed_restore:
         case command_kind_e::stream_restore:
@@ -136,7 +138,7 @@ namespace display_device::topology {
                  (!managed_mode && (legacy_restore_operation(operation) || operation == vdd_create));
         case command_kind_e::reconfigure:
           // Managed: only a mode change of the head this run created, never creation or whole-state writes.
-          return managed_mode ? operation == native_mode || operation == vdd_set_modes || operation == write_display_modes :
+          return managed_mode ? operation == native_mode || operation == native_activate || operation == vdd_set_modes || operation == write_display_modes :
                                 legacy_prepare_operation(operation);
         case command_kind_e::shutdown_vdd_destroy:
           return !managed_mode && operation == vdd_destroy;

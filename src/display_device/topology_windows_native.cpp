@@ -71,6 +71,12 @@ namespace display_device::topology {
       }
       return found;
     }
+
+    /** Listed on the desktop with an OS display name and geometry, so it can be captured. */
+    bool
+    on_desktop(const observed_display_t &display) {
+      return display.info.device_state != device_state_e::inactive && display.layout && !display.info.display_name.empty();
+    }
   }  // namespace
 
   std::optional<driver_version_t>
@@ -280,9 +286,15 @@ namespace display_device::topology {
       }
       const bool listed = wait_for([&](const inventory_t &observed) {
         const auto *now = head_with(observed, guid);
-        return now && lists(edge_.list_modes(now->info.display_name));
+        return now && (!on_desktop(*now) || lists(edge_.list_modes(now->info.display_name)));
       });
       if (!listed) return fail(error_code_e::unknown_applied_state, "the virtual display does not offer " + describe(wanted) + " after the mode list changed");
+      if (auto active = ensure_active(capability, guid); !active) return active;
+      const bool offered_now = wait_for([&](const inventory_t &observed) {
+        const auto *now = head_with(observed, guid);
+        return now && on_desktop(*now) && lists(edge_.list_modes(now->info.display_name));
+      });
+      if (!offered_now) return fail(error_code_e::unknown_applied_state, "the virtual display does not offer " + describe(wanted) + " after the mode list changed");
     }
 
     const auto listed_now = inventory();
@@ -301,6 +313,35 @@ namespace display_device::topology {
              same_whole_hz(now->layout->mode.refresh_rate, wanted.refresh_hz);
     });
     if (!applied) return fail(error_code_e::unknown_applied_state, "the virtual display does not show " + describe(wanted) + " after the mode was applied");
+    return {};
+  }
+
+  result_t<void>
+  windows_native_platform_t::do_activate_head(const mutation_capability_t &capability, const observed_display_t &head) {
+    if (!head.head) return fail(error_code_e::missing_identity, "the display is not a virtual display head");
+    return ensure_active(capability, head.head->guid);
+  }
+
+  result_t<void>
+  windows_native_platform_t::ensure_active(const mutation_capability_t &capability, const head_guid_t &guid) {
+    const auto listed = inventory();
+    const auto *head = listed.available ? head_with(listed, guid) : nullptr;
+    if (!head) return fail(error_code_e::unknown_applied_state, "the virtual display is no longer listed");
+    if (on_desktop(*head)) return {};
+    const auto sent = edge_.activate(capability, head->id);
+    switch (sent.delivery) {
+      case edge_delivery_e::not_sent:
+        return fail(error_code_e::resource_unavailable, "the virtual display was not added to the desktop: " + sent.detail);
+      case edge_delivery_e::uncertain:
+        return fail(error_code_e::unknown_applied_state, "the virtual display may have been added to the desktop: " + sent.detail);
+      case edge_delivery_e::delivered:
+        break;
+    }
+    const bool active = wait_for([&](const inventory_t &observed) {
+      const auto *now = head_with(observed, guid);
+      return now && on_desktop(*now);
+    });
+    if (!active) return fail(error_code_e::unknown_applied_state, "the virtual display is not on the desktop after it was added");
     return {};
   }
 }  // namespace display_device::topology

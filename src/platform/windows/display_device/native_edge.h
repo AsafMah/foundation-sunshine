@@ -65,6 +65,10 @@ namespace display_device::topology::win32_edge {
     edge_send_t
     send_set_modes(const mutation_capability_t &capability, const std::vector<edge_mode_t> &modes, const version_gate_t &gate) override;
 
+    /** CCD through `extend_topology`; a refusal is `uncertain`, since its revert may not have taken. */
+    edge_send_t
+    activate(const mutation_capability_t &capability, const os_display_id_t &display) override;
+
     std::chrono::steady_clock::time_point
     now() override;
 

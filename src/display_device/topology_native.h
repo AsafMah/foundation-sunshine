@@ -97,6 +97,15 @@ namespace display_device::topology {
     virtual result_t<void>
     change_head_mode(const mutation_capability_t &capability, const observed_display_t &head, const display_mode_t &mode) final;
 
+    /**
+     * Add the virtual head `head` (as last observed) to the desktop as its own extended display,
+     * then wait (bounded) for it to be listed active. A newly created head can arrive inactive,
+     * with no OS display name to capture. Other displays keep their topology groups. A head that
+     * is already active is left alone. An error leaves the applied state unknown.
+     */
+    virtual result_t<void>
+    activate_head(const mutation_capability_t &capability, const observed_display_t &head) final;
+
   protected:
     // Keep concrete hooks nonpublic and carry the capability through to raw setters.
     // The entry guards check authority, not proof that a head belongs to this request.
@@ -111,6 +120,9 @@ namespace display_device::topology {
 
     virtual result_t<void>
     do_change_head_mode(const mutation_capability_t &capability, const observed_display_t &head, const display_mode_t &mode) = 0;
+
+    virtual result_t<void>
+    do_activate_head(const mutation_capability_t &capability, const observed_display_t &head) = 0;
   };
 
   enum class native_verdict_e : std::uint8_t {

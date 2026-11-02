@@ -323,4 +323,14 @@ namespace display_device {
   bool
   set_topology(const topology::mutation_capability_t &capability, const active_topology_t &new_topology);
 
+  /**
+   * @brief Add one listed but inactive device to the desktop as its own extended display.
+   * Every other active group is kept; the change is verified and reverted when it does not take.
+   * Needs `native_activate` (managed native heads only).
+   * @param device_id The device to add.
+   * @returns True if the device is now its own group on the desktop, false otherwise.
+   */
+  bool
+  extend_topology(const topology::mutation_capability_t &capability, const std::string &device_id);
+
 }  // namespace display_device

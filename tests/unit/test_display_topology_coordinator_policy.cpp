@@ -104,6 +104,7 @@ namespace {
     operation_e::vdd_cursor,
     operation_e::adapter_restart,
     operation_e::native_mode,
+    operation_e::native_activate,
   };
 
   constexpr std::array restoration_leaves {
@@ -389,9 +390,10 @@ namespace {
     const std::map<kind, std::set<op>> managed {
       { kind::startup_recovery, with(restore, { op::native_recover }) },
       { kind::legacy_startup_restore, restore },
-      { kind::launch_prepare, { op::native_apply, op::vdd_create, op::vdd_destroy } },
+      // Activation only adds the head this run created to the desktop; whole-topology writes stay refused.
+      { kind::launch_prepare, { op::native_apply, op::native_activate, op::vdd_create, op::vdd_destroy } },
       { kind::launch_failed_restore, { op::native_restore, op::vdd_destroy } },
-      { kind::reconfigure, { op::native_mode, op::vdd_set_modes, op::write_display_modes } },
+      { kind::reconfigure, { op::native_mode, op::native_activate, op::vdd_set_modes, op::write_display_modes } },
       { kind::stream_restore, { op::native_restore, op::vdd_destroy } },
       { kind::shutdown_restore, { op::native_restore, op::vdd_destroy } },
       { kind::shutdown_vdd_destroy, {} },

@@ -95,7 +95,31 @@ namespace {
       }
       creates.push_back(intent);
       if (on_create) return on_create(intent);
-      displays.push_back(zako_head("vdd-" + std::to_string(creates.size()), intent.value, 500 + creates.size()));
+      auto head = zako_head("vdd-" + std::to_string(creates.size()), intent.value, 500 + creates.size());
+      if (create_inactive) deactivate(head);
+      displays.push_back(std::move(head));
+      return { edge_delivery_e::delivered, {} };
+    }
+
+    /** As the Win32 edge lists a display that is not on the desktop. */
+    static void
+    deactivate(dt::edge_display_t &display) {
+      display.info.display_name.clear();
+      display.info.device_state = state_e::inactive;
+      display.layout.reset();
+    }
+
+    dt::edge_send_t
+    activate(const dt::mutation_capability_t &capability, const dt::os_display_id_t &display) override {
+      capability.require(dt::operation_e::native_activate);
+      activations.push_back(display);
+      if (on_activate) return on_activate(display);
+      for (auto &listed : displays) {
+        if (listed.id != display) continue;
+        listed.info.display_name = "\\\\.\\DISPLAY-" + display.value;
+        listed.info.device_state = state_e::active;
+        listed.layout = display_topology_test::layout(3840);
+      }
       return { edge_delivery_e::delivered, {} };
     }
 
@@ -146,6 +170,7 @@ namespace {
         display.id = dt::os_display_id_t { name };
         display.info.display_name = "\\\\.\\DISPLAY-" + name;
         display.arrival += 100;
+        if (recreate_inactive) deactivate(display);
       }
       return { edge_delivery_e::delivered, {} };
     }
@@ -186,6 +211,12 @@ namespace {
     std::vector<std::vector<dt::edge_mode_t>> plans;
     std::function<dt::edge_send_t(const dt::os_display_id_t &, const display_device::display_mode_t &)> on_set_mode;
     std::function<dt::edge_send_t(const std::vector<dt::edge_mode_t> &)> on_set_modes;
+    /** New heads arrive off the desktop, as ZakoVDD heads did in the G1 hardware run. */
+    bool create_inactive {};
+    /** SETMODES recreates heads off the desktop. */
+    bool recreate_inactive {};
+    std::vector<dt::os_display_id_t> activations;
+    std::function<dt::edge_send_t(const dt::os_display_id_t &)> on_activate;
   };
 
   dt::windows_native_options_t
@@ -815,4 +846,127 @@ TEST_F(WindowsNative, TheExecutorLeavesAForeignHeadAlone) {
   EXPECT_EQ(edge.destroys, 0);
   ASSERT_TRUE(store.record());
   EXPECT_TRUE(store.record()->owned_heads.empty());
+}
+
+// --- Head activation (A4) -------------------------------------------------------------
+
+namespace {
+  dt::result_t<void>
+  activate_with(dt::windows_native_platform_t &platform, const dt::observed_display_t &head, dt::command_kind_e kind = dt::command_kind_e::launch_prepare) {
+    std::optional<dt::result_t<void>> result;
+    with_capability(kind, [&](const auto &capability) { result = platform.activate_head(capability, head); }, true);
+    return *result;
+  }
+
+  bool
+  on_desktop(const dt::edge_display_t &display) {
+    return display.layout && !display.info.display_name.empty() && display.info.device_state != state_e::inactive;
+  }
+}  // namespace
+
+TEST_F(WindowsNative, ActivateAddsAHeadThatArrivedOffTheDesktopAndWaitsForIt) {
+  edge.create_inactive = true;
+  const auto head = created_head();
+  ASSERT_FALSE(on_desktop(the_head()));
+  ASSERT_TRUE(activate_with(platform, head));
+  ASSERT_EQ(edge.activations.size(), 1u);
+  EXPECT_EQ(edge.activations[0], dt::os_display_id_t { "vdd-1" });
+  EXPECT_TRUE(on_desktop(the_head()));
+  const auto inventory = platform.inventory();
+  ASSERT_TRUE(find(inventory, "vdd-1"));
+  EXPECT_EQ(find(inventory, "vdd-1")->info.display_name, "\\\\.\\DISPLAY-vdd-1");
+}
+
+TEST_F(WindowsNative, ActivateLeavesAHeadOnTheDesktopAlone) {
+  const auto head = created_head();
+  ASSERT_TRUE(activate_with(platform, head));
+  EXPECT_TRUE(edge.activations.empty());
+}
+
+TEST_F(WindowsNative, ActivateDeliveryMapsToTheContract) {
+  edge.create_inactive = true;
+  const auto head = created_head();
+  edge.on_activate = [](const auto &) { return dt::edge_send_t { edge_delivery_e::not_sent, "no session" }; };
+  EXPECT_TRUE(fails_with(activate_with(platform, head), dt::error_code_e::resource_unavailable, "no session"));
+  edge.on_activate = [](const auto &) { return dt::edge_send_t { edge_delivery_e::uncertain, "SetDisplayConfig failed" }; };
+  EXPECT_TRUE(fails_with(activate_with(platform, head), dt::error_code_e::unknown_applied_state, "SetDisplayConfig failed"));
+  edge.on_activate = [](const auto &) { return dt::edge_send_t { edge_delivery_e::delivered, {} }; };
+  const auto sleeps = edge.sleeps;
+  EXPECT_TRUE(fails_with(activate_with(platform, head), dt::error_code_e::unknown_applied_state, "not on the desktop"));
+  EXPECT_GT(edge.sleeps, sleeps);
+  EXPECT_FALSE(on_desktop(the_head()));
+}
+
+TEST_F(WindowsNative, ActivateNeedsAListedHeadIdentity) {
+  edge.create_inactive = true;
+  const auto head = created_head();
+  auto anonymous = head;
+  anonymous.head.reset();
+  EXPECT_TRUE(fails_with(activate_with(platform, anonymous), dt::error_code_e::missing_identity, "not a virtual display head"));
+  edge.drop_heads();
+  EXPECT_TRUE(fails_with(activate_with(platform, head), dt::error_code_e::unknown_applied_state, "no longer listed"));
+  EXPECT_TRUE(edge.activations.empty());
+}
+
+TEST_F(WindowsNative, ActivateIsOnlyForAManagedPrepareOrReconfigure) {
+  edge.create_inactive = true;
+  const auto head = created_head();
+  for (const auto kind : { dt::command_kind_e::launch_prepare, dt::command_kind_e::reconfigure }) {
+    with_capability(kind, [&](const auto &capability) {
+      EXPECT_THROW((void) platform.activate_head(capability, head), dt::capability_error_t);
+    });
+  }
+  with_capability(dt::command_kind_e::native_restore, [&](const auto &capability) {
+    EXPECT_THROW((void) platform.activate_head(capability, head), dt::capability_error_t);
+  }, true);
+  EXPECT_TRUE(edge.activations.empty());
+  EXPECT_TRUE(activate_with(platform, head, dt::command_kind_e::reconfigure));
+}
+
+TEST_F(WindowsNative, ChangeModeAddsAHeadRecreatedOffTheDesktopBackBeforeApplyingTheMode) {
+  const auto head = created_head();
+  edge.recreate_inactive = true;
+  ASSERT_TRUE(change(head, mode(2560, 1440)));
+  ASSERT_EQ(edge.activations.size(), 1u);
+  EXPECT_EQ(edge.activations[0], dt::os_display_id_t { "vdd-r1" });
+  ASSERT_EQ(edge.mode_sets.size(), 1u);
+  EXPECT_EQ(edge.mode_sets[0].first, dt::os_display_id_t { "vdd-r1" });
+  EXPECT_TRUE(on_desktop(the_head()));
+  EXPECT_EQ(the_head().layout->mode.resolution.width, 2560u);
+}
+
+TEST_F(WindowsNative, ChangeModeStopsWhenARecreatedHeadCannotBeAddedBack) {
+  const auto head = created_head();
+  edge.recreate_inactive = true;
+  edge.on_activate = [](const auto &) { return dt::edge_send_t { edge_delivery_e::uncertain, "SetDisplayConfig failed" }; };
+  EXPECT_TRUE(fails_with(change(head, mode(2560, 1440)), dt::error_code_e::unknown_applied_state, "SetDisplayConfig failed"));
+  EXPECT_TRUE(edge.mode_sets.empty());
+}
+
+TEST_F(WindowsNative, TheExecutorAddsAColdCreatedHeadToTheDesktopAndStillRemovesIt) {
+  edge.create_inactive = true;
+  memory_store_t store;
+  dt::native_executor_t executor { store, platform, { next_uuid, 2, driver() } };
+  dt::native_outcome_t prepared;
+  with_capability(dt::command_kind_e::launch_prepare, [&](const auto &capability) {
+    prepared = executor.prepare(capability, { dt::native_profile_t::source_e::virtual_head, {} });
+  }, true);
+  ASSERT_EQ(prepared.verdict, native_verdict_e::ok) << prepared.reason;
+  ASSERT_TRUE(prepared.target);
+  EXPECT_EQ(prepared.target->display, dt::os_display_id_t { "vdd-1" });
+  ASSERT_EQ(edge.activations.size(), 1u);
+  EXPECT_TRUE(on_desktop(the_head()));
+  const auto record = store.record();
+  ASSERT_TRUE(record);
+  ASSERT_EQ(record->owned_heads.size(), 1u);
+  ASSERT_TRUE(record->steps.back().observed);
+  const auto *journaled = find(*record->steps.back().observed, "vdd-1");
+  ASSERT_TRUE(journaled);
+  EXPECT_FALSE(journaled->info.display_name.empty());
+
+  dt::native_outcome_t restored;
+  with_capability(dt::command_kind_e::native_restore, [&](const auto &capability) { restored = executor.restore(capability); }, true);
+  EXPECT_EQ(restored.verdict, native_verdict_e::ok) << restored.reason;
+  EXPECT_EQ(edge.destroys, 1);
+  EXPECT_FALSE(store.bytes);
 }

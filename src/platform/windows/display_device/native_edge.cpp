@@ -231,6 +231,12 @@ namespace display_device::topology::win32_edge {
     return to_edge(vdd_ioctl::send_command_gated(capability, command, gate));
   }
 
+  edge_send_t
+  win32_native_edge_t::activate(const mutation_capability_t &capability, const os_display_id_t &display) {
+    if (display_device::extend_topology(capability, display.value)) return { edge_delivery_e::delivered, {} };
+    return { edge_delivery_e::uncertain, "the display could not be added to the desktop" };
+  }
+
   std::chrono::steady_clock::time_point
   win32_native_edge_t::now() {
     return std::chrono::steady_clock::now();

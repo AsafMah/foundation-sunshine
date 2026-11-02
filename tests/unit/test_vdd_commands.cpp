@@ -151,7 +151,7 @@ namespace {
       { kind::legacy_startup_restore, {}, {} },
       { kind::launch_prepare, { op::vdd_create, op::vdd_destroy, op::vdd_set_modes, op::vdd_cursor }, { op::vdd_create, op::vdd_destroy } },
       { kind::launch_failed_restore, { op::vdd_create, op::vdd_destroy }, { op::vdd_destroy } },
-      { kind::reconfigure, { op::vdd_create, op::vdd_destroy, op::vdd_set_modes, op::vdd_cursor }, {} },
+      { kind::reconfigure, { op::vdd_create, op::vdd_destroy, op::vdd_set_modes, op::vdd_cursor }, { op::vdd_set_modes } },
       { kind::stream_restore, { op::vdd_create, op::vdd_destroy }, { op::vdd_destroy } },
       { kind::shutdown_restore, { op::vdd_create, op::vdd_destroy }, { op::vdd_destroy } },
       { kind::shutdown_vdd_destroy, { op::vdd_destroy }, {} },

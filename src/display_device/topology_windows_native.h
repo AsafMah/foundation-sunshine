@@ -137,6 +137,14 @@ namespace display_device::topology {
     virtual edge_send_t
     send_set_modes(const mutation_capability_t &capability, const std::vector<edge_mode_t> &modes, const version_gate_t &gate) = 0;
 
+    /**
+     * Adds one display that is listed but not on the desktop as its own extended display,
+     * keeping every other display's topology group. Delivered means the OS accepted and
+     * verified the new topology; uncertain means it may have been applied.
+     */
+    virtual edge_send_t
+    activate(const mutation_capability_t &capability, const os_display_id_t &display) = 0;
+
     virtual std::chrono::steady_clock::time_point
     now() = 0;
 
@@ -194,10 +202,18 @@ namespace display_device::topology {
 
     /**
      * Lists the mode with the driver first (`SETMODES`) when the OS does not offer it yet,
-     * then applies it to the head with the same GUID, which may have been recreated.
+     * then applies it to the head with the same GUID, which may have been recreated. A
+     * recreated head that comes back off the desktop is added to it again first.
      */
     result_t<void>
     do_change_head_mode(const mutation_capability_t &capability, const observed_display_t &head, const display_mode_t &mode) override;
+
+    result_t<void>
+    do_activate_head(const mutation_capability_t &capability, const observed_display_t &head) override;
+
+    /** Adds the head with `guid` to the desktop unless it is already on it, and waits for it there. */
+    result_t<void>
+    ensure_active(const mutation_capability_t &capability, const head_guid_t &guid);
 
     /** Polls until `done` holds for an available inventory or the wait ends; returns whether it held. */
     bool

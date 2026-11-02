@@ -166,7 +166,7 @@ namespace {
     host_writes() const {
       return static_cast<std::size_t>(std::count_if(events.begin(), events.end(), [](const std::string &event) {
         return event == "create_head" || event == "remove_all_heads" || event.starts_with("apply_fields:") ||
-               event.starts_with("change_head_mode:");
+               event.starts_with("change_head_mode:") || event.starts_with("activate_head:");
       }));
     }
   };
@@ -364,6 +364,21 @@ namespace {
       return {};
     }
 
+    dt::result_t<void>
+    do_activate_head(const dt::mutation_capability_t &capability, const dt::observed_display_t &head) override {
+      if (on_mutation) on_mutation(&capability);
+      log_.add("activate_head:" + head.id.value);
+      activations.push_back(head.id);
+      if (on_activate) {
+        return on_activate(head);
+      }
+      auto &target = find(host, head.id.value);
+      target.info.device_state = state_e::active;
+      target.info.display_name = "\\\\.\\DISPLAY-" + head.id.value;
+      target.layout = display_topology_test::layout(3840);
+      return {};
+    }
+
   public:
     /** Applies `mode` to a listed head; `recreate` gives it a new OS id and incarnations, as SETMODES may. */
     void
@@ -381,6 +396,12 @@ namespace {
     add_head() {
       auto name = "vdd-" + std::to_string(++created);
       auto display = virtual_display(name, 3840);
+      if (create_inactive) {
+        // As observed on hardware: a cold-created IddCx head is listed but not on the desktop.
+        display.info.device_state = state_e::inactive;
+        display.info.display_name.clear();
+        display.layout.reset();
+      }
       if (creating_) {
         display.head = dt::head_identity_t { driver(), *creating_, head_incarnation };
         if (stamp) stamp(*display.head);
@@ -415,6 +436,11 @@ namespace {
     /** Replaces the default mode change (applied in place); receives the 1-based attempt. */
     std::function<dt::result_t<void>(std::size_t, const dt::observed_display_t &, const display_device::display_mode_t &)> on_change_mode;
     bool recreate_on_mode {};
+    /** New heads arrive inactive (no layout, no OS display name), as ZakoVDD heads do. */
+    bool create_inactive {};
+    std::vector<dt::os_display_id_t> activations;
+    /** Replaces the default activation (the head goes active in place). */
+    std::function<dt::result_t<void>(const dt::observed_display_t &)> on_activate;
     std::function<void(const dt::mutation_capability_t *)> on_mutation;
     /** Edits one snapshot; receives the 1-based read number. */
     std::function<void(int, dt::inventory_t &)> tamper;
@@ -3292,4 +3318,129 @@ TEST_F(NativeExecutor, TheBindingKeepsTheExecutorAlive) {
   EXPECT_TRUE(verdict_is(managed_prepare(*managed), native_verdict_e::ok));
   managed.reset();
   EXPECT_TRUE(released);
+}
+
+// --- Head activation (A4) -------------------------------------------------------------
+
+namespace {
+  dt::native_outcome_t
+  managed_prepare_with(dt::native_executor_t &executor) {
+    dt::native_outcome_t outcome;
+    with_capability(dt::command_kind_e::launch_prepare, [&](const auto &capability) { outcome = executor.prepare(capability, virtual_profile()); }, true);
+    return outcome;
+  }
+}  // namespace
+
+TEST_F(NativeExecutor, AColdCreatedVirtualDisplayIsAddedToTheDesktopBeforeItIsTheTarget) {
+  platform.create_inactive = true;
+  const auto outcome = managed_prepare_with(executor);
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok));
+  ASSERT_TRUE(outcome.target);
+  EXPECT_TRUE((*outcome.target == dt::native_target_t { dt::os_display_id_t { "vdd-1" }, true }));
+  EXPECT_EQ(log.events, (std::vector<std::string> { "save", "create_head", "save", "activate_head:vdd-1", "save" }));
+  const auto &head = find(platform.host, "vdd-1");
+  EXPECT_EQ(head.info.device_state, state_e::active);
+  EXPECT_FALSE(head.info.display_name.empty());
+
+  const auto record = store.record();
+  ASSERT_TRUE(record);
+  ASSERT_EQ(record->owned_heads.size(), 1u);
+  ASSERT_EQ(record->steps.size(), 1u);
+  EXPECT_EQ(record->steps[0].state, step_e::observed);
+  ASSERT_TRUE(record->steps[0].observed);
+  const auto &journaled = find(*record->steps[0].observed, "vdd-1");
+  EXPECT_EQ(journaled.info.device_state, state_e::active);
+  EXPECT_TRUE(journaled.layout);
+
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(NativeExecutor, AVirtualDisplayAlreadyOnTheDesktopIsNotAddedAgain) {
+  const auto outcome = managed_prepare_with(executor);
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok));
+  EXPECT_TRUE(platform.activations.empty());
+  EXPECT_EQ(log.events, (std::vector<std::string> { "save", "create_head", "save" }));
+}
+
+TEST_F(NativeExecutor, AVirtualDisplayThatCannotBeAddedToTheDesktopIsRemoved) {
+  using activation_t = std::function<dt::result_t<void>(const dt::observed_display_t &)>;
+  const std::vector<std::tuple<std::string, activation_t, std::string>> cases {
+    { "refused", [](const auto &) -> dt::result_t<void> { return failure("no desktop session"); }, "could not be added to the desktop: no desktop session" },
+    { "silently ignored", [](const auto &) -> dt::result_t<void> { return {}; }, "was not added to the desktop" },
+  };
+  for (const auto &[name, activation, reason] : cases) {
+    SCOPED_TRACE(name);
+    ASSERT_TRUE(healthy(reset_with(executor)));
+    platform.host = host_inventory();
+    platform.create_inactive = true;
+    platform.on_activate = activation;
+    log.events.clear();
+    const auto outcome = managed_prepare_with(executor);
+    EXPECT_TRUE(verdict_is(outcome, native_verdict_e::refused));
+    EXPECT_TRUE(mentions(outcome.reason, reason));
+    EXPECT_FALSE(outcome.target);
+    EXPECT_EQ(log.events.back(), "clear");
+    EXPECT_TRUE(log.contains("remove_all_heads"));
+    EXPECT_EQ(platform.head_count(), 0u);
+    EXPECT_FALSE(store.bytes);
+    EXPECT_TRUE(healthy(executor.health()));
+  }
+}
+
+TEST_F(NativeExecutor, AddingTheVirtualDisplayToTheDesktopMustLeaveOtherDisplaysAlone) {
+  platform.create_inactive = true;
+  platform.on_activate = [&](const dt::observed_display_t &head) -> dt::result_t<void> {
+    auto &target = find(platform.host, head.id.value);
+    target.info.device_state = state_e::active;
+    target.info.display_name = "\\\\.\\DISPLAY-" + head.id.value;
+    target.layout = display_topology_test::layout(3840);
+    find(platform.host, "os-B").info.device_state = state_e::inactive;
+    return {};
+  };
+  const auto outcome = managed_prepare_with(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
+  EXPECT_TRUE(mentions(outcome.reason, "changed other displays"));
+  EXPECT_TRUE(log.contains("remove_all_heads"));
+  EXPECT_FALSE(outcome.target);
+  EXPECT_TRUE(store.bytes) << "other displays still differ, so the journal stays for recovery";
+}
+
+TEST_F(NativeExecutor, AVirtualDisplayThatChangesIdentityWhileBeingAddedIsNotRemovedBlind) {
+  platform.create_inactive = true;
+  platform.on_activate = [&](const dt::observed_display_t &head) -> dt::result_t<void> {
+    auto &target = find(platform.host, head.id.value);
+    target.info.device_state = state_e::active;
+    target.info.display_name = "\\\\.\\DISPLAY-" + head.id.value;
+    target.layout = display_topology_test::layout(3840);
+    target.incarnation = dt::source_incarnation_t { 9 };
+    return {};
+  };
+  const auto outcome = managed_prepare_with(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
+  EXPECT_TRUE(mentions(outcome.reason, "changed identity"));
+  EXPECT_FALSE(log.contains("remove_all_heads"));
+  EXPECT_EQ(platform.head_count(), 1u);
+  ASSERT_TRUE(store.bytes);
+  EXPECT_EQ(store.record()->owned_heads.size(), 1u);
+}
+
+TEST_F(NativeExecutor, AnActivatedDisplayThatCannotBeJournaledIsRemoved) {
+  platform.create_inactive = true;
+  store.fail_save_call = 3;
+  const auto outcome = managed_prepare_with(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::refused));
+  EXPECT_TRUE(mentions(outcome.reason, "activated virtual display"));
+  EXPECT_EQ(log.events, (std::vector<std::string> { "save", "create_head", "save",   "activate_head:vdd-1", "save", "remove_all_heads", "clear" }));
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(NativeExecutor, ALegacyPrepareCannotAddAVirtualDisplayToTheDesktop) {
+  platform.create_inactive = true;
+  const auto outcome = prepare_with(executor, virtual_profile());
+  EXPECT_FALSE(verdict_is(outcome, native_verdict_e::ok));
+  EXPECT_TRUE(platform.activations.empty());
+  EXPECT_FALSE(log.contains("activate_head:vdd-1"));
 }

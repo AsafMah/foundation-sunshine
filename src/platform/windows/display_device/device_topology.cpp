@@ -245,8 +245,8 @@ namespace display_device {
      * @see set_topology for a description as this was split off to reduce cognitive complexity.
      */
     bool
-    do_set_topology(const topology::mutation_capability_t &capability, const active_topology_t &new_topology) {
-      capability.require(topology::operation_e::write_topology);
+    do_set_topology(const topology::mutation_capability_t &capability, topology::operation_e authority, const active_topology_t &new_topology) {
+      capability.require(authority);
       auto display_data { w_utils::query_display_config(w_utils::ALL_DEVICES) };
       if (!display_data) {
         // Error already logged
@@ -283,6 +283,58 @@ namespace display_device {
       }
 
       return true;
+    }
+
+    /**
+     * Applies `new_topology` (a change from `current_topology`) under `authority`, verifies it,
+     * and reverts to `current_topology` when it did not take.
+     */
+    bool
+    apply_topology(const topology::mutation_capability_t &capability, topology::operation_e authority,
+      const active_topology_t &current_topology, const active_topology_t &new_topology) {
+      if (do_set_topology(capability, authority, new_topology)) {
+        const auto updated_topology { get_current_topology() };
+        if (!updated_topology.empty()) {
+          if (is_topology_the_same(new_topology, updated_topology)) {
+            return true;
+          }
+          else {
+            // There is an interesting bug in Windows when you have nearly
+            // identical devices, drivers or something. For example, imagine you have:
+            //    AM   - Actual Monitor
+            //    IDD1 - Virtual display 1
+            //    IDD2 - Virtual display 2
+            //
+            // You can have the following topology:
+            //    [[AM, IDD1]]
+            // but not this:
+            //    [[AM, IDD2]]
+            //
+            // Windows API will just default to:
+            //    [[AM, IDD1]]
+            // even if you provide the second variant. Windows API will think
+            // it's OK and just return ERROR_SUCCESS in this case and there is
+            // nothing you can do. Even the Windows' settings app will not
+            // be able to set the desired topology.
+            //
+            // There seems to be a workaround - you need to make sure the IDD1
+            // device is used somewhere else in the topology, like:
+            //    [[AM, IDD2], [IDD1]]
+            //
+            // However, since we have this bug an additional sanity check is needed
+            // regardless of what Windows report back to us.
+            BOOST_LOG(error) << "Failed to change topology due to Windows bug or because the display is in deep sleep!";
+          }
+        }
+        else {
+          BOOST_LOG(error) << "Failed to get updated topology!";
+        }
+
+        // Revert back to the original topology
+        do_set_topology(capability, authority, current_topology);  // Return value does not matter
+      }
+
+      return false;
     }
 
   }  // namespace
@@ -469,49 +521,40 @@ namespace display_device {
       return true;
     }
 
-    if (do_set_topology(capability, new_topology)) {
-      const auto updated_topology { get_current_topology() };
-      if (!updated_topology.empty()) {
-        if (is_topology_the_same(new_topology, updated_topology)) {
-          return true;
-        }
-        else {
-          // There is an interesting bug in Windows when you have nearly
-          // identical devices, drivers or something. For example, imagine you have:
-          //    AM   - Actual Monitor
-          //    IDD1 - Virtual display 1
-          //    IDD2 - Virtual display 2
-          //
-          // You can have the following topology:
-          //    [[AM, IDD1]]
-          // but not this:
-          //    [[AM, IDD2]]
-          //
-          // Windows API will just default to:
-          //    [[AM, IDD1]]
-          // even if you provide the second variant. Windows API will think
-          // it's OK and just return ERROR_SUCCESS in this case and there is
-          // nothing you can do. Even the Windows' settings app will not
-          // be able to set the desired topology.
-          //
-          // There seems to be a workaround - you need to make sure the IDD1
-          // device is used somewhere else in the topology, like:
-          //    [[AM, IDD2], [IDD1]]
-          //
-          // However, since we have this bug an additional sanity check is needed
-          // regardless of what Windows report back to us.
-          BOOST_LOG(error) << "Failed to change topology due to Windows bug or because the display is in deep sleep!";
-        }
-      }
-      else {
-        BOOST_LOG(error) << "Failed to get updated topology!";
-      }
+    return apply_topology(capability, topology::operation_e::write_topology, current_topology, new_topology);
+  }
 
-      // Revert back to the original topology
-      do_set_topology(capability, current_topology);  // Return value does not matter
+  bool
+  extend_topology(const topology::mutation_capability_t &capability, const std::string &device_id) {
+    capability.require(topology::operation_e::native_activate);
+    if (device_id.empty()) {
+      BOOST_LOG(error) << "No device to add to the desktop!";
+      return false;
     }
 
-    return false;
+    const auto current_topology { get_current_topology() };
+    if (current_topology.empty()) {
+      BOOST_LOG(error) << "Failed to get current topology!";
+      return false;
+    }
+
+    for (const auto &group : current_topology) {
+      if (std::find(std::begin(group), std::end(group), device_id) != std::end(group)) {
+        if (group.size() != 1) {
+          BOOST_LOG(error) << "Device " << device_id << " is already on the desktop, but duplicated with another display!";
+        }
+        return group.size() == 1;
+      }
+    }
+
+    auto new_topology { current_topology };
+    new_topology.push_back({ device_id });
+    if (!is_topology_valid(new_topology)) {
+      BOOST_LOG(error) << "Topology with device " << device_id << " added is invalid!";
+      return false;
+    }
+
+    return apply_topology(capability, topology::operation_e::native_activate, current_topology, new_topology);
   }
 
 }  // namespace display_device

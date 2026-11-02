@@ -64,6 +64,8 @@ namespace display_device::topology {
     adapter_restart,
     /** Change the mode of the managed virtual head this run created (managed `reconfigure` only). */
     native_mode,
+    /** Add the managed virtual head this run created to the desktop as its own extended display (managed only). */
+    native_activate,
   };
 
   std::string_view

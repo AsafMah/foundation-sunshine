@@ -159,6 +159,12 @@ namespace display_device::topology {
 
     using signature_t = std::vector<std::pair<std::string, device_state_e>>;
 
+    /** Listed on the desktop with an OS display name and geometry, so it can be captured. */
+    bool
+    on_desktop(const observed_display_t &display) {
+      return display.info.device_state != device_state_e::inactive && display.layout && !display.info.display_name.empty();
+    }
+
     /**
      * Displays the transaction neither manages nor created, by identity and state.
      * Geometry is not compared: P1 never writes these displays, it only checks that
@@ -410,6 +416,12 @@ namespace display_device::topology {
     return do_change_head_mode(capability, head, mode);
   }
 
+  result_t<void>
+  native_platform_t::activate_head(const mutation_capability_t &capability, const observed_display_t &head) {
+    capability.require(operation_e::native_activate);
+    return do_activate_head(capability, head);
+  }
+
   std::string_view
   to_string(mode_change_verdict_e verdict) noexcept {
     switch (verdict) {
@@ -597,6 +609,28 @@ namespace display_device::topology {
       record.owned_heads.push_back({ *head.head, owner_, head.adapter.value_or(adapter_luid_t {}), 0 });
       if (const auto saved = store_.save(record); !saved) {
         return roll_back_head(capability, record, head, "The native journal could not record the new virtual display: " + saved.error().detail);
+      }
+      // A cold-created head can be listed but not on the desktop, with nothing to capture.
+      // It is already owned in the journal, so any failure below removes it again.
+      if (!on_desktop(head)) {
+        const auto activated = platform_.activate_head(capability, head);
+        if (!activated) {
+          return roll_back_head(capability, record, head, "The new virtual display could not be added to the desktop: " + activated.error().detail);
+        }
+        const auto active = platform_.inventory();
+        if (!sole_matching_head(platform_, active, head)) {
+          return roll_back_head(capability, record, head, "The virtual display changed identity while being added to the desktop");
+        }
+        if (!on_desktop(*virtual_heads(platform_, active).front())) {
+          return roll_back_head(capability, record, head, "The virtual display was not added to the desktop");
+        }
+        if (unmanaged_signature(platform_, active, record) != expected) {
+          return roll_back_head(capability, record, head, "Adding the virtual display to the desktop changed other displays");
+        }
+        record.steps.back().observed = active;
+        if (const auto saved = store_.save(record); !saved) {
+          return roll_back_head(capability, record, head, "The native journal could not record the activated virtual display: " + saved.error().detail);
+        }
       }
       created_in_this_run_ = record.transaction;
       health_ = { true, false, {} };

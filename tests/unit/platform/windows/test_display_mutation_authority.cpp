@@ -133,9 +133,10 @@ namespace {
     op operation;
     bool (*call)(const cap &);
   };
-  const std::array<mutation_t, 7> mutations { {
+  const std::array<mutation_t, 8> mutations { {
     { "topology", op::write_topology, [](const cap &c) { return dd::set_topology(c, { { "display" } }); } },
-    { "topology rollback", op::write_topology, [](const cap &c) { return dd::do_set_topology(c, { { "display" } }); } },
+    { "topology rollback", op::write_topology, [](const cap &c) { return dd::do_set_topology(c, op::write_topology, { { "display" } }); } },
+    { "activate", op::native_activate, [](const cap &c) { return dd::extend_topology(c, "display"); } },
     { "modes", op::write_display_modes, [](const cap &c) { return dd::set_display_modes(c, { { "display", { { 1920, 1080 }, { 60, 1 } } } }); } },
     { "modes rollback", op::write_display_modes, [](const cap &c) { return dd::do_set_modes(c, { { "display", { { 1920, 1080 }, { 60, 1 } } } }, false); } },
     { "hdr", op::write_hdr, [](const cap &c) { return dd::set_hdr_states(c, { { "display", dd::hdr_state_e::enabled } }); } },
@@ -173,7 +174,9 @@ namespace {
         for (const auto &mutation : mutations) {
           SCOPED_TRACE(mutation.name);
           queries = writes = 0;
-          const bool allowed = row.restoration || (row.topology_only && mutation.operation == op::write_topology);
+          const bool allowed = mutation.operation == op::native_activate ?
+                                 row.command == kind::launch_prepare && row.managed :
+                                 row.restoration || (row.topology_only && mutation.operation == op::write_topology);
           if (allowed) {
             EXPECT_FALSE(mutation.call(capability)) << "inventory failure must remain a failure";
           }
