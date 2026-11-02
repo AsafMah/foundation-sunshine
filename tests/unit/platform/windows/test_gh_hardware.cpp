@@ -7,13 +7,18 @@
  * head already exists. The display baseline is captured and restored outside this test.
  */
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
+#include <map>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 
 #include <gtest/gtest.h>
 
 #include "src/display_device/topology_coordinator.h"
+#include "src/display_device/topology_journal_store.h"
+#include "src/display_device/topology_native.h"
 #include "src/display_device/topology_windows_native.h"
 #include "src/globals.h"
 #include "src/platform/windows/display_device/native_edge.h"
@@ -60,6 +65,36 @@ namespace {
     }
     std::cout.flush();
     return heads;
+  }
+
+  /** Runs one managed coordinator command other than a launch prepare. */
+  void
+  in_command(dt::command_kind_e kind, const std::function<void(const dt::mutation_capability_t &)> &body) {
+    dt::coordinator_options_t options;
+    options.managed_mode = true;
+    options.probes.startup_restore_quiescent = [] { return true; };
+    options.probes.active_streams = [] { return std::size_t {}; };
+    options.native_restore = [](const auto &, const auto &) {};
+    dt::coordinator_t coordinator { options };
+    std::exception_ptr thrown;
+    bool ran = false;
+    coordinator.start([](const dt::mutation_capability_t &, const dt::command_context_t &) {}).get();
+    coordinator.run(kind, [&](const dt::mutation_capability_t &capability, const dt::command_context_t &) {
+      ran = true;
+      try {
+        body(capability);
+      }
+      catch (...) {
+        thrown = std::current_exception();
+      }
+    });
+    coordinator.stop();
+    if (thrown) {
+      std::rethrow_exception(thrown);
+    }
+    if (!ran) {
+      throw std::runtime_error { "the GH command body did not run" };
+    }
   }
 
   void
@@ -183,6 +218,125 @@ TEST(GhHardware, NativeCreateReadbackDestroy) {
   EXPECT_EQ(inventory_matches, 1u) << "the platform inventory must list exactly one head with the intent GUID";
   EXPECT_TRUE(removed);
   EXPECT_EQ(heads_after_remove, 0u);
+}
+
+/**
+ * Kit 2: the managed executor's own path on the real driver. Prepare a virtual head (create and
+ * extend it onto the desktop), resize it as a client reconfigure would, then restore. The other
+ * displays must keep their mode and position after the restore. Skipped unless
+ * SUNSHINE_GH_ACTIVATE=1; the kit captures and restores the CCD baseline around it.
+ */
+TEST(GhHardware, NativeActivateModeRestore) {
+  const char *flag = std::getenv("SUNSHINE_GH_ACTIVATE");
+  if (!flag || std::string_view { flag } != "1") {
+    GTEST_SKIP() << "set SUNSHINE_GH_ACTIVATE=1 to activate and resize a real VDD head";
+  }
+  dt::win32_edge::win32_native_edge_t edge;
+  dt::windows_native_platform_t platform { edge, { dt::zako_vdd_driver, ZAKO_NAME } };
+  const auto journal = std::filesystem::temp_directory_path() / "sunshine-gh-activate-journal.json";
+  std::filesystem::remove(journal);
+  dt::file_journal_store_t store { journal };
+  std::random_device random;
+  dt::native_executor_t executor {
+    store,
+    platform,
+    {
+      [&] {
+        dt::uuid_bytes_t bytes;
+        for (auto &byte : bytes) {
+          byte = static_cast<std::uint8_t>(random());
+        }
+        return bytes;
+      },
+      2,
+      dt::zako_vdd_driver,
+    },
+  };
+
+  const auto before = edge.snapshot();
+  ASSERT_TRUE(before.available) << "the baseline inventory is unavailable; nothing was written";
+  ASSERT_EQ(print("before", before), 0u) << "a driver head already exists; nothing was written";
+
+  const auto others = [](const dt::edge_snapshot_t &snapshot) {
+    std::map<std::string, std::string> layouts;
+    for (const auto &display : snapshot.displays) {
+      if (display.kind == dt::head_class_e::driver_head) {
+        continue;
+      }
+      std::ostringstream out;
+      if (display.layout) {
+        out << display.layout->mode.resolution.width << 'x' << display.layout->mode.resolution.height
+            << '@' << display.layout->position.x << ',' << display.layout->position.y;
+      }
+      else {
+        out << "inactive";
+      }
+      layouts[display.id.value] = out.str();
+    }
+    return layouts;
+  };
+  const auto active_head = [](const dt::edge_snapshot_t &snapshot) -> const dt::edge_display_t * {
+    for (const auto &display : snapshot.displays) {
+      if (display.kind == dt::head_class_e::driver_head) {
+        return &display;
+      }
+    }
+    return nullptr;
+  };
+
+  std::uint32_t width = 1920;
+  std::uint32_t height = 1080;
+  if (const char *mode = std::getenv("SUNSHINE_GH_MODE")) {
+    std::istringstream in { mode };
+    char x {};
+    in >> width >> x >> height;
+  }
+
+  dt::native_outcome_t prepared;
+  in_launch_prepare([&](const auto &capability) { prepared = executor.prepare(capability, { dt::native_profile_t::source_e::virtual_head, {} }); });
+  std::cout << "GH prepare verdict=" << dt::to_string(prepared.verdict) << " reason=" << prepared.reason
+            << " target=" << (prepared.target ? prepared.target->display.value : std::string { "none" }) << '\n';
+  const auto prepared_snapshot = edge.snapshot();
+  print("after-prepare", prepared_snapshot);
+  const auto *prepared_head = active_head(prepared_snapshot);
+  const bool prepared_active = prepared_head && prepared_head->layout && !prepared_head->info.display_name.empty();
+  std::cout << "GH prepare_active=" << prepared_active
+            << " gdi=" << (prepared_head ? prepared_head->info.display_name : std::string {}) << '\n';
+  const bool others_kept_on_prepare = others(prepared_snapshot) == others(before);
+  std::cout << "GH prepare_others_unchanged=" << others_kept_on_prepare << '\n';
+
+  dt::mode_change_outcome_t changed;
+  if (prepared.verdict == dt::native_verdict_e::ok) {
+    in_command(dt::command_kind_e::reconfigure, [&](const auto &capability) { changed = executor.change_mode(capability, { width, height }); });
+  }
+  std::cout << "GH change verdict=" << dt::to_string(changed.verdict) << " reason=" << changed.reason
+            << " display=" << (changed.display ? changed.display->value : std::string { "none" }) << '\n';
+  const auto changed_snapshot = edge.snapshot();
+  print("after-change", changed_snapshot);
+  const auto *changed_head = active_head(changed_snapshot);
+  const bool changed_mode = changed_head && changed_head->layout &&
+                            changed_head->layout->mode.resolution.width == width &&
+                            changed_head->layout->mode.resolution.height == height;
+  std::cout << "GH change_active_with_mode=" << changed_mode << '\n';
+
+  dt::native_outcome_t restored;
+  in_command(dt::command_kind_e::native_restore, [&](const auto &capability) { restored = executor.restore(capability); });
+  std::cout << "GH restore verdict=" << dt::to_string(restored.verdict) << " reason=" << restored.reason << '\n';
+  const auto after = edge.snapshot();
+  const auto heads_after = print("after-restore", after);
+  const bool others_restored = others(after) == others(before);
+  std::cout << "GH restore_others_unchanged=" << others_restored << " journal_left=" << std::filesystem::exists(journal) << '\n';
+  std::cout.flush();
+
+  EXPECT_EQ(prepared.verdict, dt::native_verdict_e::ok) << prepared.reason;
+  EXPECT_TRUE(prepared_active) << "hardware unknown: CCD extend adds a cold-created head to the desktop";
+  EXPECT_TRUE(others_kept_on_prepare) << "extend-only must leave the other displays' mode and position";
+  EXPECT_EQ(changed.verdict, dt::mode_change_verdict_e::applied) << changed.reason;
+  EXPECT_TRUE(changed_mode) << "hardware unknown: a SETMODES-recreated head is back on the desktop at the new mode";
+  EXPECT_EQ(restored.verdict, dt::native_verdict_e::ok) << restored.reason;
+  EXPECT_EQ(heads_after, 0u);
+  EXPECT_TRUE(others_restored) << "removing the head must leave the other displays as they were";
+  EXPECT_FALSE(std::filesystem::exists(journal));
 }
 
 /** Read-only: list the edge classification; the kit parses `GH driver_heads=`. */
