@@ -692,3 +692,12 @@ User-confirmed P1 decisions:
 - When a stream-start ticket expires or is cancelled, the monitor command tied
   to that ticket is cancelled by its own handle; unrelated queued work in the
   same generation continues.
+
+Managed-head dynamic mode requests (P2, provisional pending G1 hardware): a
+client resolution or FPS change request (`IDX_DYNAMIC_PARAM_CHANGE`) on a
+managed native head (`config.monitor.display_exact`) is refused with one INFO
+line naming the kept and requested mode. It does not touch session config,
+perf, the display or the encoder. A request for the exact current mode is a
+silent no-op. Legacy sessions run the unchanged legacy handler. Managed-head
+resolution changes with make-before-break admission are a separate scheduled
+slice; FPS changes stay out of scope.

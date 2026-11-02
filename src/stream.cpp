@@ -58,6 +58,7 @@ extern "C" {
 #include "network.h"
 #include "streaming/perf_recorder.h"
 #include "stream.h"
+#include "stream_dynamic_mode.h"
 #include "sync.h"
 #include "tray/system_tray.h"
 #include "tray/tray_state.h"
@@ -2157,7 +2158,12 @@ namespace stream {
 
         const auto width = read_dynamic_param_i32(payload, WIRE_WORD_SIZE);
         const auto height = read_dynamic_param_i32(payload, WIRE_WORD_SIZE * 2);
-        handle_resolution_change(session, width, height);
+        const auto outcome = stream::dynamic_mode::gate(session->config.monitor, stream::dynamic_mode::request_t::resolution(width, height), [&]() {
+          handle_resolution_change(session, width, height);
+        });
+        if (outcome.decision == stream::dynamic_mode::decision_e::refused_managed) {
+          BOOST_LOG(info) << outcome.message;
+        }
         return;
       }
 
@@ -2171,27 +2177,31 @@ namespace stream {
         }
 
         const float new_fps = read_dynamic_param_f32(payload, WIRE_WORD_SIZE);
-        
-        if (new_fps <= 0.0f || new_fps > 1000.0f) {
-          BOOST_LOG(warning) << "Invalid FPS value: " << new_fps;
-          return;
-        }
+        const auto outcome = stream::dynamic_mode::gate(session->config.monitor, stream::dynamic_mode::request_t::fps(new_fps), [&]() {
+          if (new_fps <= 0.0f || new_fps > 1000.0f) {
+            BOOST_LOG(warning) << "Invalid FPS value: " << new_fps;
+            return;
+          }
 
-        session->config.monitor.framerate = static_cast<int>(new_fps);
-        perf::update_session_display(
-          session->launch_session_id,
-          session->config.monitor.width,
-          session->config.monitor.height,
-          session->config.monitor.framerate
-        );
-        
-        video::dynamic_param_t param;
-        param.type = video::dynamic_param_type_e::FPS;
-        param.value.float_value = new_fps;
-        param.valid = true;
-        session->video.dynamic_param_change_events->raise(param);
-        
-        BOOST_LOG(info) << "Dynamic FPS change: " << new_fps << " fps";
+          session->config.monitor.framerate = static_cast<int>(new_fps);
+          perf::update_session_display(
+            session->launch_session_id,
+            session->config.monitor.width,
+            session->config.monitor.height,
+            session->config.monitor.framerate
+          );
+
+          video::dynamic_param_t param;
+          param.type = video::dynamic_param_type_e::FPS;
+          param.value.float_value = new_fps;
+          param.valid = true;
+          session->video.dynamic_param_change_events->raise(param);
+
+          BOOST_LOG(info) << "Dynamic FPS change: " << new_fps << " fps";
+        });
+        if (outcome.decision == stream::dynamic_mode::decision_e::refused_managed) {
+          BOOST_LOG(info) << outcome.message;
+        }
         return;
       }
 
