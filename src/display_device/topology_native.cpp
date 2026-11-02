@@ -749,4 +749,58 @@ namespace display_device::topology {
     return present ? conflict(what) : refused(what);
   }
 
+  managed_native_t::managed_native_t(native_executor_t *executor, result_t<native_profile_t> profile):
+      executor_(executor),
+      profile_(std::move(profile)) {
+    if (profile_ && !executor_) {
+      throw std::invalid_argument { "a valid display_topology_profile needs a native executor" };
+    }
+  }
+
+  native_health_t
+  managed_native_t::health() const {
+    auto health = executor_ ? executor_->health() : native_health_t {};
+    if (!profile_ && !health.in_conflict) {
+      health.in_conflict = true;
+      health.reason = "Invalid display_topology_profile: " + profile_.error().detail;
+    }
+    return health;
+  }
+
+  native_health_t
+  managed_native_t::recover(const mutation_capability_t &capability) {
+    capability.require(operation_e::native_recover);
+    if (executor_) {
+      executor_->recover(capability);
+    }
+    return health();
+  }
+
+  native_health_t
+  managed_native_t::restore(const mutation_capability_t &capability) {
+    capability.require(operation_e::native_restore);
+    if (executor_) {
+      executor_->restore(capability);
+    }
+    return health();
+  }
+
+  native_health_t
+  managed_native_t::reset(const mutation_capability_t &capability) {
+    capability.require(operation_e::reset_persistence);
+    if (executor_) {
+      executor_->reset(capability);
+    }
+    return health();
+  }
+
+  native_outcome_t
+  managed_native_t::prepare(const mutation_capability_t &capability) {
+    capability.require(operation_e::native_apply);
+    if (!profile_) {
+      return { native_verdict_e::conflict, std::nullopt, "Invalid display_topology_profile: " + profile_.error().detail };
+    }
+    return executor_->prepare(capability, *profile_);
+  }
+
 }  // namespace display_device::topology

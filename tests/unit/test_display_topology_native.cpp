@@ -2569,3 +2569,134 @@ TEST_F(JournalFile, ARestartFindsTheJournalAndLeavesTheDisplay) {
   EXPECT_EQ(read_file(path), bytes);
   EXPECT_EQ(platform.head_count(), 1u);
 }
+// --- Managed process binding --------------------------------------------------------
+
+namespace {
+  dt::result_t<dt::native_profile_t>
+  invalid_setting() {
+    const auto parsed = dt::parse_native_profile(R"({"version":1,"monitors":[{"source":"primary"}]})");
+    if (parsed) {
+      throw std::runtime_error { "fixture setting unexpectedly parsed" };
+    }
+    return std::unexpected(parsed.error());
+  }
+
+  dt::native_health_t
+  managed_recover(dt::managed_native_t &managed) {
+    dt::native_health_t health;
+    with_capability(dt::command_kind_e::startup_recovery, [&](const auto &capability) { health = managed.recover(capability); }, true);
+    return health;
+  }
+
+  dt::native_health_t
+  managed_restore(dt::managed_native_t &managed) {
+    dt::native_health_t health;
+    with_capability(dt::command_kind_e::native_restore, [&](const auto &capability) { health = managed.restore(capability); }, true);
+    return health;
+  }
+
+  dt::native_health_t
+  managed_reset(dt::managed_native_t &managed) {
+    dt::native_health_t health;
+    with_capability(dt::command_kind_e::reset_persistence, [&](const auto &capability) { health = managed.reset(capability); }, true);
+    return health;
+  }
+
+  dt::native_outcome_t
+  managed_prepare(dt::managed_native_t &managed) {
+    dt::native_outcome_t outcome;
+    with_capability(dt::command_kind_e::launch_prepare, [&](const auto &capability) { outcome = managed.prepare(capability); }, true);
+    return outcome;
+  }
+}  // namespace
+
+TEST_F(NativeExecutor, AnInvalidProfileIsInConflictFromConstructionAndAfterEveryEntryPoint) {
+  dt::managed_native_t managed { &executor, invalid_setting() };
+  for (const auto &health : { managed.health(), managed_recover(managed), managed_restore(managed), managed_reset(managed) }) {
+    EXPECT_TRUE(health.in_conflict);
+    EXPECT_FALSE(health.journal_present);
+    EXPECT_TRUE(mentions(health.reason, "display_topology_profile")) << health.reason;
+  }
+  EXPECT_EQ(log.host_writes(), 0u);
+}
+
+TEST_F(NativeExecutor, AnInvalidProfileStillReportsAJournalOfAnEarlierRun) {
+  store.put(head_journal(step_e::attempted));
+  dt::managed_native_t managed { &executor, invalid_setting() };
+  const auto health = managed_recover(managed);
+  EXPECT_TRUE(health.in_conflict);
+  EXPECT_TRUE(health.journal_present);
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_EQ(log.host_writes(), 0u);
+}
+
+TEST_F(NativeExecutor, AnInvalidProfileNeverPreparesAndNeverTouchesTheHost) {
+  dt::managed_native_t managed { &executor, invalid_setting() };
+  const auto outcome = managed_prepare(managed);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
+  EXPECT_FALSE(outcome.target);
+  EXPECT_TRUE(mentions(outcome.reason, "display_topology_profile"));
+  EXPECT_EQ(log.host_writes(), 0u);
+  EXPECT_EQ(store.saves, 0);
+}
+
+TEST(NativeManaged, AnInvalidProfileWithoutAnExecutorStillFailsClosed) {
+  dt::managed_native_t managed { nullptr, invalid_setting() };
+  for (const auto &health : { managed.health(), managed_recover(managed), managed_restore(managed), managed_reset(managed) }) {
+    EXPECT_TRUE(health.in_conflict);
+    EXPECT_TRUE(mentions(health.reason, "display_topology_profile")) << health.reason;
+  }
+  EXPECT_TRUE(verdict_is(managed_prepare(managed), native_verdict_e::conflict));
+}
+
+TEST(NativeManaged, AValidProfileNeedsAnExecutor) {
+  EXPECT_THROW((dt::managed_native_t { nullptr, virtual_profile() }), std::invalid_argument);
+}
+
+TEST_F(NativeExecutor, AManagedEntryPointRequiresItsOwnCapability) {
+  dt::managed_native_t managed { &executor, virtual_profile() };
+  EXPECT_THROW(with_capability(dt::command_kind_e::rotate, [&](const auto &capability) { managed.prepare(capability); }),
+    dt::capability_error_t);
+  dt::managed_native_t invalid { nullptr, invalid_setting() };
+  EXPECT_THROW(with_capability(dt::command_kind_e::rotate, [&](const auto &capability) { invalid.prepare(capability); }),
+    dt::capability_error_t);
+  EXPECT_THROW(with_capability(dt::command_kind_e::rotate, [&](const auto &capability) { invalid.recover(capability); }),
+    dt::capability_error_t);
+  EXPECT_THROW(with_capability(dt::command_kind_e::rotate, [&](const auto &capability) { invalid.restore(capability); }),
+    dt::capability_error_t);
+  EXPECT_THROW(with_capability(dt::command_kind_e::rotate, [&](const auto &capability) { invalid.reset(capability); }),
+    dt::capability_error_t);
+}
+
+TEST_F(NativeExecutor, AValidVirtualProfilePreparesTheExactHeadAndRestoresIt) {
+  dt::managed_native_t managed { &executor, virtual_profile() };
+  EXPECT_TRUE(healthy(managed.health()));
+  EXPECT_TRUE(healthy(managed_recover(managed)));
+  const auto outcome = managed_prepare(managed);
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok));
+  ASSERT_TRUE(outcome.target);
+  EXPECT_EQ(outcome.target->display.value, "vdd-1");
+  EXPECT_TRUE(outcome.target->virtual_head);
+  EXPECT_TRUE(managed.health().journal_present);
+  EXPECT_TRUE(healthy(managed_restore(managed)));
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_TRUE(healthy(managed_restore(managed))) << "idempotent";
+}
+
+TEST_F(NativeExecutor, AValidPhysicalProfileTargetsExactlyThatDisplay) {
+  dt::managed_native_t managed { &executor, physical_profile("os-B") };
+  const auto outcome = managed_prepare(managed);
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok));
+  EXPECT_TRUE(outcome.target == (dt::native_target_t { dt::os_display_id_t { "os-B" }, false }));
+  EXPECT_EQ(log.host_writes(), 0u);
+}
+
+TEST_F(NativeExecutor, AValidProfileReportsAndResetsAnEarlierRunsJournal) {
+  store.put(head_journal(step_e::attempted));
+  dt::managed_native_t managed { &executor, virtual_profile() };
+  const auto recovered = managed_recover(managed);
+  EXPECT_TRUE(recovered.in_conflict);
+  EXPECT_TRUE(recovered.journal_present);
+  EXPECT_TRUE(healthy(managed_reset(managed)));
+  EXPECT_FALSE(store.bytes);
+}

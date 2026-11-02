@@ -16,6 +16,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 
 #include "topology_actor_startup.h"
@@ -51,6 +52,21 @@ namespace display_device::topology {
   const char *
   to_string(lifecycle_cleanup_e value) noexcept;
 
+  /**
+   * Managed (native) mode. Present selects managed mode for the whole process: every
+   * hook is required, and each returned health is published to the coordinator.
+   */
+  struct native_lifecycle_hooks_t {
+    /** Health published at construction, before startup recovery. */
+    std::function<native_health_t()> health;
+    /** Runs first in startup recovery, before actor recovery and the legacy startup restoration. */
+    std::function<native_health_t(const mutation_capability_t &)> recover;
+    /** The managed restoration: lease end and shutdown. Must be idempotent. */
+    std::function<native_health_t(const mutation_capability_t &)> restore;
+    /** Administrator reset (`reset_persistence` authority). */
+    std::function<native_health_t(const mutation_capability_t &)> reset;
+  };
+
   struct lifecycle_hooks_t {
     /** Required: the legacy startup restoration, run with startup authority after actor recovery. */
     command_body_t startup_restore;
@@ -67,6 +83,8 @@ namespace display_device::topology {
     actor_startup_options_t actor;
     /** Diagnostics; may be called from the worker, the watcher or the caller. */
     std::function<void(const std::string &)> report;
+    /** Empty for legacy mode (unchanged behaviour). */
+    std::optional<native_lifecycle_hooks_t> native;
     std::chrono::milliseconds startup_wait { 30000 };
     std::chrono::milliseconds shutdown_restore_wait { 4000 };
     std::chrono::milliseconds vdd_destroy_wait { 3000 };
@@ -105,7 +123,23 @@ namespace display_device::topology {
     lifecycle_cleanup_e
     shutdown_vdd_destroy();
 
+    /** Whether the process was latched into managed (native) mode. */
+    bool
+    managed() const noexcept {
+      return hooks_.native.has_value();
+    }
+
+    /** In managed mode, run the native reset under `capability` and publish its health; otherwise nothing. */
+    void
+    reset_native(const mutation_capability_t &capability);
+
   private:
+    coordinator_options_t
+    with_native(coordinator_options_t options);
+    /** Run a native hook and publish its health; an exception publishes In conflict and propagates. */
+    void
+    run_native(const mutation_capability_t &capability,
+      const std::function<native_health_t(const mutation_capability_t &)> &hook, const char *failure);
     lifecycle_cleanup_e
     run_bounded(command_kind_e kind, command_body_t body, std::chrono::milliseconds wait);
     void

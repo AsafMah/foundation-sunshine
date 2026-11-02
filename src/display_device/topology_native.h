@@ -213,4 +213,40 @@ namespace display_device::topology {
     native_health_t health_;
   };
 
+  /**
+   * @brief The latched `display_topology_profile` of a managed process bound to its executor.
+   * @details Only a non-blank setting selects managed mode. One that does not parse keeps the
+   *          process In conflict (never legacy, never another display): every launch is refused,
+   *          while recovery, restore and reset still reconcile any journal of an earlier run.
+   *          Entry points run on the coordinator worker, like the executor's.
+   */
+  class managed_native_t {
+  public:
+    /**
+     * @param executor May be null only when `profile` is an error (no native platform was built).
+     * @throws std::invalid_argument for a valid profile without an executor.
+     */
+    managed_native_t(native_executor_t *executor, result_t<native_profile_t> profile);
+
+    native_health_t
+    health() const;
+
+    native_health_t
+    recover(const mutation_capability_t &capability);
+
+    /** Idempotent: lease end and shutdown. */
+    native_health_t
+    restore(const mutation_capability_t &capability);
+
+    native_health_t
+    reset(const mutation_capability_t &capability);
+
+    native_outcome_t
+    prepare(const mutation_capability_t &capability);
+
+  private:
+    native_executor_t *executor_;
+    result_t<native_profile_t> profile_;
+  };
+
 }  // namespace display_device::topology

@@ -4,6 +4,7 @@
  */
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <future>
@@ -152,6 +153,12 @@ namespace display_device::topology {
       std::mutex kinds_mutex;
       std::function<void()> startup_extra;
       std::unique_ptr<process_lifecycle_t> lifecycle;
+      native_health_t native_initial;
+      native_health_t native_recovered;
+      native_health_t native_restored;
+      native_health_t native_reset;
+      std::function<void()> native_recover_extra;
+      std::function<void()> native_restore_extra;
 
       ~fixture_t() {
         observation = process_observation_e::exited;
@@ -240,6 +247,41 @@ namespace display_device::topology {
         auto h = hooks();
         if (adjust) adjust(h);
         lifecycle = std::make_unique<process_lifecycle_t>(options(), std::move(h));
+        return *lifecycle;
+      }
+
+      native_lifecycle_hooks_t
+      native_hooks() {
+        native_lifecycle_hooks_t result;
+        result.health = [this]() { return native_initial; };
+        result.recover = [this](const mutation_capability_t &capability) {
+          capability.require(operation_e::native_recover);
+          saw(capability.kind(), "native_recover");
+          if (native_recover_extra) native_recover_extra();
+          return native_recovered;
+        };
+        result.restore = [this](const mutation_capability_t &capability) {
+          capability.require(operation_e::native_restore);
+          saw(capability.kind(), "native_restore");
+          if (native_restore_extra) native_restore_extra();
+          return native_restored;
+        };
+        result.reset = [this](const mutation_capability_t &capability) {
+          capability.require(operation_e::reset_persistence);
+          saw(capability.kind(), "native_reset");
+          return native_reset;
+        };
+        return result;
+      }
+
+      process_lifecycle_t &
+      make_managed(std::function<void(native_lifecycle_hooks_t &)> adjust = {}) {
+        auto h = hooks();
+        h.native = native_hooks();
+        if (adjust) adjust(*h.native);
+        auto o = options();
+        o.probes.active_streams = []() { return std::size_t {}; };
+        lifecycle = std::make_unique<process_lifecycle_t>(std::move(o), std::move(h));
         return *lifecycle;
       }
 
@@ -480,6 +522,154 @@ namespace display_device::topology {
       EXPECT_EQ(lifecycle.shutdown_vdd_destroy(), lifecycle_cleanup_e::skipped);
       EXPECT_TRUE(f.log.events().empty());
       EXPECT_EQ(lifecycle.coordinator().status().phase, coordinator_phase_e::stopped);
+    }
+
+    bool
+    same_health(const native_health_t &actual, const native_health_t &expected) {
+      return actual.journal_present == expected.journal_present && actual.in_conflict == expected.in_conflict &&
+             actual.reason == expected.reason;
+    }
+
+    TEST(ProcessLifecycleManaged, EveryNativeHookIsRequired) {
+      const std::vector<std::function<void(native_lifecycle_hooks_t &)>> removals {
+        [](auto &n) { n.health = nullptr; },
+        [](auto &n) { n.recover = nullptr; },
+        [](auto &n) { n.restore = nullptr; },
+        [](auto &n) { n.reset = nullptr; },
+      };
+      for (std::size_t index = 0; index < removals.size(); ++index) {
+        fixture_t f;
+        EXPECT_THROW(f.make_managed(removals[index]), std::invalid_argument) << "hook " << index;
+      }
+    }
+
+    TEST(ProcessLifecycleManaged, ManagedCoordinatorOptionsWithoutNativeHooksAreRefused) {
+      fixture_t f;
+      auto o = f.options();
+      o.managed_mode = true;
+      o.probes.active_streams = []() { return std::size_t {}; };
+      o.native_restore = [](const auto &, const auto &) {};
+      EXPECT_THROW((process_lifecycle_t { std::move(o), f.hooks() }), std::invalid_argument);
+    }
+
+    TEST(ProcessLifecycleManaged, LegacyHooksLeaveTheCoordinatorLegacyAndResetNativeIsANoOp) {
+      fixture_t f;
+      auto &lifecycle = f.make();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      EXPECT_FALSE(lifecycle.managed());
+      EXPECT_FALSE(lifecycle.coordinator().status().managed_mode);
+      const auto ran = lifecycle.coordinator().run(kind::reset_persistence,
+        [&](const mutation_capability_t &capability, const command_context_t &) { lifecycle.reset_native(capability); });
+      EXPECT_TRUE(ran.completed());
+      EXPECT_EQ(f.log.events(), (std::vector<std::string> { "startup" }));
+    }
+
+    TEST(ProcessLifecycleManaged, ManagedModeIsLatchedAndTheInitialHealthIsPublishedAtConstruction) {
+      fixture_t f;
+      f.native_initial = { false, true, "Invalid display_topology_profile" };
+      auto &lifecycle = f.make_managed();
+      EXPECT_TRUE(lifecycle.managed());
+      const auto status = lifecycle.coordinator().status();
+      EXPECT_TRUE(status.managed_mode);
+      EXPECT_TRUE(same_health(status.native, f.native_initial)) << status.native.reason;
+      EXPECT_TRUE(f.log.events().empty()) << "nothing runs before start";
+    }
+
+    TEST(ProcessLifecycleManaged, NativeRecoveryRunsBeforeTheLegacyStartupRestorationAndIsPublished) {
+      fixture_t f;
+      f.native_recovered = { true, false, "journal kept" };
+      auto &lifecycle = f.make_managed();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      EXPECT_EQ(f.log.events(), (std::vector<std::string> { "native_recover", "startup" }));
+      EXPECT_EQ(f.seen_kinds(), (std::vector<kind> { kind::startup_recovery, kind::startup_recovery }));
+      EXPECT_TRUE(same_health(lifecycle.coordinator().status().native, f.native_recovered));
+    }
+
+    TEST(ProcessLifecycleManaged, AThrowingNativeRecoveryIsInConflictButLegacyStartupStillRuns) {
+      fixture_t f;
+      f.native_recover_extra = []() { throw std::runtime_error { "recover exploded" }; };
+      auto &lifecycle = f.make_managed();
+      lifecycle.start();
+      EXPECT_EQ(f.log.events(), (std::vector<std::string> { "native_recover", "startup" }));
+      const auto native = lifecycle.coordinator().status().native;
+      EXPECT_TRUE(native.in_conflict);
+      EXPECT_NE(native.reason.find("recover exploded"), std::string::npos) << native.reason;
+    }
+
+    TEST(ProcessLifecycleManaged, AConflictedRecoveryRefusesManagedLaunches) {
+      fixture_t f;
+      f.native_recovered = { true, true, "head of unknown origin" };
+      auto &lifecycle = f.make_managed();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      const auto admission = lifecycle.coordinator().admit_launch({ 1, "cert:a" });
+      EXPECT_FALSE(admission);
+      EXPECT_EQ(admission.reason, reject_reason_e::recovery_required);
+    }
+
+    TEST(ProcessLifecycleManaged, AnEndedManagedLeaseRunsTheNativeRestoreAndPublishesItsHealth) {
+      fixture_t f;
+      f.native_restored = { true, true, "restore could not prove the head" };
+      auto &lifecycle = f.make_managed();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      auto &coordinator = lifecycle.coordinator();
+      const auto admission = coordinator.admit_launch({ 1, "cert:a" });
+      ASSERT_TRUE(admission);
+      EXPECT_EQ(admission.token->flavor, launch_flavor_e::managed);
+      ASSERT_TRUE(coordinator.run_launch_prepare(*admission.token, [](const auto &, const auto &) {}).completed());
+      ASSERT_TRUE(coordinator.abort_launch(*admission.token, {}));
+      EXPECT_TRUE(eventually([&]() { return same_health(coordinator.status().native, f.native_restored); }));
+      const auto events = f.log.events();
+      EXPECT_EQ(std::count(events.begin(), events.end(), "native_restore"), 1);
+    }
+
+    TEST(ProcessLifecycleManaged, ShutdownRestoresNativelyAndNeverRunsTheLegacyShutdownRestoration) {
+      fixture_t f;
+      auto &lifecycle = f.make_managed();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      EXPECT_EQ(lifecycle.shutdown_restore(), lifecycle_cleanup_e::completed);
+      EXPECT_EQ(f.log.events(), (std::vector<std::string> { "native_recover", "startup", "native_restore" }));
+      EXPECT_EQ(f.seen_kinds().back(), kind::shutdown_restore);
+    }
+
+    TEST(ProcessLifecycleManaged, AFailedShutdownNativeRestoreIsReportedAndInConflict) {
+      fixture_t f;
+      f.native_restore_extra = []() { throw std::runtime_error { "restore exploded" }; };
+      auto &lifecycle = f.make_managed();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      EXPECT_EQ(lifecycle.shutdown_restore(), lifecycle_cleanup_e::failed);
+      EXPECT_TRUE(f.reported_containing("restore exploded"));
+      EXPECT_TRUE(lifecycle.coordinator().status().native.in_conflict);
+    }
+
+    TEST(ProcessLifecycleManaged, ManagedShutdownNeverDestroysAVddButStillStops) {
+      fixture_t f;
+      auto &lifecycle = f.make_managed();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      EXPECT_EQ(lifecycle.shutdown_vdd_destroy(), lifecycle_cleanup_e::skipped);
+      EXPECT_EQ(f.log.events(), (std::vector<std::string> { "native_recover", "startup" }));
+      EXPECT_EQ(lifecycle.coordinator().status().phase, coordinator_phase_e::stopped);
+      EXPECT_FALSE(f.reported_containing("rejected"));
+    }
+
+    TEST(ProcessLifecycleManaged, ManagedModeSuppressesAutomaticVddEvenWhenHealthy) {
+      fixture_t f;
+      auto &lifecycle = f.make_managed();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      EXPECT_FALSE(lifecycle.coordinator().status().native.in_conflict);
+      EXPECT_TRUE(lifecycle.suppress_automatic_vdd());
+    }
+
+    TEST(ProcessLifecycleManaged, ResetNativeRunsTheNativeResetAndPublishesItsHealth) {
+      fixture_t f;
+      f.native_recovered = { true, true, "unresolved" };
+      f.native_reset = { false, false, "" };
+      auto &lifecycle = f.make_managed();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      const auto ran = lifecycle.coordinator().run(kind::reset_persistence,
+        [&](const mutation_capability_t &capability, const command_context_t &) { lifecycle.reset_native(capability); });
+      EXPECT_TRUE(ran.completed());
+      EXPECT_TRUE(same_health(lifecycle.coordinator().status().native, f.native_reset));
+      EXPECT_EQ(f.log.events().back(), "native_reset");
     }
 
   }  // namespace

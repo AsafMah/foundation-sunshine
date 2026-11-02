@@ -45,7 +45,27 @@ namespace display_device::topology {
       if (!hooks.actor.store || !hooks.actor.observe) {
         throw std::invalid_argument { "Topology lifecycle needs the actor record store and process observer" };
       }
+      if (hooks.native && (!hooks.native->health || !hooks.native->recover || !hooks.native->restore || !hooks.native->reset)) {
+        throw std::invalid_argument { "Managed topology lifecycle needs native health, recovery, restore and reset hooks" };
+      }
       return hooks;
+    }
+
+    native_health_t
+    failed_native(std::string what) {
+      // An exception leaves the host unproven: keep whatever may be journaled and refuse launches.
+      return { true, true, std::move(what) };
+    }
+
+    coordinator_options_t
+    latched(coordinator_options_t options, const lifecycle_hooks_t &hooks) {
+      if (options.managed_mode && !hooks.native) {
+        throw std::invalid_argument { "A managed coordinator needs the lifecycle's native hooks" };
+      }
+      if (hooks.native) {
+        options.managed_mode = true;
+      }
+      return options;
     }
   }  // namespace
 
@@ -83,17 +103,59 @@ namespace display_device::topology {
 
   process_lifecycle_t::process_lifecycle_t(coordinator_options_t options, lifecycle_hooks_t hooks):
       hooks_(validated(std::move(hooks))),
-      coordinator_(std::move(options)) {
+      coordinator_(with_native(std::move(options))) {
     if (!hooks_.actor.restore_pending) {
       hooks_.actor.restore_pending = [this]() { return coordinator_.status().startup_restore_pending; };
     }
     if (!hooks_.actor.report) {
       hooks_.actor.report = [this](const std::string &line) { report(line); };
     }
+    if (hooks_.native) {
+      // Before start() can queue any worker command, so it is ordered before every native entry point.
+      try {
+        coordinator_.publish_native_health(hooks_.native->health());
+      }
+      catch (const std::exception &error) {
+        coordinator_.publish_native_health(failed_native(std::string { "Native health is unknown: " } + error.what()));
+      }
+      catch (...) {
+        coordinator_.publish_native_health(failed_native("Native health is unknown"));
+      }
+    }
+  }
+
+  coordinator_options_t
+  process_lifecycle_t::with_native(coordinator_options_t options) {
+    options = latched(std::move(options), hooks_);
+    if (hooks_.native) {
+      options.native_restore = [this](const mutation_capability_t &capability, const command_context_t &) {
+        run_native(capability, hooks_.native->restore, "Native restore failed");
+      };
+    }
+    return options;
+  }
+
+  void
+  process_lifecycle_t::run_native(const mutation_capability_t &capability,
+    const std::function<native_health_t(const mutation_capability_t &)> &hook, const char *failure) {
+    native_health_t health;
+    try {
+      health = hook(capability);
+    }
+    catch (const std::exception &error) {
+      coordinator_.publish_native_health(failed_native(std::string { failure } + ": " + error.what()));
+      throw;
+    }
+    catch (...) {
+      coordinator_.publish_native_health(failed_native(failure));
+      throw;
+    }
+    coordinator_.publish_native_health(std::move(health));
   }
 
   bool
   process_lifecycle_t::suppress_automatic_vdd() const {
+    if (managed()) return true;
     const auto status = coordinator_.status();
     return status.native.journal_present || status.native.in_conflict;
   }
@@ -101,6 +163,14 @@ namespace display_device::topology {
   lifecycle_start_e
   process_lifecycle_t::start() {
     auto started = coordinator_.start([this](const mutation_capability_t &capability, const command_context_t &) {
+      if (hooks_.native) {
+        try {
+          run_native(capability, hooks_.native->recover, "Native recovery failed");
+        }
+        catch (...) {
+          // Already In conflict; the legacy restoration and actor recovery still run.
+        }
+      }
       const auto classified = recover_startup_actor(coordinator_, capability, hooks_.actor, hooks_.startup_restore);
       report(std::string { "Startup actor record: " } + std::string { to_string(classified) });
     });
@@ -125,6 +195,13 @@ namespace display_device::topology {
       return lifecycle_cleanup_e::skipped;
     }
     coordinator_.begin_draining();
+    if (hooks_.native) {
+      return run_bounded(command_kind_e::shutdown_restore,
+        [this](const mutation_capability_t &capability, const command_context_t &) {
+          run_native(capability, hooks_.native->restore, "Native restore failed");
+        },
+        hooks_.shutdown_restore_wait);
+    }
     return run_bounded(command_kind_e::shutdown_restore, hooks_.shutdown_restore, hooks_.shutdown_restore_wait);
   }
 
@@ -134,7 +211,8 @@ namespace display_device::topology {
     if (shut_down_) return lifecycle_cleanup_e::skipped;
     shut_down_ = true;
     auto result = lifecycle_cleanup_e::skipped;
-    if (coordinator_.status().phase != coordinator_phase_e::not_started && !hooks_.keep_vdd()) {
+    // Managed mode owns heads only through the native journal; no automatic destroy.
+    if (!managed() && coordinator_.status().phase != coordinator_phase_e::not_started && !hooks_.keep_vdd()) {
       coordinator_.begin_draining();
       result = run_bounded(command_kind_e::shutdown_vdd_destroy, hooks_.quiet_vdd_destroy, hooks_.vdd_destroy_wait);
     }
@@ -157,6 +235,13 @@ namespace display_device::topology {
     if (result.completed()) return lifecycle_cleanup_e::completed;
     report(std::string { to_string(kind) } + " failed: " + describe(result));
     return lifecycle_cleanup_e::failed;
+  }
+
+  void
+  process_lifecycle_t::reset_native(const mutation_capability_t &capability) {
+    if (hooks_.native) {
+      run_native(capability, hooks_.native->reset, "Native reset failed");
+    }
   }
 
   void
