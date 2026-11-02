@@ -1198,7 +1198,9 @@ namespace display_device::topology {
     if (!managed && legacy_cleanup) {
       submit_posted_locked(command_kind_e::launch_failed_restore, std::move(legacy_cleanup));
     }
-    release_lease_locked(managed && (!staged || lease_->prepare_started), command_kind_e::launch_failed_restore);
+    // As expiry: a launch that never submitted a body has nothing to restore.
+    const bool submitted = lease_->prepare_mode != prepare_mode_e::not_submitted;
+    release_lease_locked(managed && submitted && (!staged || lease_->prepare_started), command_kind_e::launch_failed_restore);
     return true;
   }
 

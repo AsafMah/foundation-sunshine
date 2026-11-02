@@ -500,6 +500,7 @@ TEST(VideoLiveAdmission, AdmissionBeyondTheBudgetIsRefused) {
   EXPECT_NE(second.status, 0);
   EXPECT_EQ(second.result.error, video::probe_error_e::no_working_encoder);
   EXPECT_NE(second.result.message.find("budget"), std::string::npos) << second.result.message;
+  EXPECT_TRUE(second.budget_refusal) << "capacity, not a hardware failure: no cooldown";
   EXPECT_EQ(budget.sessions(0x10), 1u);
   EXPECT_EQ(video::testing::chosen_encoder_name(), encoder);
 
@@ -531,6 +532,7 @@ TEST(VideoLiveAdmission, AnEnforcedBudgetNeedsTheRequestedMode) {
   EXPECT_NE(outcome.status, 0);
   EXPECT_EQ(outcome.result.error, video::probe_error_e::no_working_encoder);
   EXPECT_NE(outcome.result.message.find("needs the requested mode"), std::string::npos) << outcome.result.message;
+  EXPECT_TRUE(outcome.budget_refusal);
   EXPECT_EQ(budget.sessions(0x10), 0u);
 }
 
@@ -560,7 +562,26 @@ TEST(VideoLiveAdmission, SoftwareAdmissionIsAccountedOnTheDisplayAdapter) {
   auto unknown = video::probe_encoders_with_outcome(exact_target("FAKE_C"));
   EXPECT_NE(unknown.status, 0);
   EXPECT_NE(unknown.result.message.find("unknown adapter"), std::string::npos) << unknown.result.message;
+  EXPECT_TRUE(unknown.budget_refusal);
   EXPECT_EQ(budget.sessions(0x20), 1u);
+}
+
+TEST(VideoLiveAdmission, EncoderAndDisplayRefusalsAreNotBudgetRefusals) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x20 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 4, ample_rate } }, { 0x20, { 4, ample_rate } } } };
+
+  const auto other_adapter = video::probe_encoders_with_outcome(exact_target("FAKE_B"));
+  EXPECT_NE(other_adapter.status, 0);
+  EXPECT_NE(other_adapter.result.message.find("adapter"), std::string::npos) << other_adapter.result.message;
+  EXPECT_FALSE(other_adapter.budget_refusal) << "an encoder that cannot run on the target is a hardware failure";
+
+  const auto missing = video::probe_encoders_with_outcome(exact_target("FAKE_MISSING"));
+  EXPECT_NE(missing.status, 0);
+  EXPECT_EQ(missing.result.error, video::probe_error_e::no_active_display);
+  EXPECT_FALSE(missing.budget_refusal);
 }
 
 TEST(VideoLiveAdmission, ChoosingTheEncoderAdvancesTheGeneration) {

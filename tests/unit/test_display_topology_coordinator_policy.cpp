@@ -1919,6 +1919,8 @@ namespace {
 
       const auto failing = managed.admit_launch({ 93, "cert:a" });
       ASSERT_TRUE(failing);
+      // A submitted prepare is what makes the abort owe a restore; see UnsubmittedTerminationDoesNotRestore.
+      ASSERT_TRUE(managed.run_launch_prepare(*failing.token, {}).completed());
       EXPECT_TRUE(managed.abort_launch(*failing.token, counting(legacy_cleanups)));
       EXPECT_FALSE(managed.abort_launch(*failing.token, counting(legacy_cleanups)));
       ASSERT_TRUE(flush(managed).completed());
@@ -4021,6 +4023,33 @@ namespace {
         EXPECT_TRUE(blocking.completion.get().completed());
         ASSERT_TRUE(flush(coordinator).completed());
         EXPECT_EQ(calls.load(), 0);
+      }
+    }
+  }
+
+  // A launch refused before it submits anything (e.g. a cooling-down target) has
+  // nothing to restore; abort must agree with expiry and leave the driver alone.
+  TEST(DisplayTopologyCoordinator, UnsubmittedTerminationDoesNotRestore) {
+    for (const bool managed : { false, true }) {
+      for (const bool expiry : { false, true }) {
+        fake_clock_t clock;
+        std::atomic_int calls {};
+        auto options = make_options(clock, managed);
+        if (managed) options.native_restore = counting(calls);
+        coordinator_t coordinator { options };
+        ASSERT_TRUE(start_ready(coordinator).completed());
+        const auto launch = coordinator.admit_launch({ 443, "unsubmitted" });
+        ASSERT_TRUE(launch);
+        if (expiry) {
+          clock.advance(1000ms);
+          coordinator.tick();
+        }
+        else {
+          EXPECT_TRUE(coordinator.abort_launch(*launch.token, {}));
+        }
+        ASSERT_TRUE(flush(coordinator).completed());
+        EXPECT_EQ(calls.load(), 0) << "managed=" << managed << " expiry=" << expiry;
+        EXPECT_TRUE(coordinator.admit_launch({ 444, "next" })) << "the lease was released";
       }
     }
   }

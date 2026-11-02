@@ -104,12 +104,13 @@ namespace nvhttp::stream_start {
           throw std::invalid_argument { "Display preparation requires fatal probe supervision" };
         }
         if (coordination_->token.flavor == topology::launch_flavor_e::managed) {
-          if (!coordination_->coordinator.managed_mode() || !coordination_->managed_prepare || coordination_->legacy_cleanup) {
-            throw std::invalid_argument { "Managed preparation requires managed ownership and a native prepare, without legacy cleanup" };
+          if (!coordination_->coordinator.managed_mode() || !coordination_->managed_prepare || coordination_->legacy_cleanup ||
+              !coordination_->cooldown || coordination_->cooldown_key.empty()) {
+            throw std::invalid_argument { "Managed preparation requires managed ownership, a native prepare and a keyed cooldown, without legacy cleanup" };
           }
         }
         else if (coordination_->coordinator.managed_mode() || coordination_->token.flavor != topology::launch_flavor_e::legacy ||
-                 !coordination_->legacy_cleanup || coordination_->managed_prepare) {
+                 !coordination_->legacy_cleanup || coordination_->managed_prepare || coordination_->cooldown) {
           throw std::invalid_argument { "Legacy preparation requires legacy ownership, cleanup and fatal supervision" };
         }
       }
@@ -117,6 +118,16 @@ namespace nvhttp::stream_start {
       bool
       managed() const {
         return coordination_->token.flavor == topology::launch_flavor_e::managed;
+      }
+
+      launch_cooldown_t &
+      cooldown() const {
+        return *coordination_->cooldown;
+      }
+
+      const std::string &
+      cooldown_key() const {
+        return coordination_->cooldown_key;
       }
 
       topology::native_prepared_t
@@ -900,17 +911,33 @@ namespace nvhttp::stream_start {
       "review_display_settings", "display", "display_configuration", true);
   }
 
+  static void
+  set_managed_cooldown_error(pt::ptree &tree, std::chrono::milliseconds remaining) {
+    const auto seconds = std::to_string(std::chrono::ceil<std::chrono::seconds>(remaining).count());
+    set_sunshine_error(tree, 503, "The managed display failed to prepare moments ago; retry after " + seconds + " s",
+      "MANAGED_DISPLAY_COOLDOWN", "Retry after " + seconds + " seconds.", "retry_launch", "display", "display_configuration", true);
+  }
+
   // Managed (native) launches stream exactly the profile's target: no legacy intent,
   // display fallback or temporary encoder retry, since any of them would capture a
-  // display the topology does not own.
+  // display the topology does not own. A hardware-side failure cools the target
+  // down; a budget refusal does not.
   static bool
   prepare_managed_display(
     preparation_context_t &preparation,
     pt::ptree &tree,
     rtsp_stream::launch_session_t &launch_session) {
+    auto &cooldown = preparation.cooldown();
+    const auto &key = preparation.cooldown_key();
+    if (const auto remaining = cooldown.refuse(key)) {
+      set_managed_cooldown_error(tree, *remaining);
+      return false;
+    }
     const auto prepared = preparation.prepare_native();
     if (!prepared.display || prepared.display->display.empty()) {
-      set_managed_display_error(tree, prepared.reason.empty() ? "no target display" : prepared.reason);
+      const auto reason = prepared.reason.empty() ? std::string { "no target display" } : prepared.reason;
+      cooldown.fail(key, reason);
+      set_managed_display_error(tree, reason);
       return false;
     }
 #ifdef _WIN32
@@ -918,6 +945,7 @@ namespace nvhttp::stream_start {
 #endif
     auto outcome = preparation.probe_admitted(managed_probe_target(launch_session, prepared.display->display));
     if (outcome.status != 0) {
+      if (!outcome.budget_refusal) cooldown.fail(key, outcome.result.message);
       set_video_probe_error(tree);
       return false;
     }
@@ -925,6 +953,7 @@ namespace nvhttp::stream_start {
     if (!preparation.record(*prepared.display)) {
       throw preparation_error_t { { topology::outcome_e::rejected, topology::reject_reason_e::stale_transaction } };
     }
+    cooldown.succeed(key);
     adopt_managed_display(launch_session, *prepared.display);
     carry_admission(launch_session, outcome);
     return true;

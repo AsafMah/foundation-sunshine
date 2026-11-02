@@ -400,13 +400,16 @@ namespace nvhttp {
     stream_start::launch_coordination_t
     coordination() const {
       if (managed_) {
+        // One cooldown for the process: the latched profile is its only target.
+        static const auto cooldown = std::make_shared<stream_start::launch_cooldown_t>();
         return {
           display_device::coordinated::coordinator(), *token_, {},
           []() { lifetime::force_terminate(EXIT_FAILURE); },
           {}, policy_,
           [](const display_device::topology::mutation_capability_t &capability) {
             return display_device::coordinated::prepare_native(capability);
-          }
+          },
+          cooldown, display_device::coordinated::latched_profile()
         };
       }
       return {

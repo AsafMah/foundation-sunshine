@@ -6,9 +6,11 @@
 
 #include "display_device/settings.h"
 #include "display_device/topology_routes.h"
+#include "nvhttp_launch_cooldown.h"
 #include "rtsp.h"
 
 #include <boost/property_tree/ptree.hpp>
+#include <memory>
 #include <string>
 
 namespace nvhttp::stream_start {
@@ -30,6 +32,9 @@ namespace nvhttp::stream_start {
     /** The runtime's automatic-VDD policy, latched by the caller for this launch. */
     display_device::automatic_vdd_policy_e vdd_policy { display_device::automatic_vdd_policy_e::suppress };
     std::function<display_device::topology::native_prepared_t(const display_device::topology::mutation_capability_t &)> managed_prepare;
+    /** Managed only, and required there: the failure cooldown and the profile target it is keyed on. */
+    std::shared_ptr<launch_cooldown_t> cooldown;
+    std::string cooldown_key;
   };
 
   void

@@ -52,6 +52,7 @@ namespace {
     std::vector<probe_call_t> probed;
     std::deque<video::probe_result_t> joiner_admissions;
     std::vector<video::probe_target_t> joiners_admitted;
+    bool budget_refusal {};
     std::vector<std::string> events;
     std::vector<bool> touch;
     std::vector<display_device::automatic_vdd_policy_e> policies;
@@ -202,6 +203,7 @@ namespace video {
     outcome.result = last_encoder_probe_result;
     outcome.encoder_generation = 7;
     if (outcome.status == 0) outcome.admission = admission::pending_t::unaccounted();
+    else outcome.budget_refusal = fake.budget_refusal;
     return outcome;
   }
 
@@ -813,6 +815,9 @@ namespace {
     std::shared_ptr<std::atomic_int> restores = std::make_shared<std::atomic_int>();
     topology::native_prepared_t prepared { topology::managed_target_t { "{zako-head}", true }, {} };
     int prepares {};
+    std::chrono::steady_clock::time_point now {};
+    std::shared_ptr<nvhttp::stream_start::launch_cooldown_t> cooldown =
+      std::make_shared<nvhttp::stream_start::launch_cooldown_t>([this] { return now; });
 
     void
     managed(std::chrono::milliseconds setup_timeout = 60s) {
@@ -835,6 +840,8 @@ namespace {
         fake.events.push_back("native_prepare");
         return prepared;
       };
+      coordination.cooldown = cooldown;
+      coordination.cooldown_key = "virtual_head";
       return coordination;
     }
 
@@ -1026,6 +1033,12 @@ namespace {
     auto with_legacy_cleanup = coordination;
     with_legacy_cleanup.legacy_cleanup = [](const auto &, const auto &) {};
     EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &with_legacy_cleanup), std::invalid_argument);
+    auto missing_cooldown = coordination;
+    missing_cooldown.cooldown = {};
+    EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &missing_cooldown), std::invalid_argument);
+    auto unkeyed_cooldown = coordination;
+    unkeyed_cooldown.cooldown_key.clear();
+    EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &unkeyed_cooldown), std::invalid_argument);
     EXPECT_EQ(prepares, 0);
     EXPECT_TRUE(fake.events.empty());
     EXPECT_TRUE(coordinator->abort_launch(coordination.token, {}));
@@ -1035,8 +1048,14 @@ namespace {
     auto coordination = route();
     coordination.managed_prepare = [](const auto &) { return topology::native_prepared_t {}; };
     EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination), std::invalid_argument);
-    EXPECT_TRUE(fake.events.empty());
     EXPECT_TRUE(coordinator->abort_launch(coordination.token, {}));
+    auto with_cooldown = route();
+    with_cooldown.cooldown = std::make_shared<nvhttp::stream_start::launch_cooldown_t>();
+    with_cooldown.cooldown_key = "virtual_head";
+    EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &with_cooldown), std::invalid_argument)
+      << "the cooldown is managed-only; the legacy path never sees it";
+    EXPECT_TRUE(fake.events.empty());
+    EXPECT_TRUE(coordinator->abort_launch(with_cooldown.token, {}));
   }
 }  // namespace
 
@@ -1065,5 +1084,113 @@ namespace {
     EXPECT_TRUE(joiner.env.find("SUNSHINE_CLIENT_DISPLAY_NAME") == joiner.env.end());
     EXPECT_FALSE(joiner.video_admission);
     EXPECT_FALSE(fake.joiners_admitted[0].mode) << "no launch mode, no mode";
+  }
+}  // namespace
+
+// Managed failure cooldown (provisional pending G1 hardware).
+namespace {
+  using launch_cooldown_t = nvhttp::stream_start::launch_cooldown_t;
+
+  TEST(LaunchCooldown, AFailureRefusesItsKeyForTheWindowOnly) {
+    std::chrono::steady_clock::time_point now {};
+    launch_cooldown_t cooldown { [&now] { return now; } };
+    EXPECT_FALSE(cooldown.refuse("virtual_head"));
+    cooldown.fail("virtual_head", "refused: head create failed");
+    EXPECT_EQ(cooldown.refuse("virtual_head"), 5000ms);
+    EXPECT_FALSE(cooldown.refuse("physical:\\\\.\\DISPLAY1")) << "keys cool down independently";
+    now += 4999ms;
+    EXPECT_EQ(cooldown.refuse("virtual_head"), 1ms);
+    now += 1ms;
+    EXPECT_FALSE(cooldown.refuse("virtual_head")) << "the window is fixed at 5 s";
+    EXPECT_FALSE(cooldown.refuse("virtual_head"));
+  }
+
+  TEST(LaunchCooldown, ASuccessClearsTheKey) {
+    std::chrono::steady_clock::time_point now {};
+    launch_cooldown_t cooldown { [&now] { return now; } };
+    cooldown.fail("virtual_head", "conflict");
+    cooldown.fail("other", "conflict");
+    cooldown.succeed("virtual_head");
+    EXPECT_FALSE(cooldown.refuse("virtual_head"));
+    EXPECT_TRUE(cooldown.refuse("other"));
+  }
+
+  TEST(LaunchCooldown, AnotherFailureRestartsTheWindow) {
+    std::chrono::steady_clock::time_point now {};
+    launch_cooldown_t cooldown { [&now] { return now; } };
+    cooldown.fail("virtual_head", "first");
+    now += 3s;
+    cooldown.fail("virtual_head", "second");
+    EXPECT_EQ(cooldown.refuse("virtual_head"), 5000ms);
+  }
+
+  class ManagedLaunchCooldown: public ManagedStreamStart {
+  protected:
+    bool
+    attempt() {
+      tree.clear();
+      launch->video_admission.reset();
+      auto coordination = managed_route();
+      const auto result = nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination);
+      if (result) EXPECT_TRUE(coordinator->bind_launch(coordination.token));
+      else settle();
+      return result;
+    }
+
+    std::string
+    code() const {
+      return tree.get<std::string>("root.sunshine_error_code", "<none>");
+    }
+  };
+
+  TEST_F(ManagedLaunchCooldown, AFailedPreparationRefusesTheNextLaunchWithoutTouchingTheDriver) {
+    managed();
+    prepared = { std::nullopt, "refused: the virtual display head could not be created" };
+    EXPECT_FALSE(attempt());
+    EXPECT_EQ(code(), "MANAGED_DISPLAY_UNAVAILABLE");
+    EXPECT_EQ(prepares, 1);
+
+    now += 2500ms;
+    prepared = { topology::managed_target_t { "{zako-head}", true }, {} };
+    const auto restores_before = restores->load();
+    EXPECT_FALSE(attempt());
+    EXPECT_EQ(restores->load(), restores_before) << "nothing was prepared, so nothing is restored";
+    EXPECT_EQ(prepares, 1) << "a cooling target is refused before the driver is touched";
+    EXPECT_EQ(tree.get<int>("root.<xmlattr>.status_code"), 503);
+    EXPECT_EQ(code(), "MANAGED_DISPLAY_COOLDOWN");
+    EXPECT_EQ(tree.get<std::string>("root.sunshine_recovery_action"), "retry_launch");
+    EXPECT_NE(tree.get<std::string>("root.<xmlattr>.status_message").find("retry after 3 s"), std::string::npos)
+      << tree.get<std::string>("root.<xmlattr>.status_message");
+    EXPECT_FALSE(launch->display_exact);
+    EXPECT_FALSE(launch->video_admission);
+    EXPECT_TRUE(fake.probed.empty());
+
+    now += 2500ms;
+    fake.probes = { probed(probe_error_e::none) };
+    EXPECT_TRUE(attempt()) << "the window has passed";
+    EXPECT_EQ(prepares, 2);
+    EXPECT_EQ(client_display(), "{zako-head}");
+  }
+
+  TEST_F(ManagedLaunchCooldown, AnExactTargetEncoderFailureCoolsTheTargetDown) {
+    managed();
+    fake.probes = { probed(probe_error_e::no_working_encoder) };
+    EXPECT_FALSE(attempt());
+    EXPECT_EQ(prepares, 1);
+    EXPECT_FALSE(attempt());
+    EXPECT_EQ(code(), "MANAGED_DISPLAY_COOLDOWN");
+    EXPECT_EQ(prepares, 1);
+  }
+
+  TEST_F(ManagedLaunchCooldown, ABudgetRefusalDoesNotCoolTheTargetDown) {
+    managed();
+    fake.budget_refusal = true;
+    fake.probes = { probed(probe_error_e::no_working_encoder) };
+    EXPECT_FALSE(attempt());
+    EXPECT_NE(code(), "MANAGED_DISPLAY_COOLDOWN");
+    fake.budget_refusal = false;
+    fake.probes = { probed(probe_error_e::none) };
+    EXPECT_TRUE(attempt()) << "a budget refusal is capacity, not a hardware failure";
+    EXPECT_EQ(prepares, 2);
   }
 }  // namespace

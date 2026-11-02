@@ -207,6 +207,11 @@ namespace display_device::coordinated {
     return lifecycle().prepare_native(capability);
   }
 
+  const std::string &
+  latched_profile() {
+    return latched().setting;
+  }
+
   topology::topology_status_report_t
   status_report(std::string_view desired_setting) {
     const auto status = coordinator().status();

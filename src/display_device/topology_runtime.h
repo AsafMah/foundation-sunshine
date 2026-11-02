@@ -22,6 +22,8 @@ namespace display_device::coordinated {
   void shutdown_vdd_destroy();
   /** Managed launches only: prepare the latched native profile on the topology worker. */
   topology::native_prepared_t prepare_native(const topology::mutation_capability_t &capability);
+  /** The `display_topology_profile` this process latched; blank in legacy mode. */
+  const std::string &latched_profile();
   /** Read-only admin report of the saved `display_topology_profile` against the one this process latched. */
   topology::topology_status_report_t status_report(std::string_view desired_setting);
 

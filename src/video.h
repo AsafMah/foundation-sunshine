@@ -674,6 +674,8 @@ namespace video {
     std::uint64_t encoder_generation {};
     /** Live probes only: the admission to commit before the source is attached. */
     admission::pending_t admission {};
+    /** The admission budget refused this, not the encoder or the display: no failure cooldown. */
+    bool budget_refusal {};
   };
 
   /**

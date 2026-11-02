@@ -5242,6 +5242,13 @@ namespace video {
       return outcome;
     }
 
+    probe_outcome_t
+    budget_refused(std::string message, std::string hint, std::uint64_t generation) {
+      auto outcome = refused(probe_error_e::no_working_encoder, std::move(message), std::move(hint), generation);
+      outcome.budget_refusal = true;
+      return outcome;
+    }
+
     // Accounts an exact display against the encoder selection in snapshot: a
     // hardware encoder must have been validated on the display's adapter, and an
     // enforced budget must have room for the mode. Unknown on either side fails closed.
@@ -5266,19 +5273,19 @@ namespace video {
       outcome.encoder_generation = snapshot.generation;
       if (const auto budget = current_admission_budget(); budget && budget->enforced()) {
         if (!target.mode) {
-          return refused(probe_error_e::no_working_encoder, "The live admission budget needs the requested mode.", {}, snapshot.generation);
+          return budget_refused("The live admission budget needs the requested mode.", {}, snapshot.generation);
         }
         if (!admission_adapter) {
           // Software encodes in system memory, but capture still runs on the display's adapter.
           admission_adapter = capture_platform_display_adapter(display_name);
         }
         if (!admission_adapter || *admission_adapter == 0) {
-          return refused(probe_error_e::no_working_encoder, "The live admission budget cannot account a display on an unknown adapter.", {}, snapshot.generation);
+          return budget_refused("The live admission budget cannot account a display on an unknown adapter.", {}, snapshot.generation);
         }
         auto pending = budget->reserve({ *admission_adapter, target.mode->width, target.mode->height, target.mode->fps }, budget->max_pending());
         if (!pending) {
           BOOST_LOG(warning) << "Admission of output ["sv << display_name << "] refused by the admission budget: "sv << pending.error().detail;
-          return refused(probe_error_e::no_working_encoder, "The live admission budget refused the requested display: " + pending.error().detail,
+          return budget_refused("The live admission budget refused the requested display: " + pending.error().detail,
             "End another stream, then try again.", snapshot.generation);
         }
         outcome.admission = std::move(*pending);
