@@ -238,3 +238,95 @@ TEST(VideoCaptureSources, ExactSessionRefusesAMissingSource) {
   }
   EXPECT_EQ(platform.opened("FAKE_A"), 0);
 }
+
+TEST(VideoLiveAdmission, GlobalProbeNeverRunsOnAFakePlatform) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 } } };
+  const auto encoder = video::testing::chosen_encoder_name();
+
+  EXPECT_NE(video::probe_encoders(video::probe_target_t { "FAKE_A", video::probe_target_policy_e::exact }), 0);
+  EXPECT_NE(video::probe_encoders(), 0);
+  EXPECT_EQ(video::testing::chosen_encoder_name(), encoder);
+  EXPECT_EQ(platform.opened("FAKE_A"), 0);
+}
+
+TEST(VideoLiveAdmission, ExactTargetBesideALiveStreamKeepsTheEncoder) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  expect_only(*live, 1);
+  const auto encoder = video::testing::chosen_encoder_name();
+  ASSERT_FALSE(encoder.empty());
+
+  EXPECT_EQ(video::probe_encoders(video::probe_target_t { "FAKE_B", video::probe_target_policy_e::exact }), 0)
+    << video::last_encoder_probe_result.message;
+  EXPECT_TRUE(video::last_encoder_probe_result);
+  EXPECT_EQ(video::testing::chosen_encoder_name(), encoder);
+  expect_only(*live, 1);
+  EXPECT_EQ(platform.opened("FAKE_A"), 1);
+  EXPECT_EQ(platform.opened("FAKE_B"), 0);
+}
+
+TEST(VideoLiveAdmission, ExactTargetBesideALegacyStreamKeepsTheEncoder) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } } };
+  video::config_t legacy {};
+  legacy.display_name = "FAKE_A";
+  auto live = video::testing::attach_capture(legacy);
+  ASSERT_TRUE(live);
+  expect_only(*live, 1);
+  const auto encoder = video::testing::chosen_encoder_name();
+
+  EXPECT_EQ(video::probe_encoders(video::probe_target_t { "FAKE_B", video::probe_target_policy_e::exact }), 0)
+    << video::last_encoder_probe_result.message;
+  EXPECT_EQ(video::testing::chosen_encoder_name(), encoder);
+}
+
+TEST(VideoLiveAdmission, LiveAdmissionRefusesAnUnavailableTarget) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  expect_only(*live, 1);
+  const auto encoder = video::testing::chosen_encoder_name();
+
+  EXPECT_NE(video::probe_encoders(video::probe_target_t { "FAKE_GONE", video::probe_target_policy_e::exact }), 0);
+  EXPECT_EQ(video::last_encoder_probe_result.error, video::probe_error_e::no_active_display);
+  EXPECT_EQ(video::testing::chosen_encoder_name(), encoder);
+  expect_only(*live, 1);
+}
+
+TEST(VideoLiveAdmission, NonExactTargetsNeverTakeTheLiveAdmission) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  expect_only(*live, 1);
+
+  // Falls through to the global probe, which the fake platform refuses.
+  EXPECT_NE(video::probe_encoders(video::probe_target_t { "FAKE_B", video::probe_target_policy_e::vdd_compatible }), 0);
+  EXPECT_NE(video::probe_encoders(), 0);
+}
+
+TEST(VideoLiveAdmission, HardwareEncoderRefusesWithoutReprobing) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  expect_only(*live, 1);
+  video::testing::scoped_hardware_encoder_t hardware;
+  const auto encoder = video::testing::chosen_encoder_name();
+  ASSERT_NE(encoder, "software");
+
+  EXPECT_NE(video::probe_encoders(video::probe_target_t { "FAKE_B", video::probe_target_policy_e::exact }), 0);
+  EXPECT_EQ(video::last_encoder_probe_result.error, video::probe_error_e::no_working_encoder);
+  EXPECT_NE(video::last_encoder_probe_result.message.find("live hardware-encoded"), std::string::npos)
+    << video::last_encoder_probe_result.message;
+  EXPECT_EQ(video::testing::chosen_encoder_name(), encoder);
+  EXPECT_EQ(platform.opened("FAKE_B"), 0);
+}
+
+TEST(VideoLiveAdmission, NamesOnlyPlatformStillBlocksTheGlobalProbe) {
+  video::testing::set_capture_platform({}, [](platf::mem_type_e) { return std::vector<std::string> { "FAKE_A" }; });
+  const auto result = video::probe_encoders();
+  const auto message = video::last_encoder_probe_result.message;
+  video::testing::set_capture_platform({}, {});
+
+  EXPECT_NE(result, 0);
+  EXPECT_NE(message.find("test capture platform"), std::string::npos) << message;
+}

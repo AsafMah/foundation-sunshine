@@ -699,5 +699,21 @@ namespace video {
     /** Null when the capture source refuses the session. */
     std::unique_ptr<capture_attachment_t>
     attach_capture(const config_t &config);
+
+    /** The process-global encoder streams start with; empty when none. */
+    std::string
+    chosen_encoder_name();
+
+    /** Makes the first non-software encoder the chosen one for its lifetime. */
+    class scoped_hardware_encoder_t {
+    public:
+      scoped_hardware_encoder_t();
+      ~scoped_hardware_encoder_t();
+      scoped_hardware_encoder_t(const scoped_hardware_encoder_t &) = delete;
+      scoped_hardware_encoder_t &operator=(const scoped_hardware_encoder_t &) = delete;
+
+    private:
+      void *_previous;
+    };
   }  // namespace testing
 }  // namespace video

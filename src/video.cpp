@@ -1209,6 +1209,12 @@ namespace video {
       return source->ref();
     }
 
+    bool
+    any_live() {
+      std::lock_guard lg { _lock };
+      return std::ranges::any_of(_sources, [](auto &entry) { return entry.second->has_ref(); });
+    }
+
   private:
     std::mutex _lock;
     std::map<std::string, std::unique_ptr<safe::shared_t<capture_thread_async_ctx_t>>> _sources;
@@ -5123,6 +5129,59 @@ namespace video {
       {}
     };
 
+    // An exact managed target beside a live stream must not reselect the shared
+    // encoder or its capability flags under that stream. Admit it against the
+    // encoder already validated, after checking the target is capturable.
+    const bool live_capture = capture_thread_async.has_ref() || capture_thread_sync.has_ref() || exact_capture_sources.any_live();
+    if (target && target->policy == probe_target_policy_e::exact && live_capture) {
+      const auto *encoder = chosen_encoder;
+      if (!encoder) {
+        last_encoder_probe_result = {
+          probe_error_e::no_working_encoder,
+          "No validated encoder is available to admit another display while streaming.",
+          {}
+        };
+        return -1;
+      }
+      if (encoder != &software) {
+        // A hardware encoder is bound to one adapter; capture visibility alone
+        // does not prove it can consume this display. Refuse rather than reprobe.
+        last_encoder_probe_result = {
+          probe_error_e::no_working_encoder,
+          "Another display cannot be admitted beside a live hardware-encoded stream yet.",
+          "End the current stream, then try again."
+        };
+        BOOST_LOG(error) << "Live admission of output ["sv << target->output_name << "] refused for hardware encoder ["sv << encoder->name << "]"sv;
+        return -1;
+      }
+      const auto display_name = resolve_capture_display(target->output_name, display_device::get_display_name(target->output_name));
+      const auto available = capture_platform_display_names(encoder->platform_formats->dev_type);
+      if (display_name.empty() || std::ranges::find(available, display_name) == available.end()) {
+        last_encoder_probe_result = {
+          probe_error_e::no_active_display,
+          "The requested display is not available to capture while streaming.",
+          "Connect or enable the selected display, then try again."
+        };
+        BOOST_LOG(error) << "Requested output ["sv << target->output_name << "] is unavailable for live admission"sv;
+        return -1;
+      }
+      BOOST_LOG(info) << "Admitted exact output ["sv << display_name << "] beside a live stream with encoder ["sv << encoder->name << "]"sv;
+      return 0;
+    }
+
+    {
+      std::lock_guard lg { capture_platform_lock };
+      if (capture_display_override || capture_display_names_override) {
+        // Hermetic tests: the global probe validates real encoders on real displays.
+        last_encoder_probe_result = {
+          probe_error_e::no_working_encoder,
+          "The global encoder probe is disabled while a test capture platform is installed.",
+          {}
+        };
+        return -1;
+      }
+    }
+
     if (!allow_encoder_probing()) {
       active_encoder_for_status.store(nullptr, std::memory_order_release);
       // Error already logged
@@ -5561,6 +5620,25 @@ namespace video {
   end_capture_sync(capture_thread_sync_ctx_t &ctx) {}
 
   namespace testing {
+    std::string
+    chosen_encoder_name() {
+      return chosen_encoder ? std::string { chosen_encoder->name } : std::string {};
+    }
+
+    scoped_hardware_encoder_t::scoped_hardware_encoder_t():
+        _previous { chosen_encoder } {
+      for (auto *encoder : encoders) {
+        if (encoder != &software) {
+          chosen_encoder = encoder;
+          break;
+        }
+      }
+    }
+
+    scoped_hardware_encoder_t::~scoped_hardware_encoder_t() {
+      chosen_encoder = static_cast<encoder_t *>(_previous);
+    }
+
     void
     set_capture_platform(capture_display_factory_t display, capture_display_names_t names) {
       {
