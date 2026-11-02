@@ -2032,6 +2032,7 @@ namespace rtsp_stream {
 
       // Set display_name from session environment or use global configuration
       monitor.display_exact = session.display_exact;
+      monitor.admission = session.video_admission;
       if (auto it = session.env.find("SUNSHINE_CLIENT_DISPLAY_NAME"); it != session.env.end()) {
         monitor.display_name = it->to_string();
         BOOST_LOG(info) << "Session using specified display: " << monitor.display_name;

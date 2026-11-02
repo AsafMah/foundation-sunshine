@@ -1790,6 +1790,7 @@ namespace video {
     testing::capture_display_factory_t capture_display_override;
     testing::capture_display_names_t capture_display_names_override;
     testing::capture_display_adapter_t capture_display_adapter_override;
+    std::function<int()> global_probe_override;
 
     // The adapter each encoder last passed validation on; 0 when unknown.
     // Also guards writes of chosen_encoder and its generation, so a live probe
@@ -1839,6 +1840,35 @@ namespace video {
     current_admission_budget() {
       std::lock_guard lg { admission_budget_lock };
       return admission_budget;
+    }
+
+    // Commits a session's admission before its capture source is acquired. The
+    // ticket is fenced on the encoder selection it was granted against. An
+    // exact session without a ticket is refused while the budget is enforced;
+    // otherwise sessions without one attach as before, unaccounted.
+    std::optional<admission::lease_t>
+    admit_capture(const config_t &config) {
+      if (const auto ticket = config.admission) {
+        std::lock_guard lg { ticket->lock };
+        if (const auto generation = chosen_encoder_snapshot().generation; generation != ticket->encoder_generation) {
+          BOOST_LOG(error) << "Capture of output ["sv << config.display_name << "] refused: its admission was granted on encoder generation "sv
+                           << ticket->encoder_generation << ", now "sv << generation;
+          return std::nullopt;
+        }
+        auto lease = ticket->pending.commit();
+        if (!lease) {
+          BOOST_LOG(error) << "Capture of output ["sv << config.display_name << "] refused: "sv << lease.error().detail;
+          return std::nullopt;
+        }
+        return std::move(*lease);
+      }
+      if (config.display_exact) {
+        if (const auto budget = current_admission_budget(); budget && budget->enforced()) {
+          BOOST_LOG(error) << "Capture of exact output ["sv << config.display_name << "] refused: no admission"sv;
+          return std::nullopt;
+        }
+      }
+      return admission::lease_t {};
     }
 
     std::optional<std::uint64_t>
@@ -4822,6 +4852,13 @@ namespace video {
     void *channel_data,
     std::optional<safe::mail_raw_t::event_t<dynamic_param_t>> dynamic_param_events,
     int packet_size) {
+    // Held for the session: capture_async and the sync join both return only
+    // after the session's capture ref is dropped.
+    auto admitted = admit_capture(config);
+    if (!admitted) {
+      mail->event<bool>(mail::shutdown)->raise(true);
+      return;
+    }
 #ifdef _WIN32
     if (config.videoFormat == static_cast<int>(LI_PYROWAVE_VIDEO_FORMAT)) {
       // PyroWave uses the same shared capture coordinator and encoder-loop
@@ -5205,30 +5242,19 @@ namespace video {
       return outcome;
     }
 
-    // An exact managed target beside a live stream must not reselect the shared
-    // encoder or its capability flags under that stream. Admit it against the
-    // encoder already validated, after checking the target is capturable.
+    // Accounts an exact display against the encoder selection in snapshot: a
+    // hardware encoder must have been validated on the display's adapter, and an
+    // enforced budget must have room for the mode. Unknown on either side fails closed.
     probe_outcome_t
-    probe_live(const probe_target_t &target) {
-      const auto snapshot = chosen_encoder_snapshot();
+    admit_exact(const encoder_snapshot_t &snapshot, const std::string &display_name, const probe_target_t &target) {
       const auto *encoder = snapshot.encoder;
-      if (!encoder) {
-        return refused(probe_error_e::no_working_encoder, "No validated encoder is available to admit another display while streaming.", {}, snapshot.generation);
-      }
-      const auto display_name = resolve_capture_display(target.output_name, display_device::get_display_name(target.output_name));
-      const auto available = capture_platform_display_names(encoder->platform_formats->dev_type);
-      if (display_name.empty() || std::ranges::find(available, display_name) == available.end()) {
-        BOOST_LOG(error) << "Requested output ["sv << target.output_name << "] is unavailable for live admission"sv;
-        return refused(probe_error_e::no_active_display, "The requested display is not available to capture while streaming.",
-          "Connect or enable the selected display, then try again.", snapshot.generation);
-      }
       std::optional<std::uint64_t> admission_adapter;
       if (encoder != &software) {
         // A hardware encoder runs on the capture display's device; it is only
-        // proven on the adapter it was validated on. Unknown on either side fails closed.
+        // proven on the adapter it was validated on.
         const auto display_adapter = capture_platform_display_adapter(display_name);
         if (snapshot.validated_adapter == 0 || !display_adapter || *display_adapter != snapshot.validated_adapter) {
-          BOOST_LOG(error) << "Live admission of output ["sv << display_name << "] refused for hardware encoder ["sv << encoder->name
+          BOOST_LOG(error) << "Admission of output ["sv << display_name << "] refused for hardware encoder ["sv << encoder->name
                            << "]: adapter agreement not established"sv;
           return refused(probe_error_e::no_working_encoder, "The requested display is not on the adapter the live hardware encoder was validated on.",
             "End the current stream, then try again.", snapshot.generation);
@@ -5251,7 +5277,7 @@ namespace video {
         }
         auto pending = budget->reserve({ *admission_adapter, target.mode->width, target.mode->height, target.mode->fps }, budget->max_pending());
         if (!pending) {
-          BOOST_LOG(warning) << "Live admission of output ["sv << display_name << "] refused by the admission budget: "sv << pending.error().detail;
+          BOOST_LOG(warning) << "Admission of output ["sv << display_name << "] refused by the admission budget: "sv << pending.error().detail;
           return refused(probe_error_e::no_working_encoder, "The live admission budget refused the requested display: " + pending.error().detail,
             "End another stream, then try again.", snapshot.generation);
         }
@@ -5260,10 +5286,58 @@ namespace video {
       else {
         outcome.admission = admission::pending_t::unaccounted();
       }
-      BOOST_LOG(info) << "Admitted exact output ["sv << display_name << "] beside a live stream with encoder ["sv << encoder->name << "]"sv;
       outcome.status = 0;
       outcome.result = { probe_error_e::none, "Encoder probe succeeded.", {} };
       return outcome;
+    }
+
+    // An exact managed target beside a live stream must not reselect the shared
+    // encoder or its capability flags under that stream. Admit it against the
+    // encoder already validated, after checking the target is capturable.
+    probe_outcome_t
+    probe_live(const probe_target_t &target) {
+      const auto snapshot = chosen_encoder_snapshot();
+      const auto *encoder = snapshot.encoder;
+      if (!encoder) {
+        return refused(probe_error_e::no_working_encoder, "No validated encoder is available to admit another display while streaming.", {}, snapshot.generation);
+      }
+      const auto display_name = resolve_capture_display(target.output_name, display_device::get_display_name(target.output_name));
+      const auto available = capture_platform_display_names(encoder->platform_formats->dev_type);
+      if (display_name.empty() || std::ranges::find(available, display_name) == available.end()) {
+        BOOST_LOG(error) << "Requested output ["sv << target.output_name << "] is unavailable for live admission"sv;
+        return refused(probe_error_e::no_active_display, "The requested display is not available to capture while streaming.",
+          "Connect or enable the selected display, then try again.", snapshot.generation);
+      }
+      auto outcome = admit_exact(snapshot, display_name, target);
+      if (outcome.status == 0) {
+        BOOST_LOG(info) << "Admitted exact output ["sv << display_name << "] beside a live stream with encoder ["sv << encoder->name << "]"sv;
+      }
+      return outcome;
+    }
+
+    // The first exact stream: the global probe validated the chosen encoder on
+    // the target itself; account it like a live admission.
+    void
+    admit_global(probe_outcome_t &outcome, const probe_target_t &target) {
+      const auto snapshot = chosen_encoder_snapshot();
+      if (!snapshot.encoder) {
+        outcome = refused(probe_error_e::no_working_encoder, "No validated encoder is available to admit the display.", {}, snapshot.generation);
+        return;
+      }
+      const auto budget = current_admission_budget();
+      if (!budget || !budget->enforced()) {
+        outcome.admission = admission::pending_t::unaccounted();
+        outcome.encoder_generation = snapshot.generation;
+        return;
+      }
+      const auto display_name = resolve_capture_display(target.output_name, display_device::get_display_name(target.output_name));
+      auto admitted = admit_exact(snapshot, display_name, target);
+      if (admitted.status != 0) {
+        outcome = std::move(admitted);
+        return;
+      }
+      outcome.admission = std::move(admitted.admission);
+      outcome.encoder_generation = snapshot.generation;
     }
 
     int
@@ -5279,9 +5353,15 @@ namespace video {
     // The global probe still publishes through last_encoder_probe_result; it
     // only runs while nothing streams, so no live outcome can interleave.
     probe_outcome_t outcome;
-    outcome.status = probe_encoders_global(std::move(target));
+    outcome.status = probe_encoders_global(target);
     outcome.result = last_encoder_probe_result;
     outcome.encoder_generation = chosen_encoder_snapshot().generation;
+    if (outcome.status == 0 && target && target->policy == probe_target_policy_e::exact) {
+      admit_global(outcome, *target);
+      if (outcome.status != 0) {
+        last_encoder_probe_result = outcome.result;
+      }
+    }
     return outcome;
   }
 
@@ -5301,6 +5381,23 @@ namespace video {
       {}
     };
 
+    std::function<int()> global_probe;
+    {
+      std::lock_guard lg { capture_platform_lock };
+      global_probe = global_probe_override;
+    }
+    if (global_probe) {
+      // Reselects like the real probe: the generation moves even when the
+      // same encoder is chosen again.
+      auto previous_encoder = chosen_encoder;
+      set_chosen_encoder(nullptr);
+      const auto status = global_probe();
+      set_chosen_encoder(previous_encoder);
+      if (status != 0) {
+        last_encoder_probe_result = { probe_error_e::no_working_encoder, "The test global probe failed.", {} };
+      }
+      return status;
+    }
     {
       std::lock_guard lg { capture_platform_lock };
       if (capture_display_override || capture_display_names_override) {
@@ -5802,6 +5899,12 @@ namespace video {
     }
 
     void
+    set_global_probe(std::function<int()> probe) {
+      std::lock_guard lg { capture_platform_lock };
+      global_probe_override = std::move(probe);
+    }
+
+    void
     set_capture_platform(capture_display_factory_t display, capture_display_names_t names, capture_display_adapter_t adapter) {
       {
         std::lock_guard lg { capture_platform_lock };
@@ -5825,8 +5928,8 @@ namespace video {
     namespace {
       class attachment_t: public capture_attachment_t {
       public:
-        attachment_t(capture_source_ref_t ref, captured_frame_event_t images):
-            _ref { std::move(ref) }, _images { std::move(images) } {}
+        attachment_t(admission::lease_t lease, capture_source_ref_t ref, captured_frame_event_t images):
+            _lease { std::move(lease) }, _ref { std::move(ref) }, _images { std::move(images) } {}
 
         ~attachment_t() override {
           _images->stop();
@@ -5839,6 +5942,8 @@ namespace video {
         }
 
       private:
+        // Declared first: released only after the capture ref is dropped.
+        admission::lease_t _lease;
         capture_source_ref_t _ref;
         captured_frame_event_t _images;
       };
@@ -5846,13 +5951,17 @@ namespace video {
 
     std::unique_ptr<capture_attachment_t>
     attach_capture(const config_t &config) {
+      auto lease = admit_capture(config);
+      if (!lease) {
+        return nullptr;
+      }
       auto ref = acquire_capture_source(config);
       if (!ref) {
         return nullptr;
       }
       auto images = std::make_shared<captured_frame_event_t::element_type>();
       ref->capture_ctx_queue->raise(capture_ctx_t { images, config });
-      return std::make_unique<attachment_t>(std::move(ref), std::move(images));
+      return std::make_unique<attachment_t>(std::move(*lease), std::move(ref), std::move(images));
     }
   }  // namespace testing
 

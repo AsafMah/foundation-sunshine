@@ -180,6 +180,25 @@ namespace nvhttp::stream_start {
         return output->value();
       }
 
+      // As probe, keeping this call's admission for the launch to carry.
+      video::probe_outcome_t
+      probe_admitted(video::probe_target_t target) {
+        auto output = std::make_shared<std::optional<video::probe_outcome_t>>();
+        auto *coordinator = &coordination_->coordinator;
+        const auto token = coordination_->token;
+        auto work = [coordinator, token, output, target = std::move(target)]() mutable {
+          if (!coordinator->launch_setup_deadline(token)) {
+            throw preparation_error_t { { topology::outcome_e::rejected, topology::reject_reason_e::stale_transaction } };
+          }
+          auto outcome = video::probe_encoders_with_outcome(target);
+          video::last_encoder_probe_result = outcome.result;
+          *output = std::move(outcome);
+        };
+        topology::run_supervised_probe(deadline(), fence_, std::move(work),
+          coordination_->fatal_probe_timeout, coordination_->spawn_probe);
+        return std::move(output->value());
+      }
+
       void
       wait(std::chrono::milliseconds delay) const {
         const auto until = std::min(std::chrono::steady_clock::now() + delay, deadline());
@@ -874,7 +893,13 @@ namespace nvhttp::stream_start {
 #ifdef _WIN32
     start_touch_keyboard(launch_session);
 #endif
-    if (preparation.probe({ prepared.display->display, video::probe_target_policy_e::exact }) != 0) {
+    video::probe_target_t target { prepared.display->display, video::probe_target_policy_e::exact };
+    if (launch_session.width > 0 && launch_session.height > 0 && launch_session.fps > 0) {
+      target.mode = video::probe_mode_t { static_cast<std::uint32_t>(launch_session.width), static_cast<std::uint32_t>(launch_session.height),
+        static_cast<std::uint32_t>(launch_session.fps) };
+    }
+    auto outcome = preparation.probe_admitted(std::move(target));
+    if (outcome.status != 0) {
       set_video_probe_error(tree);
       return false;
     }
@@ -883,6 +908,10 @@ namespace nvhttp::stream_start {
       throw preparation_error_t { { topology::outcome_e::rejected, topology::reject_reason_e::stale_transaction } };
     }
     adopt_managed_display(launch_session, *prepared.display);
+    auto ticket = std::make_shared<video::admission_ticket_t>();
+    ticket->pending = std::move(outcome.admission);
+    ticket->encoder_generation = outcome.encoder_generation;
+    launch_session.video_admission = std::move(ticket);
     return true;
   }
 

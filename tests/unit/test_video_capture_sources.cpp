@@ -21,8 +21,14 @@ namespace {
   // Each fake source stamps its id into every image's width.
   class fake_display_t: public platf::display_t {
   public:
-    explicit fake_display_t(int id):
-        _id { id } {}
+    explicit fake_display_t(int id, std::function<void()> on_close = {}):
+        _id { id }, _on_close { std::move(on_close) } {}
+
+    ~fake_display_t() override {
+      if (_on_close) {
+        _on_close();
+      }
+    }
 
     platf::capture_e
     capture(const push_captured_image_cb_t &push, const pull_free_image_cb_t &pull, bool *) override {
@@ -51,6 +57,7 @@ namespace {
 
   private:
     int _id;
+    std::function<void()> _on_close;
   };
 
   class fake_capture_platform_t {
@@ -69,7 +76,7 @@ namespace {
           if (it == _sources.end()) {
             return nullptr;
           }
-          return std::make_shared<fake_display_t>(it->second);
+          return std::make_shared<fake_display_t>(it->second, [this] { closed(); });
         },
         [this](platf::mem_type_e) {
           std::vector<std::string> names;
@@ -97,7 +104,27 @@ namespace {
       return _opened[name];
     }
 
+    // Runs as each source's display is destroyed, on its capture thread.
+    void
+    on_close(std::function<void()> callback) {
+      std::lock_guard lg { _lock };
+      _on_close = std::move(callback);
+    }
+
   private:
+    void
+    closed() {
+      std::function<void()> callback;
+      {
+        std::lock_guard lg { _lock };
+        callback = _on_close;
+      }
+      if (callback) {
+        callback();
+      }
+    }
+
+    std::function<void()> _on_close;
     std::map<std::string, int> _sources;
     std::map<std::string, std::uint64_t> _adapters;
     std::mutex _lock;
@@ -568,4 +595,257 @@ TEST(VideoLiveAdmission, TheOutcomeCarriesTheEncoderGeneration) {
     EXPECT_NE(hardware_generation, software.encoder_generation);
   }
   EXPECT_NE(video::testing::encoder_generation(), hardware_generation);
+}
+
+namespace {
+  class scoped_global_probe_t {
+  public:
+    explicit scoped_global_probe_t(int status) {
+      video::testing::set_global_probe([status] { return status; });
+    }
+    ~scoped_global_probe_t() {
+      video::testing::set_global_probe({});
+    }
+  };
+
+  std::shared_ptr<video::admission_ticket_t>
+  ticket_from(video::probe_outcome_t &outcome) {
+    auto ticket = std::make_shared<video::admission_ticket_t>();
+    ticket->pending = std::move(outcome.admission);
+    ticket->encoder_generation = outcome.encoder_generation;
+    return ticket;
+  }
+
+  video::config_t
+  ticketed_config(const std::string &display, std::shared_ptr<video::admission_ticket_t> ticket) {
+    auto config = exact_config(display);
+    config.admission = std::move(ticket);
+    return config;
+  }
+}  // namespace
+
+TEST(VideoAdmissionTicket, CommitsBeforeAttachAndReleasesWithTheCapture) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 2, ample_rate } } } };
+
+  auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_B"));
+  ASSERT_EQ(outcome.status, 0) << outcome.result.message;
+  const auto ticket = ticket_from(outcome);
+  auto attached = video::testing::attach_capture(ticketed_config("FAKE_B", ticket));
+  ASSERT_TRUE(attached);
+  expect_only(*attached, 2);
+  EXPECT_EQ(budget.sessions(0x10), 1u);
+  EXPECT_FALSE(ticket->pending.commit()) << "the attach committed the ticket";
+  attached.reset();
+  EXPECT_EQ(budget.sessions(0x10), 0u) << "the lease ends with the capture ref";
+}
+
+TEST(VideoAdmissionTicket, AStaleGenerationIsRefusedBeforeTheSourceIsAcquired) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 2, ample_rate } } } };
+
+  auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_B"));
+  ASSERT_EQ(outcome.status, 0) << outcome.result.message;
+  auto ticket = ticket_from(outcome);
+  {
+    video::testing::scoped_hardware_encoder_t reselected { 0x10 };
+    EXPECT_FALSE(video::testing::attach_capture(ticketed_config("FAKE_B", ticket)));
+  }
+  EXPECT_FALSE(video::testing::attach_capture(ticketed_config("FAKE_B", ticket))) << "a reselection in between is never undone";
+  EXPECT_EQ(platform.opened("FAKE_B"), 0);
+  EXPECT_EQ(budget.sessions(0x10), 1u) << "still pending";
+  ticket.reset();
+  EXPECT_EQ(budget.sessions(0x10), 0u);
+}
+
+TEST(VideoAdmissionTicket, ATicketAdmitsOneCapture) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 4, ample_rate } } } };
+
+  auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_B"));
+  ASSERT_EQ(outcome.status, 0) << outcome.result.message;
+  const auto config = ticketed_config("FAKE_B", ticket_from(outcome));
+  auto first = video::testing::attach_capture(config);
+  ASSERT_TRUE(first);
+  EXPECT_FALSE(video::testing::attach_capture(config));
+  EXPECT_EQ(budget.sessions(0x10), 1u);
+}
+
+TEST(VideoAdmissionTicket, AnEmptyTicketIsRefused) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 } } };
+  auto ticket = std::make_shared<video::admission_ticket_t>();
+  ticket->encoder_generation = video::testing::encoder_generation();
+  EXPECT_FALSE(video::testing::attach_capture(ticketed_config("FAKE_A", ticket)));
+  EXPECT_EQ(platform.opened("FAKE_A"), 0);
+}
+
+TEST(VideoAdmissionTicket, AnExactCaptureWithoutATicketIsRefusedUnderABudget) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 } } };
+  scoped_budget_t budget { { { 0x10, { 4, ample_rate } } } };
+  EXPECT_FALSE(video::testing::attach_capture(exact_config("FAKE_A")));
+  EXPECT_EQ(platform.opened("FAKE_A"), 0);
+
+  // Legacy sessions are not accounted, with or without a budget.
+  video::config_t legacy {};
+  legacy.display_name = "FAKE_B";
+  auto attached = video::testing::attach_capture(legacy);
+  ASSERT_TRUE(attached);
+  expect_only(*attached, 2);
+  EXPECT_EQ(budget.sessions(0x10), 0u);
+}
+
+TEST(VideoAdmissionTicket, WithoutABudgetUnticketedCapturesAttachAsBefore) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 } } };
+  auto attached = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(attached);
+  expect_only(*attached, 1);
+}
+
+TEST(VideoAdmissionTicket, AnUnattachedTicketReturnsItsReservation) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 2, ample_rate } } } };
+  {
+    auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_B"));
+    ASSERT_EQ(outcome.status, 0) << outcome.result.message;
+    const auto ticket = ticket_from(outcome);
+    EXPECT_EQ(budget.sessions(0x10), 1u);
+  }
+  EXPECT_EQ(budget.sessions(0x10), 0u);
+}
+
+TEST(VideoAdmissionTicket, TheFirstStreamIsReservedByTheGlobalProbe) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 } }, { { "FAKE_A", 0x10 } } };
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 1, ample_rate } } } };
+  scoped_global_probe_t global { 0 };
+
+  const auto before = video::testing::encoder_generation();
+  auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_A"));
+  ASSERT_EQ(outcome.status, 0) << outcome.result.message;
+  EXPECT_GT(outcome.encoder_generation, before) << "the ticket is fenced on the probe's own selection";
+  EXPECT_EQ(outcome.encoder_generation, video::testing::encoder_generation());
+  EXPECT_EQ(budget.sessions(0x10), 1u);
+  auto attached = video::testing::attach_capture(ticketed_config("FAKE_A", ticket_from(outcome)));
+  ASSERT_TRUE(attached);
+  expect_only(*attached, 1);
+  EXPECT_EQ(budget.sessions(0x10), 1u);
+  attached.reset();
+  EXPECT_EQ(budget.sessions(0x10), 0u);
+}
+
+TEST(VideoAdmissionTicket, TheFirstStreamIsRefusedOverTheBudget) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 } }, { { "FAKE_A", 0x10 } } };
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 1, ample_rate } } } };
+  scoped_global_probe_t global { 0 };
+
+  auto held = video::probe_encoders_with_outcome(exact_target("FAKE_A"));
+  ASSERT_EQ(held.status, 0) << held.result.message;
+  auto refused = video::probe_encoders_with_outcome(exact_target("FAKE_A"));
+  EXPECT_NE(refused.status, 0);
+  EXPECT_NE(refused.result.message.find("budget"), std::string::npos) << refused.result.message;
+  EXPECT_EQ(video::last_encoder_probe_result.message, refused.result.message) << "the published result reports the refusal";
+  EXPECT_EQ(video::probe_encoders(exact_target("FAKE_A", std::nullopt)), -1);
+  EXPECT_NE(video::last_encoder_probe_result.message.find("needs the requested mode"), std::string::npos) << video::last_encoder_probe_result.message;
+  EXPECT_EQ(budget.sessions(0x10), 1u);
+}
+
+TEST(VideoAdmissionTicket, TheFirstStreamNeedsAdapterAgreement) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 } }, { { "FAKE_A", 0x20 } } };
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 1, ample_rate } }, { 0x20, { 1, ample_rate } } } };
+  scoped_global_probe_t global { 0 };
+
+  auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_A"));
+  EXPECT_NE(outcome.status, 0);
+  EXPECT_NE(outcome.result.message.find("adapter"), std::string::npos) << outcome.result.message;
+  EXPECT_EQ(budget.sessions(0x10) + budget.sessions(0x20), 0u);
+}
+
+TEST(VideoAdmissionTicket, TheFirstStreamWithoutABudgetIsUnaccounted) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 } } };
+  scoped_global_probe_t global { 0 };
+  auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_A"));
+  ASSERT_EQ(outcome.status, 0) << outcome.result.message;
+  auto attached = video::testing::attach_capture(ticketed_config("FAKE_A", ticket_from(outcome)));
+  ASSERT_TRUE(attached);
+  expect_only(*attached, 1);
+}
+
+TEST(VideoAdmissionTicket, AFailedOrUntargetedGlobalProbeCarriesNoAdmission) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 } }, { { "FAKE_A", 0x10 } } };
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 1, ample_rate } } } };
+  {
+    scoped_global_probe_t global { -1 };
+    auto failed = video::probe_encoders_with_outcome(exact_target("FAKE_A"));
+    EXPECT_NE(failed.status, 0);
+    EXPECT_FALSE(failed.admission.commit());
+  }
+  scoped_global_probe_t global { 0 };
+  auto untargeted = video::probe_encoders_with_outcome();
+  ASSERT_EQ(untargeted.status, 0);
+  EXPECT_FALSE(untargeted.admission.commit()) << "the startup probe admits nobody";
+  EXPECT_EQ(budget.sessions(0x10), 0u);
+}
+
+TEST(VideoAdmissionTicket, AStreamWithARefusedTicketShutsDownBeforeCapturing) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 } } };
+  auto ticket = std::make_shared<video::admission_ticket_t>();
+  ticket->pending = video::admission::pending_t::unaccounted();
+  ticket->encoder_generation = video::testing::encoder_generation() + 1;
+  auto mail = std::make_shared<safe::mail_raw_t>();
+  // Mail posts are held weakly; keep the session's shutdown event alive like the stream does.
+  auto shutdown = mail->event<bool>(mail::shutdown);
+  video::capture(mail, ticketed_config("FAKE_A", ticket), nullptr);
+  EXPECT_TRUE(shutdown->peek());
+  EXPECT_EQ(platform.opened("FAKE_A"), 0);
+  EXPECT_TRUE(ticket->pending.commit()) << "a refused ticket is not consumed";
+}
+
+TEST(VideoAdmissionTicket, TheLeaseOutlivesTheCaptureSource) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 }, { "FAKE_B", 2 } }, { { "FAKE_A", 0x10 }, { "FAKE_B", 0x10 } } };
+  auto live = video::testing::attach_capture(exact_config("FAKE_A"));
+  ASSERT_TRUE(live);
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 2, ample_rate } } } };
+
+  auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_B"));
+  ASSERT_EQ(outcome.status, 0) << outcome.result.message;
+  auto attached = video::testing::attach_capture(ticketed_config("FAKE_B", ticket_from(outcome)));
+  ASSERT_TRUE(attached);
+  expect_only(*attached, 2);  // the source's display is open
+  std::atomic<int> held_at_close { -1 };
+  platform.on_close([&] { held_at_close = static_cast<int>(budget.sessions(0x10)); });
+  attached.reset();
+  EXPECT_EQ(held_at_close.load(), 1) << "the source closed after its admission was released";
+  EXPECT_EQ(budget.sessions(0x10), 0u);
+  platform.on_close({});
+}
+TEST(VideoAdmissionTicket, AReprobeBeforeTheFirstStreamAttachesStalesItsTicket) {
+  fake_capture_platform_t platform { { { "FAKE_A", 1 } }, { { "FAKE_A", 0x10 } } };
+  video::testing::scoped_hardware_encoder_t hardware { 0x10 };
+  scoped_budget_t budget { { { 0x10, { 1, ample_rate } } } };
+  scoped_global_probe_t global { 0 };
+
+  auto outcome = video::probe_encoders_with_outcome(exact_target("FAKE_A"));
+  ASSERT_EQ(outcome.status, 0) << outcome.result.message;
+  auto ticket = ticket_from(outcome);
+  ASSERT_EQ(video::probe_encoders_with_outcome().status, 0);
+  EXPECT_FALSE(video::testing::attach_capture(ticketed_config("FAKE_A", ticket)));
+  EXPECT_EQ(platform.opened("FAKE_A"), 0);
+  ticket.reset();
+  EXPECT_EQ(budget.sessions(0x10), 0u);
 }

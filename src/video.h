@@ -144,6 +144,17 @@ namespace video {
   // 动态参数调节事件类型
   using dynamic_param_change_event_t = safe::mail_raw_t::event_t<dynamic_param_t>;
 
+  /**
+   * A launch's admission, carried from the probe that granted it to the
+   * capture attach that commits it. It is valid only against the encoder
+   * selection it was granted on, and commits at most once.
+   */
+  struct admission_ticket_t {
+    std::mutex lock;
+    admission::pending_t pending;
+    std::uint64_t encoder_generation {};
+  };
+
   /* Encoding configuration requested by remote client */
   struct config_t {
     int width;  // Video width in pixels
@@ -213,6 +224,9 @@ namespace video {
     bool pyrowave_dynamic_hdr_mapping = false;
     std::shared_ptr<streaming::bitrate_budget_t> bitrate_budget;
     std::shared_ptr<streaming::capture_target_t> capture_target;
+    // The launch's admission, committed once before the capture source is
+    // acquired; its lease lives as long as the session's capture ref.
+    std::shared_ptr<admission_ticket_t> admission;
 
     platf::frame_pipeline_policy_t
     effective_frame_pipeline_policy() const {
@@ -712,6 +726,13 @@ namespace video {
     /** Advances on every change of the chosen encoder. */
     std::uint64_t
     encoder_generation();
+
+    /**
+     * Replace the global probe's encoder validation (empty restores it). The
+     * replacement returns the probe status; 0 keeps the chosen encoder.
+     */
+    void
+    set_global_probe(std::function<int()> probe);
 
     using capture_display_factory_t = std::function<std::shared_ptr<platf::display_t>(platf::mem_type_e, const std::string &, const config_t &)>;
     using capture_display_names_t = std::function<std::vector<std::string>(platf::mem_type_e)>;

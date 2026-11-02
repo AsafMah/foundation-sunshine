@@ -25,6 +25,9 @@ namespace stream::session {
 namespace spatial_transport {
   struct LiveSession;
 }
+namespace video {
+  struct admission_ticket_t;
+}
 
 namespace rtsp_stream {
   constexpr auto RTSP_SETUP_PORT = 21;
@@ -77,6 +80,9 @@ namespace rtsp_stream {
 
     // Capture exactly SUNSHINE_CLIENT_DISPLAY_NAME; never fall back to another display.
     bool display_exact {};
+    // Managed topology: the admission the launch's probe granted, committed when
+    // the stream's capture attaches. Null for legacy launches.
+    std::shared_ptr<video::admission_ticket_t> video_admission;
     bool host_audio;
     std::string unique_id;
     std::string client_name;

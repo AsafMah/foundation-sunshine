@@ -192,6 +192,16 @@ namespace video {
     last_encoder_probe_result = consume(fake.probes, "encoder probe");
     return last_encoder_probe_result ? 0 : -1;
   }
+
+  probe_outcome_t
+  probe_encoders_with_outcome(std::optional<probe_target_t> target) {
+    probe_outcome_t outcome;
+    outcome.status = probe_encoders(std::move(target));
+    outcome.result = last_encoder_probe_result;
+    outcome.encoder_generation = 7;
+    if (outcome.status == 0) outcome.admission = admission::pending_t::unaccounted();
+    return outcome;
+  }
 }  // namespace video
 
 namespace {
@@ -740,6 +750,7 @@ namespace {
     ASSERT_TRUE(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, false, &coordination));
     events({ "configure.physical", "touch", "probe", "restore", "configure.vdd", "hdr.vdd", "probe", "commit" });
     EXPECT_EQ(fake.policies, std::vector(3, display_device::automatic_vdd_policy_e::suppress));
+    EXPECT_FALSE(launch->video_admission) << "a legacy launch carries no admission";
     EXPECT_TRUE(coordinator->bind_launch(coordination.token));
   }
 
@@ -833,6 +844,13 @@ namespace {
     EXPECT_TRUE(fake.configured.empty());
     EXPECT_EQ(client_display(), "{zako-head}");
     EXPECT_TRUE(launch->display_exact);
+    ASSERT_TRUE(fake.probed[0].target.mode);
+    EXPECT_EQ(fake.probed[0].target.mode->width, 1440u);
+    EXPECT_EQ(fake.probed[0].target.mode->height, 900u);
+    EXPECT_EQ(fake.probed[0].target.mode->fps, 75u);
+    ASSERT_TRUE(launch->video_admission) << "the probe's admission is carried to the stream";
+    EXPECT_EQ(launch->video_admission->encoder_generation, 7u);
+    EXPECT_TRUE(launch->video_admission->pending.commit()) << "the carried admission is the probe's own, uncommitted";
     EXPECT_EQ(coordinator->managed_display(coordination.token), prepared.display);
     EXPECT_TRUE(coordinator->bind_launch(coordination.token));
     EXPECT_EQ(restores->load(), 0);
@@ -878,6 +896,7 @@ namespace {
     EXPECT_EQ(tree.get<int>("root.<xmlattr>.status_code"), 503);
     EXPECT_EQ(tree.get<std::string>("root.<xmlattr>.status_message"), "original probe failure original probe hint");
     EXPECT_EQ(client_display(), "<unset>");
+    EXPECT_FALSE(launch->video_admission) << "a refused probe carries no admission";
     EXPECT_FALSE(coordinator->managed_display(coordination.token));
     EXPECT_EQ(restores->load(), 1);
   }
@@ -921,6 +940,7 @@ namespace {
     ASSERT_TRUE(nvhttp::stream_start::join_managed_display(join_tree, joiner, *coordinator, *joined.token));
     EXPECT_EQ(joiner.env["SUNSHINE_CLIENT_DISPLAY_NAME"].to_string(), "{zako-head}");
     EXPECT_TRUE(joiner.display_exact);
+    EXPECT_FALSE(joiner.video_admission) << "joiners are not admitted yet; an enforced budget refuses their capture";
     EXPECT_EQ(prepares, 1) << "joiners never prepare again";
     EXPECT_TRUE(coordinator->bind_launch(*joined.token));
 
