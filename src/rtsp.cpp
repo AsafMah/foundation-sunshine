@@ -1235,6 +1235,9 @@ namespace rtsp_stream {
         ss << "a=" << streaming::restart_intent::HOST_VERSION_ATTRIBUTE << ":"
            << streaming::restart_intent::LI_HOST_RESTART_PROTOCOL_VERSION << std::endl;
       }
+      if (platf::query_session_locked().has_value()) {
+        caps |= platf::platform_caps::host_session_state;
+      }
       ss << "a=x-ss-general.featureFlags:" << caps << std::endl;
 #ifdef _WIN32
       if (config::input.mouse && (caps & platf::platform_caps::pen_touch)) {

@@ -42,15 +42,18 @@ cd foundation-sunshine
 RTSP 重启能力之前验证 SYSTEM 身份和事件句柄；便携启动不提供此桥接。
 暂时不存在的控制台会话会重新查询，不立即触发迁移。
 
-v1 协议值与经过审查的 common-c 定义一致，见
-`AsafMah/moonlight-common-c` 提交
-`080e04dd3c26bede976a8434ddc3defe8fc4b6e8`：
+fork 保留的 v1 能力位为：
 `SS_TERMINATION_HOST_RESTART_V1=0x53535201`、
-`LI_FF_HOST_RESTART=0x800`、`ML_FF_HOST_RESTART=0x100`、
+`LI_FF_HOST_RESTART=0x1000`、`ML_FF_HOST_RESTART=0x200`、
 `LI_HOST_RESTART_PROTOCOL_VERSION=1`。双方必须协商各自的能力位、
 `x-ss-restart.protocolVersion:1` / `x-ml-restart.protocolVersion:1`
 及加密控制通道。只有接受协议的会话收到 `53 53 52 01`；
 真正停止及旧客户端保持 `80 03 00 23`，不改变现有包布局或加密方式。
+
+上游会话锁定状态保留主机位 `0x800` / 客户端位 `0x100`。早期 fork
+重启协议使用这两个位；此处不提供旧位别名，避免错误协商。先发布配套
+Moonlight/common-c 更新。.219 客户端连接新主机时无法协商重启协议，
+仍收到普通终止原因；旧 common-c 接收分派忽略未知的 `0x550E` 锁定状态包。
 
 控制线程在释放会话和 ENet peer 之前最多执行 250 ms 的 ENet 协议工作。
 这不是应用层确认，强制终止或丢包仍可能表现为普通连接丢失。

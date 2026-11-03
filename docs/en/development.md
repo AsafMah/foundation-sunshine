@@ -44,16 +44,21 @@ event handles before enabling RTSP restart support. Portable startup has no
 restart bridge. A transient absent console session is rechecked, not treated as
 a migration.
 
-These v1 protocol allocations match the reviewed common-c definitions in
-`AsafMah/moonlight-common-c` commit
-`080e04dd3c26bede976a8434ddc3defe8fc4b6e8`:
+The fork-reserved v1 capability allocations are:
 `SS_TERMINATION_HOST_RESTART_V1=0x53535201`,
-`LI_FF_HOST_RESTART=0x800`, `ML_FF_HOST_RESTART=0x100`, and
+`LI_FF_HOST_RESTART=0x1000`, `ML_FF_HOST_RESTART=0x200`, and
 `LI_HOST_RESTART_PROTOCOL_VERSION=1`. Host and client must both negotiate their
 feature bit and `x-ss-restart.protocolVersion:1` /
 `x-ml-restart.protocolVersion:1`, with encrypted control. Only an accepted
 session receives restart reason bytes `53 53 52 01`; genuine stops and legacy
 sessions retain `80 03 00 23`. No packet layout or existing encryption changes.
+
+Upstream host-session lock state retains host bit `0x800` / client bit `0x100`.
+Restart used those bits in earlier fork releases; there is deliberately no
+legacy-bit alias. Ship the matching Moonlight/common-c update first. A .219
+client on this host cannot negotiate restart intent and receives ordinary
+termination instead. It may receive the upstream `0x550E` lock-state packet;
+the old common-c receive dispatcher ignores that unknown control type.
 
 The owning control thread services ENet for up to 250 ms before session/peer
 teardown. This improves delivery but adds no application acknowledgement:

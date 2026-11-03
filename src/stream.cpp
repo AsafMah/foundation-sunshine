@@ -37,6 +37,11 @@ extern "C" {
 // clang-format on
 }
 
+#ifndef ML_FF_HOST_SESSION_STATE
+  // Mirrors moonlight-common-c's client feature flag until the submodule carries it.
+  #define ML_FF_HOST_SESSION_STATE 0x100
+#endif
+
 #ifndef DATA_SHARDS_MAX
   #define DATA_SHARDS_MAX 255
 #endif
@@ -50,6 +55,7 @@ extern "C" {
 #include "haptics/authored_ir.h"
 #include "haptics/authored_ir_extended.h"
 #include "haptics/wire.h"
+#include "nvhttp.h"
 #include "input.h"
 #include "logging.h"
 #include "mic_mixer.h"
@@ -73,6 +79,10 @@ extern "C" {
 #include "platform/common.h"
 #include "touch_keyboard_session.h"
 #include "text_context/bridge.h"
+
+static_assert((streaming::restart_intent::LI_FF_HOST_RESTART & platf::platform_caps::host_session_state) == 0);
+static_assert((streaming::restart_intent::LI_FF_HOST_RESTART & platf::platform_caps::client_resolution_change) == 0);
+static_assert((streaming::restart_intent::ML_FF_HOST_RESTART & ML_FF_HOST_SESSION_STATE) == 0);
 
 #define IDX_START_A 0
 #define IDX_START_B 1
@@ -98,6 +108,7 @@ extern "C" {
 #define IDX_DS5_HAPTICS_PCM 22  // Authored DualSense actuator PCM (Sunshine protocol extension)
 #define IDX_DS5_HAPTICS_IR_V2 23  // Device-independent analyzed haptics (Sunshine protocol extension)
 #define IDX_TEXT_CONTEXT 24  // Remote text focus/context update (Sunshine protocol extension)
+#define IDX_HOST_SESSION_STATE 25  // Host session lock state (Sunshine protocol extension)
 
 static const short packetTypes[] = {
   0x0305,  // Start A
@@ -125,6 +136,7 @@ static const short packetTypes[] = {
   0x550A,  // Authored DualSense haptics PCM (Sunshine protocol extension)
   0x550B,  // Device-independent DualSense haptics IR v2 (Sunshine protocol extension)
   0x550C,  // Remote text context update (Sunshine protocol extension)
+  0x550E,  // Host session lock state (Sunshine protocol extension)
 };
 
 namespace asio = boost::asio;
@@ -714,6 +726,9 @@ namespace stream {
       bool cursor_visible = false;
       std::uint64_t cursor_failed_revision = 0;
       std::uint32_t cursor_send_failures = 0;
+
+      // Last lock state delivered to a client that negotiated ML_FF_HOST_SESSION_STATE.
+      std::optional<bool> host_session_locked_sent;
 
       // Analysis/filter/timeline history belongs to one controller, including
       // when several pads share the same streaming connection.
@@ -1847,16 +1862,18 @@ namespace stream {
     return 0;
   }
 
-  int
-  send_text_context(session_t *session, const text_context::payload_t &payload) {
-    if (!session->control.peer || session->config.controlProtocolType != 13 ||
-        payload.size() != text_context::kWireSize) {
+  /**
+   * Frame, encrypt and send a small Sunshine extension payload on the v2 control stream.
+   * Returns 0 on success, -1 on failure.
+   */
+  static int
+  send_control_payload(session_t *session, std::uint16_t type, std::string_view payload, std::string_view name) {
+    if (!session->control.peer || session->config.controlProtocolType != 13) {
       return -1;
     }
-    const std::size_t plaintext_size = sizeof(control_header_v2) + payload.size();
-    std::vector<std::uint8_t> plaintext(plaintext_size);
+    std::vector<std::uint8_t> plaintext(sizeof(control_header_v2) + payload.size());
     auto *hdr = reinterpret_cast<control_header_v2 *>(plaintext.data());
-    hdr->type = packetTypes[IDX_TEXT_CONTEXT];
+    hdr->type = type;
     hdr->payloadLength = static_cast<std::uint16_t>(payload.size());
     std::memcpy(plaintext.data() + sizeof(control_header_v2), payload.data(), payload.size());
 
@@ -1867,10 +1884,28 @@ namespace stream {
       std::string_view {reinterpret_cast<char *>(plaintext.data()), plaintext.size()},
       encrypted.data(), encrypted.size());
     if (view.empty() || session->broadcast_ref->control_server.send(view, session->control.peer)) {
-      BOOST_LOG(warning) << "Couldn't send remote text context packet"sv;
+      BOOST_LOG(warning) << "Couldn't send "sv << name << " packet"sv;
       return -1;
     }
     return 0;
+  }
+
+  int
+  send_text_context(session_t *session, const text_context::payload_t &payload) {
+    if (payload.size() != text_context::kWireSize) {
+      return -1;
+    }
+    return send_control_payload(session, packetTypes[IDX_TEXT_CONTEXT],
+      std::string_view {reinterpret_cast<const char *>(payload.data()), payload.size()},
+      "remote text context"sv);
+  }
+
+  int
+  send_host_session_state(session_t *session, bool locked) {
+    // 0x550E v1: version:u8, state:u8 (0 unlocked, 1 locked), reserved:u16.
+    const std::array<char, 4> payload {1, static_cast<char>(locked ? 1 : 0), 0, 0};
+    return send_control_payload(session, packetTypes[IDX_HOST_SESSION_STATE],
+      std::string_view {payload.data(), payload.size()}, "host session state"sv);
   }
 
   int
@@ -2531,6 +2566,8 @@ namespace stream {
     // termination when we shut down.
     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
+    std::optional<bool> host_session_locked;
+    auto next_host_session_poll = std::chrono::steady_clock::time_point {};
     while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
       bool has_session_awaiting_peer = false;
       bool has_ds5_haptics_session = false;
@@ -2580,6 +2617,20 @@ namespace stream {
             has_session_awaiting_peer = true;
           }
           else {
+            if (session->config.mlFeatureFlags & ML_FF_HOST_SESSION_STATE) {
+              // Polled lazily so hosts without opted-in clients never query WTS.
+              if (now >= next_host_session_poll) {
+                host_session_locked = platf::query_session_locked();
+                next_host_session_poll = now + 500ms;
+              }
+              if (host_session_locked && session->control.host_session_locked_sent != host_session_locked &&
+                  send_host_session_state(session, *host_session_locked) == 0) {
+                session->control.host_session_locked_sent = host_session_locked;
+                BOOST_LOG(info) << "Host session state sent: locked="sv << *host_session_locked
+                                << ", session="sv << session->launch_session_id;
+              }
+            }
+
             // 音频触觉转普通振动也需要及时处理反馈，不能只按客户端 PCM/IR 能力判断。
             has_ds5_haptics_session |=
               input::has_ds5_audio_haptics(session->input);
@@ -4600,6 +4651,24 @@ namespace stream {
       }
       catch (...) {
         BOOST_LOG(error) << "Webhook session end event construction failed"sv;
+      }
+
+      // Persist the host-side fact that this client streamed, so the WebUI
+      // recent list survives browsers and page closures. Control-only
+      // sessions never carried media and leave no history. The write is
+      // deferred to the task pool: save_state synchronizes the state file,
+      // and join() runs under a 10-second watchdog that must not depend on
+      // filesystem latency.
+      if (!session.control_only && !session.client_cert_uuid.empty()) {
+        const auto ended_at_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+        const auto client_uuid = session.client_cert_uuid;
+        task_pool.push([client_uuid, ended_at_ms] {
+          if (!nvhttp::touch_client_last_session(client_uuid, ended_at_ms)) {
+            BOOST_LOG(debug) << "Couldn't record session end for client_uuid="sv << client_uuid;
+          }
+        });
       }
 
       BOOST_LOG(debug) << "Session ended [session_id="sv << session.launch_session_id
