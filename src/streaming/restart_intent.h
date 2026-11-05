@@ -11,11 +11,11 @@
 #include <utility>
 
 namespace streaming::restart_intent {
-  // Fork-reserved capability bits; upstream session state owns LI 0x800 / ML 0x100.
+  // Fork-reserved protocol-registry bits; upstream session state owns LI 0x800 / ML 0x100.
   // The v1 reason, version attributes and wire layout remain unchanged.
   inline constexpr std::uint32_t SS_TERMINATION_HOST_RESTART_V1 = 0x53535201;
-  inline constexpr std::uint32_t LI_FF_HOST_RESTART = 0x1000;
-  inline constexpr std::uint32_t ML_FF_HOST_RESTART = 0x200;
+  inline constexpr std::uint32_t LI_FF_HOST_RESTART = 0x8000;
+  inline constexpr std::uint32_t ML_FF_HOST_RESTART = 0x8000;
   inline constexpr std::uint32_t GRACEFUL_TERMINATION = 0x80030023;
   inline constexpr std::uint32_t LI_HOST_RESTART_PROTOCOL_VERSION = 1;
   inline constexpr std::string_view HOST_VERSION_ATTRIBUTE = "x-ss-restart.protocolVersion";

@@ -46,19 +46,20 @@ a migration.
 
 The fork-reserved v1 capability allocations are:
 `SS_TERMINATION_HOST_RESTART_V1=0x53535201`,
-`LI_FF_HOST_RESTART=0x1000`, `ML_FF_HOST_RESTART=0x200`, and
+`LI_FF_HOST_RESTART=0x8000`, `ML_FF_HOST_RESTART=0x8000`, and
 `LI_HOST_RESTART_PROTOCOL_VERSION=1`. Host and client must both negotiate their
 feature bit and `x-ss-restart.protocolVersion:1` /
 `x-ml-restart.protocolVersion:1`, with encrypted control. Only an accepted
 session receives restart reason bytes `53 53 52 01`; genuine stops and legacy
 sessions retain `80 03 00 23`. No packet layout or existing encryption changes.
 
-Upstream host-session lock state retains host bit `0x800` / client bit `0x100`.
-Restart used those bits in earlier fork releases; there is deliberately no
-legacy-bit alias. Ship the matching Moonlight/common-c update first. A .219
-client on this host cannot negotiate restart intent and receives ordinary
-termination instead. It may receive the upstream `0x550E` lock-state packet;
-the old common-c receive dispatcher ignores that unknown control type.
+Upstream's protocol extension registry reserves `0x8000` downward for fork
+extensions; host-session lock state retains host bit `0x800` / client bit `0x100`.
+Earlier fork releases used `0x800`/`0x100` and then `0x1000`/`0x200`; there is
+deliberately no legacy-bit alias. Ship the matching Moonlight/common-c update
+first. Clients with either earlier allocation lose restart-intent negotiation
+and receive ordinary termination; older receivers ignore the unknown `0x550E`
+lock-state control packet.
 
 The owning control thread services ENet for up to 250 ms before session/peer
 teardown. This improves delivery but adds no application acknowledgement:
@@ -68,9 +69,7 @@ also requires a restart-aware client and authenticated host-state refresh;
 the initial client scope is a fresh launch of the original commandless Desktop.
 The host deliberately keeps its constants in `src/streaming/restart_intent.h`;
 the client-only `ML_ERROR_HOST_RESTART` is not defined by the host. Ship the
-common-c/client support before enabling host emission; the compatible client
-commit is `AsafMah/moonlight-qt` `6425ac90b38e52ef5ef7e5f73b0f6610f94ec3c7`
-and pins the common-c commit above.
+matching common-c/client support before enabling host emission.
 
 The dedicated `restart_intent_unit_tests` target uses fake service events, a
 device-free fake Core child, and loopback ENet. It does not run Sunshine or alter

@@ -8,8 +8,8 @@ namespace ri = streaming::restart_intent;
 
 TEST(RestartIntent, ConstantsMatchTheAgreedCommonCContract) {
   EXPECT_EQ(ri::SS_TERMINATION_HOST_RESTART_V1, 0x53535201u);
-  EXPECT_EQ(ri::LI_FF_HOST_RESTART, 0x00001000u);
-  EXPECT_EQ(ri::ML_FF_HOST_RESTART, 0x00000200u);
+  EXPECT_EQ(ri::LI_FF_HOST_RESTART, 0x00008000u);
+  EXPECT_EQ(ri::ML_FF_HOST_RESTART, 0x00008000u);
   EXPECT_EQ(ri::LI_HOST_RESTART_PROTOCOL_VERSION, 1u);
   EXPECT_EQ(ri::HOST_VERSION_ATTRIBUTE, "x-ss-restart.protocolVersion");
   EXPECT_EQ(ri::CLIENT_VERSION_ATTRIBUTE, "x-ml-restart.protocolVersion");
@@ -18,7 +18,9 @@ TEST(RestartIntent, ConstantsMatchTheAgreedCommonCContract) {
 TEST(RestartIntent, LockStateAndRestartNegotiateIndependently) {
   constexpr std::uint32_t host_lock_state = 0x800;
   constexpr std::uint32_t client_lock_state = 0x100;
+  constexpr std::uint32_t client_resolution_change = 0x400;
   EXPECT_EQ(ri::LI_FF_HOST_RESTART & host_lock_state, 0u);
+  EXPECT_EQ(ri::LI_FF_HOST_RESTART & client_resolution_change, 0u);
   EXPECT_EQ(ri::ML_FF_HOST_RESTART & client_lock_state, 0u);
   EXPECT_FALSE(ri::accepts_restart(true, true, client_lock_state, "1", true));
   EXPECT_TRUE(ri::accepts_restart(true, true, ri::ML_FF_HOST_RESTART, "1", true));
@@ -28,10 +30,11 @@ TEST(RestartIntent, LockStateAndRestartNegotiateIndependently) {
 }
 
 TEST(RestartIntent, LegacyClientCannotNegotiateRestartOnTheNewHost) {
-  constexpr std::uint32_t legacy_client_restart = 0x100;
-  const bool accepted = ri::accepts_restart(true, true, legacy_client_restart, "1", true);
-  EXPECT_FALSE(accepted);
-  EXPECT_EQ(ri::termination_reason(true, accepted, false), ri::GRACEFUL_TERMINATION);
+  for (const auto legacy_client_restart : { 0x100u, 0x200u }) {
+    const bool accepted = ri::accepts_restart(true, true, legacy_client_restart, "1", true);
+    EXPECT_FALSE(accepted);
+    EXPECT_EQ(ri::termination_reason(true, accepted, false), ri::GRACEFUL_TERMINATION);
+  }
 }
 
 TEST(RestartIntent, TransientConsoleDetachIsNotMigration) {

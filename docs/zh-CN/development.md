@@ -44,16 +44,17 @@ RTSP 重启能力之前验证 SYSTEM 身份和事件句柄；便携启动不提�
 
 fork 保留的 v1 能力位为：
 `SS_TERMINATION_HOST_RESTART_V1=0x53535201`、
-`LI_FF_HOST_RESTART=0x1000`、`ML_FF_HOST_RESTART=0x200`、
+`LI_FF_HOST_RESTART=0x8000`、`ML_FF_HOST_RESTART=0x8000`、
 `LI_HOST_RESTART_PROTOCOL_VERSION=1`。双方必须协商各自的能力位、
 `x-ss-restart.protocolVersion:1` / `x-ml-restart.protocolVersion:1`
 及加密控制通道。只有接受协议的会话收到 `53 53 52 01`；
 真正停止及旧客户端保持 `80 03 00 23`，不改变现有包布局或加密方式。
 
-上游会话锁定状态保留主机位 `0x800` / 客户端位 `0x100`。早期 fork
-重启协议使用这两个位；此处不提供旧位别名，避免错误协商。先发布配套
-Moonlight/common-c 更新。.219 客户端连接新主机时无法协商重启协议，
-仍收到普通终止原因；旧 common-c 接收分派忽略未知的 `0x550E` 锁定状态包。
+上游协议扩展注册表为 fork 扩展从 `0x8000` 向下分配；上游会话锁定状态
+保留主机位 `0x800` / 客户端位 `0x100`。早期 fork 版本使用过
+`0x800`/`0x100` 和 `0x1000`/`0x200`；此处不提供旧位别名，避免错误协商。
+先发布配套 Moonlight/common-c 更新。使用早期分配的客户端无法协商重启协议，
+仍收到普通终止原因；旧接收分派忽略未知的 `0x550E` 锁定状态包。
 
 控制线程在释放会话和 ENet peer 之前最多执行 250 ms 的 ENet 协议工作。
 这不是应用层确认，强制终止或丢包仍可能表现为普通连接丢失。
@@ -61,9 +62,7 @@ Moonlight/common-c 更新。.219 客户端连接新主机时无法协商重启�
 及认证后的主机状态刷新，客户端第一阶段仅重新启动原先无命令的 Desktop。
 主机常量保留在 `src/streaming/restart_intent.h`；仅供客户端使用的
 `ML_ERROR_HOST_RESTART` 不在主机定义。启用主机发送功能之前，先发布
-common-c 与客户端支持。兼容客户端提交为
-`AsafMah/moonlight-qt` 的 `6425ac90b38e52ef5ef7e5f73b0f6610f94ec3c7`，
-其 common-c 子模块固定为上述提交。
+配套 common-c 与客户端支持。
 
 独立目标 `restart_intent_unit_tests` 使用模拟服务事件、无设备操作的模拟 Core
 子进程及回环 ENet，不运行 Sunshine，也不切换 Windows 会话。
