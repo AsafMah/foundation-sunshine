@@ -9,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <boost/function.hpp>
 #include <boost/process/v1.hpp>
@@ -221,6 +222,9 @@ namespace rtsp_stream {
 
   /// Revoke pending tickets and stop only sessions authenticated as this client.
   void terminate_client_sessions(const std::string &uuid);
+
+  /// Revoke these launches' tickets and stop their streams (display group members).
+  void terminate_launch_sessions(const std::vector<std::uint32_t> &launch_session_ids);
 
   /**
    * @brief Terminates streaming sessions asynchronously when a predicate is still true.

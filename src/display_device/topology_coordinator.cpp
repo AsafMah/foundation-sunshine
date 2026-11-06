@@ -116,6 +116,25 @@ namespace display_device::topology {
   }
 
   std::string_view
+  to_string(group_join_e value) noexcept {
+    switch (value) {
+      case group_join_e::joined:
+        return "joined";
+      case group_join_e::unknown_group:
+        return "unknown_group";
+      case group_join_e::wrong_client:
+        return "wrong_client";
+      case group_join_e::bad_head:
+        return "bad_head";
+      case group_join_e::head_busy:
+        return "head_busy";
+      case group_join_e::refused:
+        return "refused";
+    }
+    return "unknown";
+  }
+
+  std::string_view
   to_string(outcome_e value) noexcept {
     switch (value) {
       case outcome_e::completed:
@@ -743,6 +762,9 @@ namespace display_device::topology {
 
   void
   coordinator_t::release_lease_locked(bool post_native_restore, command_kind_e restore_kind) {
+    if (lease_ && lease_->group && !lease_->group->ended) {
+      end_group_locked();
+    }
     const auto restore_state = lease_ ? lease_->restore_state : nullptr;
     if (post_native_restore && options_.native_restore && queue_) {
       // Retain the retiring lease if constructing or submitting the command throws.
@@ -919,6 +941,9 @@ namespace display_device::topology {
   void
   coordinator_t::remove_attachment_locked(std::uint64_t serial, command_kind_e restore_kind) {
     std::erase_if(lease_->attachments, [&](const auto &ref) { return ref.serial == serial; });
+    if (serial == 0 && lease_->group && !lease_->group->ended) {
+      end_group_locked();
+    }
     if (!lease_->restore_kind) {
       lease_->restore_kind = restore_kind;
     }
@@ -960,10 +985,137 @@ namespace display_device::topology {
   std::optional<managed_target_t>
   coordinator_t::managed_display(const launch_token_t &token) {
     std::lock_guard lock { mutex_ };
-    if (!find_attachment_locked(token)) {
+    const auto *ref = find_attachment_locked(token);
+    if (!ref) {
       return std::nullopt;
     }
+    if (ref->head != 0) {
+      return lease_->group->heads.at(ref->head);
+    }
     return lease_->display;
+  }
+
+  namespace {
+    /** Delivers queued group ends once the caller's coordinator lock is released. */
+    template <class F>
+    struct after_unlock_t {
+      F f;
+      ~after_unlock_t() {
+        f();
+      }
+    };
+    template <class F>
+    after_unlock_t(F) -> after_unlock_t<F>;
+  }  // namespace
+
+  void
+  coordinator_t::end_group_locked() {
+    lease_->group->ended = true;
+    std::vector<std::uint32_t> members;
+    // Members stream heads 1..N-1; the owner and ordinary resumes stream head 0 and are not members.
+    for (const auto &ref : lease_->attachments) {
+      if (ref.head != 0) {
+        members.push_back(ref.launch_session_id);
+      }
+    }
+    pending_group_ends_.push_back(std::move(members));
+  }
+
+  void
+  coordinator_t::deliver_group_ends() noexcept {
+    std::vector<std::vector<std::uint32_t>> ends;
+    try {
+      std::lock_guard lock { mutex_ };
+      ends.swap(pending_group_ends_);
+    }
+    catch (...) {
+      return;
+    }
+    for (const auto &members : ends) {
+      try {
+        if (options_.group_ended) {
+          options_.group_ended(members);
+        }
+      }
+      catch (...) {
+        // The observer only terminates streams; the restore never depends on it.
+      }
+    }
+  }
+
+  bool
+  coordinator_t::open_display_group(const launch_token_t &owner, const display_group_id_t &id, std::vector<managed_target_t> heads) {
+    std::lock_guard lock { mutex_ };
+    if (phase_ != coordinator_phase_e::running || stopping_ || id == display_group_id_t {} || heads.size() < 2 ||
+        heads.size() > max_group_heads) {
+      return false;
+    }
+    expire_preparing_locked();
+    if (!matches_owner_locked(owner) || lease_->flavor != launch_flavor_e::managed ||
+        lease_->stage != lease_stage_e::preparing || !lease_->prepared || !lease_->display || lease_->group ||
+        heads.front() != *lease_->display) {
+      return false;
+    }
+    for (std::size_t i = 0; i < heads.size(); ++i) {
+      if (heads[i].display.empty()) {
+        return false;
+      }
+      for (std::size_t j = 0; j < i; ++j) {
+        if (heads[j].display == heads[i].display) {
+          return false;
+        }
+      }
+    }
+    lease_->group = group_t { id, std::move(heads), false };
+    return true;
+  }
+
+  group_admission_t
+  coordinator_t::admit_group_join(const launch_request_t &request, const display_group_id_t &id, std::size_t head) {
+    after_unlock_t deliver { [this]() { deliver_group_ends(); } };
+    std::lock_guard lock { mutex_ };
+    if (const auto reason = admission_reason_locked(); reason != reject_reason_e::none) {
+      return { std::nullopt, group_join_e::refused, reason };
+    }
+    expire_preparing_locked();
+    expire_joins_locked();
+    if (!lease_ || lease_->flavor != launch_flavor_e::managed || !lease_->group || lease_->group->ended ||
+        lease_->group->id != id) {
+      return { std::nullopt, group_join_e::unknown_group };
+    }
+    if (request.client_key.empty() || request.client_key != lease_->client_key) {
+      return { std::nullopt, group_join_e::wrong_client };
+    }
+    if (head == 0 || head >= lease_->group->heads.size()) {
+      return { std::nullopt, group_join_e::bad_head };
+    }
+    if (std::any_of(lease_->attachments.begin(), lease_->attachments.end(), [&](const auto &ref) {
+          return (ref.serial != 0 && ref.head == head) || ref.launch_session_id == request.launch_session_id;
+        })) {
+      return { std::nullopt, group_join_e::head_busy };
+    }
+    if (native_.in_conflict) {
+      return { std::nullopt, group_join_e::refused, reject_reason_e::recovery_required };
+    }
+    if (lease_->stage == lease_stage_e::preparing || lease_->attachments.size() >= options_.max_managed_attachments) {
+      return { std::nullopt, group_join_e::refused, reject_reason_e::owner_busy };
+    }
+    const auto serial = lease_->next_attachment_serial++;
+    const auto deadline = now() + options_.setup_timeout;
+    lease_->attachments.push_back({ serial, request.launch_session_id, lease_stage_e::preparing, deadline, head });
+    touch_managed_locked();
+    return { launch_token_t { lease_->transaction, request.launch_session_id, launch_flavor_e::managed, deadline, serial },
+      group_join_e::joined };
+  }
+
+  std::optional<display_group_id_t>
+  coordinator_t::display_group(const launch_token_t &token) {
+    std::lock_guard lock { mutex_ };
+    const auto *ref = find_attachment_locked(token);
+    if (!ref || !lease_->group || lease_->group->ended || (ref->serial != 0 && ref->head == 0)) {
+      return std::nullopt;
+    }
+    return lease_->group->id;
   }
 
   bool
@@ -1165,6 +1317,7 @@ namespace display_device::topology {
 
   bool
   coordinator_t::abort_launch(const launch_token_t &token, command_body_t legacy_cleanup) {
+    after_unlock_t deliver { [this]() { deliver_group_ends(); } };
     if (token.attachment_serial != 0) {
       {
         std::lock_guard lock { mutex_ };
@@ -1206,6 +1359,7 @@ namespace display_device::topology {
 
   void
   coordinator_t::tick() {
+    after_unlock_t deliver { [this]() { deliver_group_ends(); } };
     std::optional<lease_t> held;
     {
       std::lock_guard lock { mutex_ };
@@ -1611,7 +1765,8 @@ namespace display_device::topology {
     result.managed_mode = options_.managed_mode;
     if (lease_) {
       result.lease = lease_snapshot_t { lease_->transaction, lease_->launch_session_id, lease_->flavor, lease_->stage,
-        lease_->attachments.size(), lease_->flavor == launch_flavor_e::managed && lease_->attachments.empty() };
+        lease_->attachments.size(), lease_->flavor == launch_flavor_e::managed && lease_->attachments.empty(),
+        lease_->group ? lease_->group->heads.size() : 0, lease_->group && lease_->group->ended };
     }
     result.native = native_;
     result.fence_active = startup_restore_attempt_active_ ||

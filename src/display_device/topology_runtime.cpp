@@ -115,10 +115,17 @@ namespace display_device::coordinated {
             }
             return topology::native_prepared_t { std::nullopt, std::move(reason) };
           }
-          return topology::native_prepared_t {
+          topology::native_prepared_t prepared {
             topology::managed_target_t { outcome.target->display.value, outcome.target->virtual_head },
             {},
           };
+          for (const auto &head : outcome.targets) {
+            prepared.heads.push_back({ head.display.value, head.virtual_head });
+          }
+          if (prepared.heads.empty()) {
+            prepared.heads.push_back(*prepared.display);
+          }
+          return prepared;
         },
         [managed](const auto &capability, std::uint32_t width, std::uint32_t height) {
           auto outcome = managed->change_mode(capability, resolution_t { width, height });
@@ -163,6 +170,10 @@ namespace display_device::coordinated {
         // control-only sessions and clears stopped ones.
         options.probes.active_streams = [] { return stream::session::has_active_video_sessions() ? std::size_t { 1 } : std::size_t { 0 }; };
         options.probes.app_running = [] { return proc::proc.running() > 0; };
+        options.group_ended = [](const std::vector<std::uint32_t> &members) {
+          BOOST_LOG(info) << "Display group ended; terminating " << members.size() << " member stream(s)";
+          rtsp_stream::terminate_launch_sessions(members);
+        };
 
         topology::lifecycle_hooks_t hooks;
         hooks.native = native_hooks();

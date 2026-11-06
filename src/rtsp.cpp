@@ -947,6 +947,23 @@ namespace rtsp_stream {
     }
 
     void
+    terminate_launch_sessions(const std::vector<std::uint32_t> &ids) {
+      for (const auto id : ids) {
+        _launch_sessions.erase(id);
+      }
+      boost::asio::post(io_context, [this, ids]() {
+        auto lock = _session_slots.lock();
+        for (const auto &session : *_session_slots) {
+          for (const auto id : ids) {
+            if (stream::session::belongs_to_launch(*session, id)) {
+              stream::session::stop(*session, stream::session::stop_reason_e::host_terminate);
+            }
+          }
+        }
+      });
+    }
+
+    void
     terminate_sessions_async_if(
       stream::session::stop_reason_e reason,
       boost::function<bool()> predicate,
@@ -1091,6 +1108,13 @@ namespace rtsp_stream {
   void
   terminate_client_sessions(const std::string &uuid) {
     server.terminate_client_sessions(uuid);
+  }
+
+  void
+  terminate_launch_sessions(const std::vector<std::uint32_t> &launch_session_ids) {
+    if (!launch_session_ids.empty()) {
+      server.terminate_launch_sessions(launch_session_ids);
+    }
   }
 
   void

@@ -53,6 +53,11 @@ namespace display_device::topology {
   PrintTo(command_kind_e value, std::ostream *os) {
     *os << to_string(value);
   }
+
+  inline void
+  PrintTo(group_join_e value, std::ostream *os) {
+    *os << to_string(value);
+  }
 }  // namespace display_device::topology
 
 namespace {
@@ -5213,5 +5218,342 @@ namespace {
     EXPECT_EQ(probe.applied.load(), 1);
     EXPECT_EQ(probe.released.load(), 0) << "the command ran, so its reservation stays";
     EXPECT_EQ(probe.last_follow_up.load(), 41) << "the follow-up decides for itself what a stale result needs";
+  }
+  // ---------------------------------------------------------------------------
+  // GW-H2: display groups (one managed lease, N heads, a leader and members)
+  // ---------------------------------------------------------------------------
+
+  const display_group_id_t group_a { 0xa1, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
+  const display_group_id_t group_b { 0xb1, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10 };
+  const std::vector<managed_target_t> three_heads { { "{head-0}", true }, { "{head-1}", true }, { "{head-2}", true } };
+
+  struct group_fixture_t {
+    fake_clock_t clock;
+    std::atomic_int restores {};
+    /** Live video streams the probe reports; zero lets the idle grace release the lease. */
+    std::atomic<std::size_t> streams { 1 };
+    std::mutex ended_mutex;
+    std::vector<std::vector<std::uint32_t>> ended;
+    std::unique_ptr<coordinator_t> coordinator;
+    launch_token_t leader {};
+
+    group_fixture_t() {
+      auto options = make_options(clock, true);
+      options.native_restore = counting(restores);
+      options.probes.active_streams = [this]() { return streams.load(); };
+      options.group_ended = [this](const std::vector<std::uint32_t> &members) {
+        std::lock_guard lock { ended_mutex };
+        ended.push_back(members);
+      };
+      coordinator = std::make_unique<coordinator_t>(std::move(options));
+    }
+
+    std::vector<std::vector<std::uint32_t>>
+    ends() {
+      std::lock_guard lock { ended_mutex };
+      return ended;
+    }
+
+    /** Admits, prepares, records head 0, opens the group, binds and activates the leader. */
+    ::testing::AssertionResult
+    open(const std::vector<managed_target_t> &heads = three_heads, const std::string &owner_key = "cert:a") {
+      if (!start_ready(*coordinator).completed()) {
+        return ::testing::AssertionFailure() << "start";
+      }
+      const auto admission = coordinator->admit_launch({ 700, owner_key });
+      if (!admission) {
+        return ::testing::AssertionFailure() << "admit";
+      }
+      leader = *admission.token;
+      if (!coordinator->run_launch_prepare(leader, {}).completed() ||
+          !coordinator->record_managed_display(leader, heads.front()) ||
+          !coordinator->open_display_group(leader, group_a, heads) ||
+          !coordinator->bind_launch(leader) || !coordinator->launch_activated(leader)) {
+        return ::testing::AssertionFailure() << "leader";
+      }
+      return ::testing::AssertionSuccess();
+    }
+
+    std::optional<launch_token_t>
+    member(std::uint32_t id, std::size_t head) {
+      const auto join = coordinator->admit_group_join({ id, "cert:a" }, group_a, head);
+      if (!join || !coordinator->bind_launch(*join.token) || !coordinator->launch_activated(*join.token)) {
+        return std::nullopt;
+      }
+      return join.token;
+    }
+  };
+
+  TEST(DisplayTopologyGroup, OnlyAPreparedManagedOwnerOpensAGroupOfDistinctHeadsLedByItsDisplay) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock, true) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 701, "cert:a" });
+    ASSERT_TRUE(owner);
+    EXPECT_FALSE(coordinator.open_display_group(*owner.token, group_a, three_heads)) << "nothing was prepared yet";
+    ASSERT_TRUE(coordinator.run_launch_prepare(*owner.token, {}).completed());
+    EXPECT_FALSE(coordinator.open_display_group(*owner.token, group_a, three_heads)) << "the leader's display is recorded first";
+    ASSERT_TRUE(coordinator.record_managed_display(*owner.token, three_heads[0]));
+
+    EXPECT_FALSE(coordinator.open_display_group(*owner.token, group_a, { three_heads[0] })) << "a group has at least two heads";
+    EXPECT_FALSE(coordinator.open_display_group(*owner.token, group_a, { three_heads[1], three_heads[0] }))
+      << "head 0 is the leader's own display";
+    EXPECT_FALSE(coordinator.open_display_group(*owner.token, group_a, { three_heads[0], three_heads[0] }))
+      << "every head is a distinct display";
+    EXPECT_FALSE(coordinator.open_display_group(*owner.token, group_a, { three_heads[0], { "", true } }))
+      << "an empty display is never a head";
+    EXPECT_FALSE(coordinator.open_display_group(*owner.token, display_group_id_t {}, three_heads)) << "an all-zero id is never a group";
+    std::vector<managed_target_t> nine { three_heads[0] };
+    for (int i = 1; i < 9; ++i) {
+      nine.push_back({ "{extra-" + std::to_string(i) + "}", true });
+    }
+    EXPECT_FALSE(coordinator.open_display_group(*owner.token, group_a, nine)) << "a group has at most eight heads";
+    auto stale = *owner.token;
+    ++stale.transaction;
+    EXPECT_FALSE(coordinator.open_display_group(stale, group_a, three_heads));
+
+    ASSERT_TRUE(coordinator.open_display_group(*owner.token, group_a, three_heads));
+    EXPECT_FALSE(coordinator.open_display_group(*owner.token, group_b, three_heads)) << "a lease opens one group";
+    EXPECT_EQ(coordinator.display_group(*owner.token), group_a);
+    EXPECT_EQ(coordinator.managed_display(*owner.token), three_heads[0]);
+    ASSERT_TRUE(coordinator.bind_launch(*owner.token));
+    ASSERT_TRUE(coordinator.launch_activated(*owner.token));
+    const auto status = coordinator.status();
+    ASSERT_TRUE(status.lease);
+    EXPECT_EQ(status.lease->group_heads, 3u);
+    EXPECT_FALSE(status.lease->group_ended);
+  }
+
+  TEST(DisplayTopologyGroup, ALegacyLeaseOrAnUngroupedJoinerNeverOpensAGroup) {
+    fake_clock_t clock;
+    coordinator_t legacy { make_options(clock) };
+    ASSERT_TRUE(start_ready(legacy).completed());
+    const auto owner = legacy.admit_launch({ 702, "cert:a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(legacy.run_launch_prepare(*owner.token, {}).completed());
+    EXPECT_FALSE(legacy.open_display_group(*owner.token, group_a, three_heads));
+    EXPECT_EQ(legacy.admit_group_join({ 703, "cert:a" }, group_a, 1).result, group_join_e::unknown_group);
+
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open());
+    const auto join = fixture.coordinator->admit_managed_join({ 704, "cert:a" });
+    ASSERT_TRUE(join);
+    EXPECT_FALSE(fixture.coordinator->open_display_group(*join.token, group_b, three_heads)) << "a joiner never prepares";
+    EXPECT_EQ(fixture.coordinator->managed_display(*join.token), three_heads[0]) << "an ungrouped join streams head 0";
+  }
+
+  TEST(DisplayTopologyGroup, AMemberJoinsOneFreeHeadOfItsClientsLiveGroupAndStreamsExactlyThatHead) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open());
+    auto &coordinator = *fixture.coordinator;
+
+    EXPECT_EQ(coordinator.admit_group_join({ 710, "cert:a" }, group_b, 1).result, group_join_e::unknown_group);
+    EXPECT_EQ(coordinator.admit_group_join({ 711, "cert:b" }, group_a, 1).result, group_join_e::wrong_client);
+    EXPECT_EQ(coordinator.admit_group_join({ 712, "" }, group_a, 1).result, group_join_e::wrong_client)
+      << "an anonymous client is never the leader's client";
+    EXPECT_EQ(coordinator.admit_group_join({ 713, "cert:a" }, group_a, 0).result, group_join_e::bad_head) << "head 0 is the leader";
+    EXPECT_EQ(coordinator.admit_group_join({ 714, "cert:a" }, group_a, 3).result, group_join_e::bad_head);
+
+    const auto first = coordinator.admit_group_join({ 715, "cert:a" }, group_a, 1);
+    ASSERT_TRUE(first) << to_string(first.result);
+    EXPECT_EQ(first.result, group_join_e::joined);
+    EXPECT_NE(first.token->attachment_serial, 0u);
+    EXPECT_EQ(coordinator.managed_display(*first.token), three_heads[1]);
+    EXPECT_EQ(coordinator.display_group(*first.token), group_a);
+    EXPECT_EQ(coordinator.admit_group_join({ 716, "cert:a" }, group_a, 1).result, group_join_e::head_busy)
+      << "a preparing member already holds head 1";
+    EXPECT_EQ(coordinator.admit_group_join({ 715, "cert:a" }, group_a, 2).result, group_join_e::head_busy)
+      << "one launch session streams one head";
+    ASSERT_TRUE(coordinator.bind_launch(*first.token));
+    ASSERT_TRUE(coordinator.launch_activated(*first.token));
+    EXPECT_EQ(coordinator.admit_group_join({ 717, "cert:a" }, group_a, 1).result, group_join_e::head_busy);
+
+    const auto second = fixture.member(718, 2);
+    ASSERT_TRUE(second);
+    EXPECT_EQ(coordinator.managed_display(*second), three_heads[2]);
+    EXPECT_EQ(coordinator.managed_display(fixture.leader), three_heads[0]);
+    EXPECT_EQ(coordinator.status().lease->attachments, 3u);
+  }
+
+  TEST(DisplayTopologyGroup, AnAnonymousLeadersGroupNeverAdmitsAnAnonymousMember) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open(three_heads, ""));
+    EXPECT_EQ(fixture.coordinator->admit_group_join({ 719, "" }, group_a, 1).result, group_join_e::wrong_client)
+      << "matching empty keys prove nothing about the client";
+    EXPECT_EQ(fixture.coordinator->status().lease->attachments, 1u);
+  }
+
+  TEST(DisplayTopologyGroup, AMemberThatEndsFreesItsHeadButKeepsItAndNeverRestores) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open());
+    auto &coordinator = *fixture.coordinator;
+    const auto member = fixture.member(720, 1);
+    ASSERT_TRUE(member);
+    ASSERT_TRUE(coordinator.end_managed_launch(*member));
+    ASSERT_TRUE(flush(coordinator).completed());
+    EXPECT_EQ(fixture.restores.load(), 0) << "a member's end never restores";
+    ASSERT_TRUE(coordinator.status().lease);
+    EXPECT_EQ(coordinator.status().lease->group_heads, 3u) << "the head stays until the group ends";
+    EXPECT_TRUE(fixture.ends().empty()) << "a member's end does not end the group";
+    EXPECT_FALSE(coordinator.managed_display(*member));
+    const auto again = fixture.member(721, 1);
+    ASSERT_TRUE(again) << "a member may rejoin its freed head";
+    EXPECT_EQ(coordinator.managed_display(*again), three_heads[1]);
+
+    // A member whose setup lapses frees its head as well.
+    const auto lapsing = coordinator.admit_group_join({ 722, "cert:a" }, group_a, 2);
+    ASSERT_TRUE(lapsing);
+    fixture.clock.advance(1000ms);
+    coordinator.tick();
+    EXPECT_FALSE(coordinator.managed_display(*lapsing.token));
+    EXPECT_TRUE(fixture.member(723, 2)) << "an expired join frees its head";
+    EXPECT_EQ(fixture.restores.load(), 0);
+  }
+
+  TEST(DisplayTopologyGroup, TheLeadersEndEndsTheGroupTerminatesEveryLiveMemberThenRestoresOnce) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open());
+    auto &coordinator = *fixture.coordinator;
+    const auto one = fixture.member(730, 1);
+    const auto two = coordinator.admit_group_join({ 731, "cert:a" }, group_a, 2);
+    ASSERT_TRUE(one);
+    ASSERT_TRUE(two);
+
+    ASSERT_TRUE(coordinator.end_managed_launch(fixture.leader));
+    auto ends = fixture.ends();
+    ASSERT_EQ(ends.size(), 1u) << "the leader's end is delivered once";
+    std::sort(ends[0].begin(), ends[0].end());
+    EXPECT_EQ(ends[0], (std::vector<std::uint32_t> { 730, 731 })) << "every live member, preparing ones included";
+    ASSERT_TRUE(coordinator.status().lease);
+    EXPECT_TRUE(coordinator.status().lease->group_ended);
+    EXPECT_EQ(coordinator.admit_group_join({ 732, "cert:a" }, group_a, 1).result, group_join_e::unknown_group)
+      << "an ended group admits no member";
+    ASSERT_TRUE(flush(coordinator).completed());
+    EXPECT_EQ(fixture.restores.load(), 0) << "the heads stay until the last member ends";
+
+    // The terminated members end their streams; the final one releases the lease.
+    fixture.streams = 0;
+    ASSERT_TRUE(coordinator.end_managed_launch(*one));
+    ASSERT_TRUE(coordinator.abort_launch(*two.token, {}));
+    coordinator.tick();
+    EXPECT_FALSE(coordinator.status().lease);
+    ASSERT_TRUE(flush(coordinator).completed());
+    EXPECT_EQ(fixture.restores.load(), 1);
+    EXPECT_EQ(fixture.ends().size(), 1u) << "member ends never re-deliver the group end";
+  }
+
+  TEST(DisplayTopologyGroup, AnUngroupedJoinOfAGroupedLeaseIsNeitherAMemberNorTerminatedWithTheGroup) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open());
+    auto &coordinator = *fixture.coordinator;
+    const auto plain = coordinator.admit_managed_join({ 733, "cert:a" });
+    ASSERT_TRUE(plain);
+    ASSERT_TRUE(coordinator.bind_launch(*plain.token));
+    ASSERT_TRUE(coordinator.launch_activated(*plain.token));
+    EXPECT_FALSE(coordinator.display_group(*plain.token)) << "an ordinary resume never learns the group";
+    const auto member = fixture.member(734, 1);
+    ASSERT_TRUE(member);
+
+    ASSERT_TRUE(coordinator.end_managed_launch(fixture.leader));
+    const auto ends = fixture.ends();
+    ASSERT_EQ(ends.size(), 1u);
+    EXPECT_EQ(ends[0], (std::vector<std::uint32_t> { 734 })) << "only the group's members end with it";
+    EXPECT_EQ(coordinator.managed_display(*plain.token), three_heads[0]) << "the ordinary join keeps streaming head 0";
+  }
+
+  TEST(DisplayTopologyGroup, ALeaderWhoseTicketVanishesEndsTheGroupLikeAnExplicitEnd) {
+    group_fixture_t fixture;
+    std::atomic_bool leader_ticket { true };
+    {
+      auto options = make_options(fixture.clock, true);
+      options.native_restore = counting(fixture.restores);
+      options.probes.ticket_present = [&](std::uint32_t id) { return id != 700 || leader_ticket.load(); };
+      options.probes.active_streams = [&]() { return fixture.streams.load(); };
+      options.group_ended = [&](const std::vector<std::uint32_t> &members) {
+        std::lock_guard lock { fixture.ended_mutex };
+        fixture.ended.push_back(members);
+      };
+      fixture.coordinator = std::make_unique<coordinator_t>(std::move(options));
+    }
+    auto &coordinator = *fixture.coordinator;
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto admission = coordinator.admit_launch({ 700, "cert:a" });
+    ASSERT_TRUE(admission);
+    fixture.leader = *admission.token;
+    ASSERT_TRUE(coordinator.run_launch_prepare(fixture.leader, {}).completed());
+    ASSERT_TRUE(coordinator.record_managed_display(fixture.leader, three_heads[0]));
+    ASSERT_TRUE(coordinator.open_display_group(fixture.leader, group_a, three_heads));
+    ASSERT_TRUE(coordinator.bind_launch(fixture.leader));
+    const auto member = fixture.member(740, 1);
+    ASSERT_TRUE(member);
+
+    coordinator.tick();
+    EXPECT_TRUE(fixture.ends().empty());
+    leader_ticket = false;
+    coordinator.tick();
+    ASSERT_EQ(fixture.ends().size(), 1u) << "a bound leader that never claimed its ticket is gone";
+    EXPECT_EQ(fixture.ends()[0], (std::vector<std::uint32_t> { 740 }));
+  }
+
+  TEST(DisplayTopologyGroup, ALeaseReleasedWhileMembersRemainDeliversTheGroupEndToThem) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open());
+    auto &coordinator = *fixture.coordinator;
+    const auto member = fixture.member(750, 2);
+    ASSERT_TRUE(member);
+    // No video stream remains: the idle grace releases the whole lease, members included.
+    fixture.streams = 0;
+    coordinator.tick();
+    fixture.clock.advance(500ms);
+    coordinator.tick();
+    EXPECT_FALSE(coordinator.status().lease);
+    ASSERT_EQ(fixture.ends().size(), 1u);
+    EXPECT_EQ(fixture.ends()[0], (std::vector<std::uint32_t> { 750 })) << "members only; the leader is the lease itself";
+    ASSERT_TRUE(flush(coordinator).completed());
+    EXPECT_EQ(fixture.restores.load(), 1);
+  }
+
+  TEST(DisplayTopologyGroup, AThrowingGroupEndObserverNeverBlocksTheRestore) {
+    fake_clock_t clock;
+    std::atomic_int restores {};
+    std::atomic_int calls {};
+    auto options = make_options(clock, true);
+    options.native_restore = counting(restores);
+    options.group_ended = [&](const std::vector<std::uint32_t> &) {
+      ++calls;
+      throw std::runtime_error { "observer" };
+    };
+    coordinator_t coordinator { std::move(options) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 760, "cert:a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(coordinator.run_launch_prepare(*owner.token, {}).completed());
+    ASSERT_TRUE(coordinator.record_managed_display(*owner.token, three_heads[0]));
+    ASSERT_TRUE(coordinator.open_display_group(*owner.token, group_a, three_heads));
+    ASSERT_TRUE(coordinator.bind_launch(*owner.token));
+    ASSERT_TRUE(coordinator.launch_activated(*owner.token));
+    const auto member = coordinator.admit_group_join({ 761, "cert:a" }, group_a, 1);
+    ASSERT_TRUE(member);
+    EXPECT_NO_THROW(EXPECT_TRUE(coordinator.end_managed_launch(*owner.token)));
+    EXPECT_EQ(calls.load(), 1);
+    ASSERT_TRUE(coordinator.abort_launch(*member.token, {}));
+    coordinator.tick();
+    ASSERT_TRUE(flush(coordinator).completed());
+    EXPECT_EQ(restores.load(), 1);
+  }
+
+  TEST(DisplayTopologyGroup, AGroupJoinIsRefusedWhileTheCoordinatorRefusesAdmission) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open());
+    auto &coordinator = *fixture.coordinator;
+    coordinator.publish_native_health({ true, true, "fake conflict" });
+    const auto refused = coordinator.admit_group_join({ 770, "cert:a" }, group_a, 1);
+    EXPECT_EQ(refused.result, group_join_e::refused);
+    EXPECT_EQ(refused.reason, reject_reason_e::recovery_required);
+    coordinator.publish_native_health({});
+    coordinator.begin_draining();
+    const auto draining = coordinator.admit_group_join({ 771, "cert:a" }, group_a, 1);
+    EXPECT_EQ(draining.result, group_join_e::refused);
+    EXPECT_EQ(draining.reason, reject_reason_e::draining);
   }
 }  // namespace

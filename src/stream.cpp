@@ -4454,6 +4454,11 @@ namespace stream {
       return !uuid.empty() && session.client_cert_uuid == uuid;
     }
 
+    bool
+    belongs_to_launch(const session_t &session, std::uint32_t launch_session_id) {
+      return session.launch_session_id == launch_session_id;
+    }
+
     streaming::capture_target_result_t
     current_capture_for_client(const std::string &client_cert_uuid) {
       if (client_cert_uuid.empty()) {

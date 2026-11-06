@@ -16,6 +16,7 @@
  */
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -150,6 +151,42 @@ namespace display_device::topology {
     std::optional<managed_target_t> display;
     /** Why there is no display. */
     std::string reason;
+    /** Every prepared head in creation order; the first is `display`. */
+    std::vector<managed_target_t> heads {};
+  };
+
+  /** 128-bit display group id; never all zero. */
+  using display_group_id_t = std::array<std::uint8_t, 16>;
+
+  /** Most heads one display group holds (the IDX_DISPLAY_GROUP wire limit). */
+  inline constexpr std::size_t max_group_heads = 8;
+
+  enum class group_join_e : std::uint8_t {
+    joined,
+    /** No live group with this id (none, another lease's, or its leader ended): HTTP 404. */
+    unknown_group,
+    /** The group belongs to another (or an anonymous) client: HTTP 403. */
+    wrong_client,
+    /** Head 0 (the leader's) or out of range: HTTP 400. */
+    bad_head,
+    /** A live member already holds the head, or this launch session holds one: HTTP 409. */
+    head_busy,
+    /** Admission is refused (`reason`): HTTP 503. */
+    refused,
+  };
+
+  std::string_view
+  to_string(group_join_e value) noexcept;
+
+  struct group_admission_t {
+    std::optional<launch_token_t> token;
+    group_join_e result { group_join_e::unknown_group };
+    reject_reason_e reason { reject_reason_e::none };
+
+    explicit
+    operator bool() const noexcept {
+      return token.has_value();
+    }
   };
 
   struct launch_admission_t {
@@ -169,6 +206,9 @@ namespace display_device::topology {
     lease_stage_e stage { lease_stage_e::preparing };
     std::size_t attachments {};
     bool retiring {};
+    /** Heads of the lease's display group; zero without one. */
+    std::size_t group_heads {};
+    bool group_ended {};
   };
 
   struct native_health_t {
@@ -370,6 +410,13 @@ namespace display_device::topology {
     command_body_t native_restore;
     /** Observer for every accepted posted command, including cancellation before start. */
     std::function<void(command_kind_e, const command_result_t &)> posted_observer;
+    /**
+     * Called once when a display group ends (its leader reference is gone, or its lease
+     * was released), with the launch session ids of every member still attached; the
+     * caller terminates their streams. Invoked without the coordinator mutex, on the
+     * thread that ended the group; exceptions are swallowed. Must not block.
+     */
+    std::function<void(const std::vector<std::uint32_t> &)> group_ended;
   };
 
   class coordinator_t {
@@ -460,9 +507,33 @@ namespace display_device::topology {
     bool
     record_managed_display(const launch_token_t &token, managed_target_t display);
 
-    /** The lease's recorded display, for any live reference of the current managed lease. */
+    /**
+     * The display a live reference of the current managed lease streams: its group
+     * head for a group member, otherwise the lease's recorded display.
+     */
     std::optional<managed_target_t>
     managed_display(const launch_token_t &token);
+
+    /**
+     * Open the lease's display group, once, after its display is recorded and before
+     * bind. `heads` are 2..max_group_heads distinct displays and heads[0] is the
+     * recorded display. The leader is the owner reference (head 0); any end of it
+     * ends the group. Returns false otherwise, or for an all-zero id.
+     */
+    bool
+    open_display_group(const launch_token_t &owner, const display_group_id_t &id, std::vector<managed_target_t> heads);
+
+    /**
+     * Reserve head `head` (1..N-1) of the live group `id` for a member stream of the
+     * leader's client. Never prepares, launches or restores; a member's end frees only
+     * its head, which stays until the group's lease is released.
+     */
+    group_admission_t
+    admit_group_join(const launch_request_t &request, const display_group_id_t &id, std::size_t head);
+
+    /** The group a live reference belongs to, while that group has not ended. */
+    std::optional<display_group_id_t>
+    display_group(const launch_token_t &token);
 
     /** Consume a bound reference, under the ticket lock before removing its ticket. */
     bool
@@ -667,6 +738,14 @@ namespace display_device::topology {
       std::uint32_t launch_session_id {};
       lease_stage_e stage { lease_stage_e::preparing };
       monotonic_time_t setup_deadline {};
+      /** Group head this reference streams; 0 is the lease's own display. */
+      std::size_t head {};
+    };
+
+    struct group_t {
+      display_group_id_t id {};
+      std::vector<managed_target_t> heads;
+      bool ended {};
     };
 
     struct lease_t {
@@ -692,6 +771,7 @@ namespace display_device::topology {
       std::optional<managed_target_t> display;
       /** Last tick saw no references while the application ran: resume may join. */
       bool app_held {};
+      std::optional<group_t> group;
     };
 
     using submission_t = command_submission_t;
@@ -756,6 +836,14 @@ namespace display_device::topology {
 
     void
     expire_joins_locked();
+
+    /** Mark the lease's group ended and queue its member list for delivery. */
+    void
+    end_group_locked();
+
+    /** Deliver queued group ends outside the mutex; never throws. */
+    void
+    deliver_group_ends() noexcept;
 
     /** `options_.native_restore`, marking native health In conflict if it throws. */
     command_body_t
@@ -826,6 +914,7 @@ namespace display_device::topology {
     native_health_t native_;
     std::uint64_t next_transaction_ { 1 };
     std::uint64_t native_restores_posted_ {};
+    std::vector<std::vector<std::uint32_t>> pending_group_ends_;
     std::uint64_t submitted_commands_ {};
 
     std::mutex tick_mutex_;
