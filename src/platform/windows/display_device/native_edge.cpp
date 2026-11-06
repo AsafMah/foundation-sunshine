@@ -237,6 +237,44 @@ namespace display_device::topology::win32_edge {
     return { edge_delivery_e::uncertain, "the display could not be added to the desktop" };
   }
 
+  edge_send_t
+  win32_native_edge_t::arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements) {
+    capability.require(arrange_operation(capability.kind()));
+    auto data = w_utils::query_display_config(w_utils::ACTIVE_ONLY_DEVICES);
+    if (!data) return { edge_delivery_e::not_sent, "the desktop could not be read" };
+
+    std::vector<bool> placed(placements.size(), false);
+    std::vector<UINT32> moved;
+    for (auto &path : data->paths) {
+      const auto info = w_utils::get_device_info_for_valid_path(path, w_utils::ACTIVE_ONLY_DEVICES);
+      if (!info) continue;
+      const auto it = std::ranges::find_if(placements, [&](const placement_t &placement) { return placement.display.value == info->device_id; });
+      if (it == placements.end()) continue;
+      const auto index = w_utils::get_source_index(path, data->modes);
+      auto *mode = w_utils::get_source_mode(index, data->modes);
+      if (!index || !mode) return { edge_delivery_e::not_sent, "display " + info->device_id + " has no source mode" };
+      // A duplicated display shares its source; moving it would move its clone too.
+      if (std::ranges::find(moved, *index) != moved.end()) {
+        return { edge_delivery_e::not_sent, "display " + info->device_id + " shares its source with another display" };
+      }
+      moved.push_back(*index);
+      mode->position = POINTL { it->position.x, it->position.y };
+      placed[static_cast<std::size_t>(it - placements.begin())] = true;
+    }
+    for (std::size_t i = 0; i < placements.size(); ++i) {
+      if (!placed[i]) return { edge_delivery_e::not_sent, "display " + placements[i].display.value + " is not on the desktop" };
+    }
+
+    // Not SDC_SAVE_TO_DATABASE: the user's saved layout for this display set stays as it was.
+    const UINT32 flags { SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_VIRTUAL_MODE_AWARE };
+    const LONG result { SetDisplayConfig(static_cast<UINT32>(data->paths.size()), data->paths.data(),
+      static_cast<UINT32>(data->modes.size()), data->modes.data(), flags) };
+    if (result != ERROR_SUCCESS) {
+      return { edge_delivery_e::uncertain, w_utils::get_error_string(result) + " while placing the displays" };
+    }
+    return { edge_delivery_e::delivered, {} };
+  }
+
   std::chrono::steady_clock::time_point
   win32_native_edge_t::now() {
     return std::chrono::steady_clock::now();

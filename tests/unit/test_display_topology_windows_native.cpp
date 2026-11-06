@@ -124,6 +124,19 @@ namespace {
     }
 
     dt::edge_send_t
+    arrange(const dt::mutation_capability_t &capability, const std::vector<dt::placement_t> &placements) override {
+      capability.require(dt::arrange_operation(capability.kind()));
+      arrangements.push_back(placements);
+      if (on_arrange) return on_arrange(placements);
+      for (const auto &placement : placements) {
+        for (auto &listed : displays) {
+          if (listed.id == placement.display && listed.layout) listed.layout->position = placement.position;
+        }
+      }
+      return { edge_delivery_e::delivered, {} };
+    }
+
+    dt::edge_send_t
     send_destroy_all(const dt::mutation_capability_t &) override {
       ++destroys;
       if (on_destroy) return on_destroy();
@@ -217,6 +230,8 @@ namespace {
     bool recreate_inactive {};
     std::vector<dt::os_display_id_t> activations;
     std::function<dt::edge_send_t(const dt::os_display_id_t &)> on_activate;
+    std::vector<std::vector<dt::placement_t>> arrangements;
+    std::function<dt::edge_send_t(const std::vector<dt::placement_t> &)> on_arrange;
   };
 
   dt::windows_native_options_t
@@ -969,4 +984,65 @@ TEST_F(WindowsNative, TheExecutorAddsAColdCreatedHeadToTheDesktopAndStillRemoves
   EXPECT_EQ(restored.verdict, native_verdict_e::ok) << restored.reason;
   EXPECT_EQ(edge.destroys, 1);
   EXPECT_FALSE(store.bytes);
+}
+// --- Placing displays (kit-3 run 20261106-193211) ---------------------------------------
+
+namespace {
+  dt::result_t<void>
+  arrange_with(dt::windows_native_platform_t &platform, const std::vector<dt::placement_t> &plan, dt::command_kind_e kind = dt::command_kind_e::launch_prepare) {
+    std::optional<dt::result_t<void>> result;
+    with_capability(kind, [&](const auto &capability) { result = platform.arrange(capability, plan); }, true);
+    return *result;
+  }
+
+  const std::vector<dt::placement_t> swapped {
+    { dt::os_display_id_t { "os-B" }, { 0, 0 } },
+    { dt::os_display_id_t { "os-A" }, { 1920, 0 } },
+  };
+}  // namespace
+
+TEST_F(WindowsNative, ArrangeMovesEveryDisplayInOneWriteAndWaitsForThem) {
+  ASSERT_TRUE(arrange_with(platform, swapped));
+  ASSERT_EQ(edge.arrangements.size(), 1u);
+  EXPECT_EQ(edge.arrangements[0], swapped);
+  const auto inventory = platform.inventory();
+  EXPECT_EQ(find(inventory, "os-B")->layout->position, (dt::position_t { 0, 0 }));
+  EXPECT_EQ(find(inventory, "os-A")->layout->position, (dt::position_t { 1920, 0 }));
+}
+
+TEST_F(WindowsNative, ArrangeOfNothingWritesNothing) {
+  ASSERT_TRUE(arrange_with(platform, {}));
+  EXPECT_TRUE(edge.arrangements.empty());
+}
+
+TEST_F(WindowsNative, ArrangeDeliveryMapsToTheContract) {
+  edge.on_arrange = [](const auto &) { return dt::edge_send_t { edge_delivery_e::not_sent, "a clone" }; };
+  EXPECT_TRUE(fails_with(arrange_with(platform, swapped), dt::error_code_e::resource_unavailable, "a clone"));
+  edge.on_arrange = [](const auto &) { return dt::edge_send_t { edge_delivery_e::uncertain, "SetDisplayConfig failed" }; };
+  EXPECT_TRUE(fails_with(arrange_with(platform, swapped), dt::error_code_e::unknown_applied_state, "SetDisplayConfig failed"));
+  edge.on_arrange = [](const auto &) { return dt::edge_send_t { edge_delivery_e::delivered, {} }; };
+  const auto sleeps = edge.sleeps;
+  EXPECT_TRUE(fails_with(arrange_with(platform, swapped), dt::error_code_e::unknown_applied_state, "not at their places"));
+  EXPECT_GT(edge.sleeps, sleeps);
+}
+
+TEST_F(WindowsNative, ArrangeWaitsForAnOffDesktopDisplayToBeAtItsPlace) {
+  edge.on_arrange = [&](const auto &plan) {
+    for (auto &display : edge.displays) {
+      if (display.id.value == "os-B") {
+        display.layout->position = plan[0].position;
+        display.info.device_state = state_e::inactive;
+      }
+    }
+    return dt::edge_send_t { edge_delivery_e::delivered, {} };
+  };
+  EXPECT_TRUE(fails_with(arrange_with(platform, { swapped[0] }), dt::error_code_e::unknown_applied_state, "not at their places"));
+}
+
+TEST_F(WindowsNative, ArrangeIsOnlyForAPrepareOrRestore) {
+  with_capability(dt::command_kind_e::reconfigure, [&](const auto &capability) {
+    EXPECT_THROW((void) platform.arrange(capability, swapped), dt::capability_error_t);
+  });
+  EXPECT_TRUE(edge.arrangements.empty());
+  EXPECT_TRUE(arrange_with(platform, swapped, dt::command_kind_e::native_restore));
 }

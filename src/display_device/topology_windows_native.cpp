@@ -344,4 +344,31 @@ namespace display_device::topology {
     if (!active) return fail(error_code_e::unknown_applied_state, "the virtual display is not on the desktop after it was added");
     return {};
   }
+
+  result_t<void>
+  windows_native_platform_t::do_arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements) {
+    if (placements.empty()) return {};
+    const auto sent = edge_.arrange(capability, placements);
+    switch (sent.delivery) {
+      case edge_delivery_e::not_sent:
+        return fail(error_code_e::resource_unavailable, "the displays were not placed: " + sent.detail);
+      case edge_delivery_e::uncertain:
+        return fail(error_code_e::unknown_applied_state, "the displays may have been placed: " + sent.detail);
+      case edge_delivery_e::delivered:
+        break;
+    }
+    const bool placed = wait_for([&](const inventory_t &observed) {
+      return std::all_of(placements.begin(), placements.end(), [&](const placement_t &placement) {
+        const auto matches = std::count_if(observed.displays.begin(), observed.displays.end(), [&](const observed_display_t &display) {
+          return display.id == placement.display;
+        });
+        const auto it = std::find_if(observed.displays.begin(), observed.displays.end(), [&](const observed_display_t &display) {
+          return display.id == placement.display;
+        });
+        return matches == 1 && on_desktop(*it) && it->layout->position == placement.position;
+      });
+    });
+    if (!placed) return fail(error_code_e::unknown_applied_state, "the displays are not at their places after they were placed");
+    return {};
+  }
 }  // namespace display_device::topology

@@ -145,6 +145,14 @@ namespace display_device::topology {
     virtual edge_send_t
     activate(const mutation_capability_t &capability, const os_display_id_t &display) = 0;
 
+    /**
+     * Moves each listed display's source corner in one desktop write, keeping every mode and
+     * topology group, and does not save the layout as the OS default. A listed display that
+     * is not on the desktop, or shares its source, is not_sent with nothing written.
+     */
+    virtual edge_send_t
+    arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements) = 0;
+
     virtual std::chrono::steady_clock::time_point
     now() = 0;
 
@@ -210,6 +218,10 @@ namespace display_device::topology {
 
     result_t<void>
     do_activate_head(const mutation_capability_t &capability, const observed_display_t &head) override;
+
+    /** One desktop write of every corner (`native_edge_t::arrange`), then waits for each display there. */
+    result_t<void>
+    do_arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements) override;
 
     /** Adds the head with `guid` to the desktop unless it is already on it, and waits for it there. */
     result_t<void>

@@ -166,7 +166,7 @@ namespace {
     host_writes() const {
       return static_cast<std::size_t>(std::count_if(events.begin(), events.end(), [](const std::string &event) {
         return event == "create_head" || event == "remove_all_heads" || event.starts_with("apply_fields:") ||
-               event.starts_with("change_head_mode:") || event.starts_with("activate_head:");
+               event.starts_with("change_head_mode:") || event.starts_with("activate_head:") || event == "arrange";
       }));
     }
   };
@@ -375,11 +375,72 @@ namespace {
       auto &target = find(host, head.id.value);
       target.info.device_state = state_e::active;
       target.info.display_name = "\\\\.\\DISPLAY-" + head.id.value;
-      target.layout = display_topology_test::layout(3840);
+      target.layout = display_topology_test::layout(right_edge());
+      if (take_origin) take_origin_for(head.id.value);
+      return {};
+    }
+
+    dt::result_t<void>
+    do_arrange(const dt::mutation_capability_t &capability, const std::vector<dt::placement_t> &placements) override {
+      if (on_mutation) on_mutation(&capability);
+      log_.add("arrange");
+      arrangements.push_back(placements);
+      if (on_arrange) {
+        return on_arrange(arrangements.size(), placements);
+      }
+      place(placements);
       return {};
     }
 
   public:
+    /** As CCD does: the corners move, and the display at 0,0 is the primary. */
+    void
+    place(const std::vector<dt::placement_t> &placements) {
+      for (const auto &placement : placements) {
+        auto &target = find(host, placement.display.value);
+        target.layout->position = placement.position;
+      }
+      for (auto &display : host.displays) {
+        if (display.info.device_state == state_e::inactive || !display.layout) continue;
+        display.info.device_state = display.layout->position == dt::position_t {} ? state_e::primary : state_e::active;
+      }
+    }
+
+    /** The right edge of the desktop, where Windows extends by default. */
+    std::int32_t
+    right_edge() const {
+      std::int32_t edge = 0;
+      for (const auto &display : host.displays) {
+        if (display.info.device_state == state_e::inactive || !display.layout) continue;
+        edge = std::max(edge, display.layout->position.x + static_cast<std::int32_t>(display.layout->mode.resolution.width));
+      }
+      return edge;
+    }
+
+    /**
+     * As Windows did with a remembered layout in the kit-3 run: the arriving head becomes the
+     * primary at 0,0 and every other desktop display moves left of it.
+     */
+    void
+    take_origin_for(const std::string &name) {
+      std::int32_t others = 0;
+      for (const auto &display : host.displays) {
+        if (display.id.value == name || display.info.device_state == state_e::inactive || !display.layout) continue;
+        others = std::max(others, display.layout->position.x + static_cast<std::int32_t>(display.layout->mode.resolution.width));
+      }
+      for (auto &display : host.displays) {
+        if (display.info.device_state == state_e::inactive || !display.layout) continue;
+        if (display.id.value == name) {
+          display.layout->position = {};
+          display.info.device_state = state_e::primary;
+        }
+        else {
+          display.layout->position.x -= others;
+          display.info.device_state = state_e::active;
+        }
+      }
+    }
+
     /** Applies `mode` to a listed head; `recreate` gives it a new OS id and incarnations, as SETMODES may. */
     void
     set_head_mode(const std::string &name, const display_device::display_mode_t &mode, bool recreate) {
@@ -395,7 +456,7 @@ namespace {
     std::string
     add_head() {
       auto name = "vdd-" + std::to_string(++created);
-      auto display = virtual_display(name, 3840);
+      auto display = virtual_display(name, right_edge());
       if (create_inactive) {
         // As observed on hardware: a cold-created IddCx head is listed but not on the desktop.
         display.info.device_state = state_e::inactive;
@@ -407,7 +468,9 @@ namespace {
         if (stamp) stamp(*display.head);
         if (strip_identity) display.head.reset();
       }
+      const bool arrived = display.info.device_state != state_e::inactive;
       host.displays.push_back(std::move(display));
+      if (arrived && take_origin) take_origin_for(name);
       return name;
     }
 
@@ -441,6 +504,11 @@ namespace {
     std::vector<dt::os_display_id_t> activations;
     /** Replaces the default activation (the head goes active in place). */
     std::function<dt::result_t<void>(const dt::observed_display_t &)> on_activate;
+    std::vector<std::vector<dt::placement_t>> arrangements;
+    /** Replaces the default placement (every corner moves); receives the 1-based call. */
+    std::function<dt::result_t<void>(std::size_t, const std::vector<dt::placement_t> &)> on_arrange;
+    /** A head that reaches the desktop takes the origin and the primary (`take_origin_for`). */
+    bool take_origin {};
     std::function<void(const dt::mutation_capability_t *)> on_mutation;
     /** Edits one snapshot; receives the 1-based read number. */
     std::function<void(int, dt::inventory_t &)> tamper;
@@ -1146,20 +1214,17 @@ TEST_F(NativeExecutor, AnUnknownInventoryCreatesNothing) {
 TEST_F(NativeExecutor, RetriesKeepTheFirstBaselineAndUseFreshIdentities) {
   platform.on_create = [&](std::size_t attempt) -> dt::result_t<delivery_e> {
     if (attempt == 1) {
+      // A moved display does not stop the retry, and must not leak into the journaled
+      // baseline; the head's placement puts it back at its baseline corner.
+      find(platform.host, "os-B").layout->position = { 2000, 0 };
       return failure("driver busy");
     }
     platform.add_head();
     return delivery_e::accepted;
   };
-  // Geometry is outside the "other displays" check, so a moved display does not stop the
-  // retry; it must not leak into the journaled baseline either.
-  platform.tamper = [](int read, dt::inventory_t &inventory) {
-    if (read > 1) {
-      find(inventory, "os-B").layout->position = { 2000, 0 };
-    }
-  };
   const auto outcome = prepare_with(executor, virtual_profile());
-  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok));
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok)) << outcome.reason;
+  EXPECT_TRUE(find(platform.host, "os-B").layout->position == (dt::position_t { 1920, 0 }));
   ASSERT_EQ(platform.intents.size(), 2u);
   EXPECT_FALSE(platform.intents[0] == platform.intents[1]);
 
@@ -4038,4 +4103,238 @@ TEST_F(NativeExecutor, ChangeModeOfOneHeadNeedsAManagedReconfigure) {
     }
   }
   EXPECT_TRUE(platform.mode_requests.empty());
+}
+
+// --- Placing heads beside the existing desktop (kit-3 run 20261106-193211) ------------
+
+namespace {
+  /**
+   * The kit-3 host under Punktfunk: a foreign virtual display (classified physical) is the
+   * whole desktop and the primary; the panels are listed but off the desktop.
+   */
+  dt::inventory_t
+  sole_virtual_primary() {
+    auto inventory = host_inventory();
+    for (auto &display : inventory.displays) {
+      display.info.device_state = state_e::inactive;
+      display.info.display_name.clear();
+      display.layout.reset();
+    }
+    auto pnk = monitor("pnk", 0, state_e::primary);
+    pnk.layout = display_topology_test::layout(0, 0, 2560, 1440);
+    pnk.layout->hdr = display_device::hdr_state_e::enabled;
+    pnk.info.hdr_state = display_device::hdr_state_e::enabled;
+    inventory.displays.push_back(pnk);
+    return inventory;
+  }
+
+  dt::position_t
+  corner(const dt::inventory_t &inventory, const std::string &name) {
+    for (const auto &display : inventory.displays) {
+      if (display.id.value == name && display.layout) return display.layout->position;
+    }
+    return { -99999, -99999 };
+  }
+
+  state_e
+  state_of(const dt::inventory_t &inventory, const std::string &name) {
+    for (const auto &display : inventory.displays) {
+      if (display.id.value == name) return display.info.device_state;
+    }
+    return state_e::inactive;
+  }
+}  // namespace
+
+TEST_F(NativeExecutor, AHeadBesideASoleVirtualPrimaryLeavesItAtTheOriginAndPrimary) {
+  for (const bool cold : { false, true }) {
+    SCOPED_TRACE(cold ? "arrives off the desktop" : "arrives on the desktop");
+    ASSERT_TRUE(healthy(reset_with(executor)));
+    platform.host = sole_virtual_primary();
+    platform.take_origin = true;
+    platform.create_inactive = cold;
+    platform.arrangements.clear();
+    const auto outcome = managed_prepare_with(executor);
+    ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok)) << outcome.reason;
+    EXPECT_EQ(state_of(platform.host, "pnk"), state_e::primary);
+    EXPECT_EQ(corner(platform.host, "pnk"), (dt::position_t { 0, 0 }));
+    EXPECT_EQ(state_of(platform.host, "vdd-" + std::to_string(platform.created)), state_e::active);
+    EXPECT_EQ(corner(platform.host, "vdd-" + std::to_string(platform.created)), (dt::position_t { 2560, 0 }));
+    EXPECT_EQ(state_of(platform.host, "os-A"), state_e::inactive) << "an off-desktop panel is not brought back";
+    ASSERT_EQ(platform.arrangements.size(), 1u);
+    EXPECT_TRUE(log.contains("arrange"));
+    EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+    EXPECT_EQ(platform.head_count(), 0u);
+    EXPECT_EQ(state_of(platform.host, "pnk"), state_e::primary);
+    EXPECT_EQ(corner(platform.host, "pnk"), (dt::position_t { 0, 0 }));
+    EXPECT_FALSE(store.bytes);
+  }
+}
+
+TEST_F(NativeExecutor, TwoHeadsBesideASoleVirtualPrimaryGoLeftToRightAfterIt) {
+  platform.host = sole_virtual_primary();
+  platform.take_origin = true;
+  platform.create_inactive = true;
+  const auto outcome = prepare_heads(executor);
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok)) << outcome.reason;
+  EXPECT_EQ(state_of(platform.host, "pnk"), state_e::primary);
+  EXPECT_EQ(corner(platform.host, "pnk"), (dt::position_t { 0, 0 }));
+  EXPECT_EQ(corner(platform.host, "vdd-1"), (dt::position_t { 2560, 0 }));
+  EXPECT_EQ(corner(platform.host, "vdd-2"), (dt::position_t { 2560 + 1920, 0 }));
+  EXPECT_EQ(outcome.targets.size(), 2u);
+}
+
+TEST_F(NativeExecutor, AHeadPushedBetweenTwoDisplaysIsMovedToTheRightEdge) {
+  platform.create_inactive = true;
+  platform.on_activate = [&](const dt::observed_display_t &head) -> dt::result_t<void> {
+    auto &target = find(platform.host, head.id.value);
+    target.info.device_state = state_e::active;
+    target.info.display_name = "\\\\.\\DISPLAY-" + head.id.value;
+    target.layout = display_topology_test::layout(1920);
+    find(platform.host, "os-B").layout->position.x = 3840;
+    return {};
+  };
+  const auto outcome = managed_prepare_with(executor);
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok)) << outcome.reason;
+  EXPECT_EQ(corner(platform.host, "os-B"), (dt::position_t { 1920, 0 }));
+  EXPECT_EQ(corner(platform.host, "vdd-1"), (dt::position_t { 3840, 0 }));
+  EXPECT_EQ(state_of(platform.host, "os-A"), state_e::primary);
+}
+
+TEST_F(NativeExecutor, ARolledBackHeadPutsADisplayItPushedAsideBack) {
+  platform.on_create = [&](std::size_t) -> dt::result_t<delivery_e> {
+    const auto name = platform.add_head();
+    find(platform.host, name).layout->position.x = 1920;
+    find(platform.host, "os-B").layout->position.x = 3840;
+    return delivery_e::accepted;
+  };
+  platform.on_arrange = [&](std::size_t call, const std::vector<dt::placement_t> &plan) -> dt::result_t<void> {
+    if (call > 1) platform.place(plan);
+    return {};
+  };
+  const auto outcome = managed_prepare_with(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::refused)) << outcome.reason;
+  EXPECT_EQ(platform.head_count(), 0u);
+  ASSERT_EQ(platform.arrangements.size(), 2u);
+  EXPECT_EQ(corner(platform.host, "os-B"), (dt::position_t { 1920, 0 }));
+  EXPECT_EQ(state_of(platform.host, "os-A"), state_e::primary);
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(NativeExecutor, AHeadThatReshapesAnotherDisplayIsRemovedWithoutPlacing) {
+  const std::vector<std::pair<std::string, std::function<void(dt::observed_display_t &)>>> cases {
+    { "mode", [](auto &display) { display.layout->mode = mode(2560, 1440); } },
+    { "hdr", [](auto &display) { display.layout->hdr = display_device::hdr_state_e::enabled; } },
+  };
+  for (const auto &[name, reshape] : cases) {
+    SCOPED_TRACE(name);
+    ASSERT_TRUE(healthy(reset_with(executor)));
+    platform.host = host_inventory();
+    platform.create_inactive = true;
+    platform.arrangements.clear();
+    platform.on_activate = [&, reshape = reshape](const dt::observed_display_t &head) -> dt::result_t<void> {
+      auto &target = find(platform.host, head.id.value);
+      target.info.device_state = state_e::active;
+      target.info.display_name = "\\\\.\\DISPLAY-" + head.id.value;
+      target.layout = display_topology_test::layout(3840);
+      reshape(find(platform.host, "os-B"));
+      return {};
+    };
+    const auto outcome = managed_prepare_with(executor);
+    EXPECT_FALSE(verdict_is(outcome, native_verdict_e::ok));
+    EXPECT_TRUE(mentions(outcome.reason, "changed other displays")) << outcome.reason;
+    EXPECT_TRUE(platform.arrangements.empty());
+    EXPECT_EQ(platform.head_count(), 0u);
+  }
+}
+
+TEST_F(NativeExecutor, PlacingThatTheDesktopIgnoresRemovesTheHeadAndPutsTheOthersBack) {
+  platform.host = sole_virtual_primary();
+  platform.take_origin = true;
+  platform.on_arrange = [&](std::size_t call, const std::vector<dt::placement_t> &plan) -> dt::result_t<void> {
+    if (call > 1) platform.place(plan);
+    return {};
+  };
+  const auto outcome = managed_prepare_with(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::refused)) << outcome.reason;
+  EXPECT_TRUE(mentions(outcome.reason, "did not restore them")) << outcome.reason;
+  EXPECT_EQ(platform.head_count(), 0u);
+  ASSERT_EQ(platform.arrangements.size(), 2u);
+  EXPECT_EQ(platform.arrangements.back(), (std::vector<dt::placement_t> { { dt::os_display_id_t { "pnk" }, { 0, 0 } } }));
+  EXPECT_EQ(state_of(platform.host, "pnk"), state_e::primary);
+  EXPECT_EQ(corner(platform.host, "pnk"), (dt::position_t { 0, 0 }));
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(NativeExecutor, PlacingThatReshapesADisplayRemovesTheHead) {
+  platform.host = sole_virtual_primary();
+  platform.take_origin = true;
+  platform.on_arrange = [&](std::size_t call, const std::vector<dt::placement_t> &plan) -> dt::result_t<void> {
+    platform.place(plan);
+    if (call == 1) find(platform.host, "pnk").layout->mode.resolution.width = 1920;
+    return {};
+  };
+  const auto outcome = managed_prepare_with(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::refused)) << outcome.reason;
+  EXPECT_TRUE(mentions(outcome.reason, "did not restore them")) << outcome.reason;
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(NativeExecutor, PlacingThatFailsKeepsTheJournalUntilARestorePutsTheOthersBack) {
+  platform.host = sole_virtual_primary();
+  platform.take_origin = true;
+  platform.on_arrange = [](std::size_t, const auto &) -> dt::result_t<void> { return failure("ccd busy"); };
+  const auto outcome = managed_prepare_with(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict)) << outcome.reason;
+  EXPECT_TRUE(mentions(outcome.reason, "placing the displays failed: ccd busy")) << outcome.reason;
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_TRUE(store.bytes) << "the primary is still displaced, so the journal stays";
+
+  platform.on_arrange = nullptr;
+  auto restarted = make_executor();
+  EXPECT_TRUE(healthy(recover_with(restarted)));
+  EXPECT_EQ(state_of(platform.host, "pnk"), state_e::primary);
+  EXPECT_EQ(corner(platform.host, "pnk"), (dt::position_t { 0, 0 }));
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(NativeExecutor, ARestoreWhoseRemovalDisplacesThePrimaryPutsItBack) {
+  platform.host = sole_virtual_primary();
+  ASSERT_TRUE(verdict_is(managed_prepare_with(executor), native_verdict_e::ok));
+  platform.on_remove = [&]() -> dt::result_t<void> {
+    platform.drop_heads();
+    auto &pnk = find(platform.host, "pnk");
+    pnk.layout->position = { 1920, 0 };
+    pnk.info.device_state = state_e::active;
+    return {};
+  };
+  platform.arrangements.clear();
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+  EXPECT_EQ(platform.arrangements.size(), 1u);
+  EXPECT_EQ(state_of(platform.host, "pnk"), state_e::primary);
+  EXPECT_EQ(corner(platform.host, "pnk"), (dt::position_t { 0, 0 }));
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(NativeExecutor, ARestoreLeavesDisplaysTheUserMovedWhereTheyAre) {
+  ASSERT_TRUE(verdict_is(managed_prepare_with(executor), native_verdict_e::ok));
+  find(platform.host, "os-B").layout->position = { 1920, 200 };
+  platform.arrangements.clear();
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+  EXPECT_TRUE(platform.arrangements.empty());
+  EXPECT_EQ(corner(platform.host, "os-B"), (dt::position_t { 1920, 200 }));
+}
+
+TEST_F(NativeExecutor, PlacingNeedsAPrepareRestoreOrRecoveryCapability) {
+  const std::vector<dt::placement_t> plan { { dt::os_display_id_t { "os-B" }, { 1920, 0 } } };
+  for (const bool managed_mode : { false, true }) {
+    for (const auto kind : { dt::command_kind_e::reconfigure, dt::command_kind_e::reset_persistence }) {
+      if (managed_mode && kind == dt::command_kind_e::reconfigure) continue;
+      SCOPED_TRACE(std::string { dt::to_string(kind) } + (managed_mode ? "/managed" : "/legacy"));
+      with_capability(kind, [&](const auto &capability) {
+        EXPECT_THROW((void) platform.arrange(capability, plan), dt::capability_error_t);
+      }, managed_mode);
+    }
+  }
+  EXPECT_TRUE(platform.arrangements.empty());
 }

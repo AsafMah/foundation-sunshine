@@ -64,6 +64,18 @@ namespace display_device::topology {
     accepted,
   };
 
+  /** Where one display's top-left corner goes on the host desktop (host pixels; 0,0 is the primary). */
+  struct placement_t {
+    os_display_id_t display;
+    position_t position;
+    bool
+    operator==(const placement_t &) const = default;
+  };
+
+  /** The operation that placing displays needs under a capability of `kind`. */
+  operation_e
+  arrange_operation(command_kind_e kind) noexcept;
+
   class native_platform_t {
   public:
     virtual ~native_platform_t() = default;
@@ -115,6 +127,15 @@ namespace display_device::topology {
     virtual result_t<void>
     activate_head(const mutation_capability_t &capability, const observed_display_t &head) final;
 
+    /**
+     * Move each listed desktop display's top-left corner to its placement in one desktop
+     * write, then wait (bounded) for them to be listed there. The display placed at 0,0
+     * becomes the primary. Modes, HDR and topology groups are not changed, and displays not
+     * listed keep their corners. An error leaves the applied state unknown.
+     */
+    virtual result_t<void>
+    arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements) final;
+
   protected:
     // Keep concrete hooks nonpublic and carry the capability through to raw setters.
     // The entry guards check authority, not proof that a head belongs to this request.
@@ -132,6 +153,9 @@ namespace display_device::topology {
 
     virtual result_t<void>
     do_activate_head(const mutation_capability_t &capability, const observed_display_t &head) = 0;
+
+    virtual result_t<void>
+    do_arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements) = 0;
   };
 
   enum class native_verdict_e : std::uint8_t {
@@ -264,6 +288,14 @@ namespace display_device::topology {
     native_outcome_t
     roll_back_heads(const mutation_capability_t &capability, const journal_record_t &record,
       const std::function<bool(const inventory_t &)> &proven, const std::string &why);
+
+    /**
+     * With no virtual display left, puts other displays back at their baseline corners when
+     * only corners or the primary drifted (`keep_moves`: only if the primary or a state did).
+     * nullopt when they match; otherwise why not, starting with `what`.
+     */
+    std::optional<std::string>
+    put_back(const mutation_capability_t &capability, const journal_record_t &record, inventory_t &after, const std::string &what, bool keep_moves);
 
     /** Point the journal's observed creation and owned head at `head` as listed in `after`. */
     mode_change_outcome_t
