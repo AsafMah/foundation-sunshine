@@ -252,6 +252,12 @@ namespace display_device::coordinated {
     return std::move(*done);
   }
 
+  std::uint8_t
+  display_group_max_heads() {
+    const auto &managed = native_binding();
+    return managed ? managed->group_max_heads() : 0;
+  }
+
   const std::string &
   latched_profile() {
     return latched().setting;

@@ -553,7 +553,7 @@ namespace display_device::topology {
     if (!monitor.is_object()) {
       return profile_error(error_code_e::invalid_profile, "a monitor must be a JSON object");
     }
-    if (const auto key = unknown_key(monitor, { "source", "display" })) {
+    if (const auto key = unknown_key(monitor, { "source", "display", "max_heads" })) {
       return profile_error(error_code_e::invalid_profile, "unknown monitor key \"" + *key + "\"");
     }
     if (!monitor.contains("source") || !monitor.at("source").is_string()) {
@@ -564,7 +564,22 @@ namespace display_device::topology {
       if (monitor.contains("display")) {
         return profile_error(error_code_e::invalid_profile, "a virtual monitor cannot name a display");
       }
-      return std::optional { native_profile_t { native_profile_t::source_e::virtual_head, {} } };
+      native_profile_t profile { native_profile_t::source_e::virtual_head, {} };
+      if (monitor.contains("max_heads")) {
+        const auto &value = monitor.at("max_heads");
+        if (!value.is_number_unsigned() || value.get<std::uint64_t>() == 0) {
+          return profile_error(error_code_e::invalid_profile, "\"max_heads\" must be a whole number of heads from 1");
+        }
+        if (value.get<std::uint64_t>() > max_virtual_heads) {
+          return profile_error(error_code_e::limit_exceeded,
+            "this version offers display groups of at most " + std::to_string(max_virtual_heads) + " heads");
+        }
+        profile.max_heads = static_cast<std::uint8_t>(value.get<std::uint64_t>());
+      }
+      return std::optional { profile };
+    }
+    if (monitor.contains("max_heads")) {
+      return profile_error(error_code_e::invalid_profile, "only a virtual monitor offers display groups (\"max_heads\")");
     }
     if (source != "physical") {
       return profile_error(error_code_e::invalid_profile, "unknown source \"" + source + "\"");
@@ -1504,6 +1519,27 @@ namespace display_device::topology {
       return { native_verdict_e::conflict, std::nullopt, unusable(profile_.error()) };
     }
     return executor_->prepare(capability, *profile_);
+  }
+
+  native_outcome_t
+  managed_native_t::prepare(const mutation_capability_t &capability, std::uint8_t heads) {
+    capability.require(operation_e::native_apply);
+    if (!profile_) {
+      return { native_verdict_e::conflict, std::nullopt, unusable(profile_.error()) };
+    }
+    if (heads == 0 || heads > group_max_heads()) {
+      return { native_verdict_e::refused, std::nullopt,
+        "The display profile offers display groups of at most " + std::to_string(group_max_heads()) + " heads, not " +
+          std::to_string(heads) };
+    }
+    auto profile = *profile_;
+    profile.virtual_heads = heads;
+    return executor_->prepare(capability, profile);
+  }
+
+  std::uint8_t
+  managed_native_t::group_max_heads() const noexcept {
+    return profile_ && profile_->source == native_profile_t::source_e::virtual_head ? profile_->max_heads : 0;
   }
 
   mode_change_outcome_t

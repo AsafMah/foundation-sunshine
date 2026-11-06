@@ -44,6 +44,11 @@ namespace display_device::topology {
      * only code (tests and the gated hardware kit) asks for them.
      */
     std::uint8_t virtual_heads { 1 };
+    /**
+     * Virtual only: the most heads a display-group launch may prepare (setting key
+     * `max_heads`, 1..max_virtual_heads). An ordinary launch still prepares `virtual_heads`.
+     */
+    std::uint8_t max_heads { 1 };
 
     bool
     operator==(const native_profile_t &) const = default;
@@ -365,6 +370,17 @@ namespace display_device::topology {
 
     native_outcome_t
     prepare(const mutation_capability_t &capability);
+
+    /**
+     * Prepare a display group of `heads` virtual heads, all or nothing. Refused, without
+     * touching the host, unless the profile is virtual and offers that many (`max_heads`).
+     */
+    native_outcome_t
+    prepare(const mutation_capability_t &capability, std::uint8_t heads);
+
+    /** The most heads a display-group launch may ask for: 0 without a usable virtual profile. */
+    std::uint8_t
+    group_max_heads() const noexcept;
 
     /** The executor's `change_mode`; refused without a usable profile. */
     mode_change_outcome_t

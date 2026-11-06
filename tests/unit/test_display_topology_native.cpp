@@ -864,6 +864,33 @@ TEST(NativeProfile, VirtualProfileIgnoresKeyOrderAndWhitespace) {
   EXPECT_TRUE(parsed->value() == virtual_profile());
 }
 
+TEST(NativeProfile, AVirtualMonitorMayOfferDisplayGroupsOfUpToTwoHeads) {
+  const auto offered = dt::parse_native_profile(R"({"version":1,"monitors":[{"source":"virtual","max_heads":2}]})");
+  ASSERT_TRUE(offered) << offered.error().detail;
+  ASSERT_TRUE(offered->has_value());
+  EXPECT_EQ(offered->value().max_heads, 2u);
+  EXPECT_EQ(offered->value().virtual_heads, 1u) << "an ordinary launch still prepares one head";
+
+  const auto single = dt::parse_native_profile(R"({"version":1,"monitors":[{"source":"virtual","max_heads":1}]})");
+  ASSERT_TRUE(single) << single.error().detail;
+  EXPECT_TRUE(single->value() == virtual_profile());
+}
+
+TEST(NativeProfile, RejectsAGroupHeadLimitItCannotHonour) {
+  using enum dt::error_code_e;
+  const std::vector<std::pair<std::string, dt::error_code_e>> cases {
+    { R"({"version":1,"monitors":[{"source":"virtual","max_heads":0}]})", invalid_profile },
+    { R"({"version":1,"monitors":[{"source":"virtual","max_heads":-2}]})", invalid_profile },
+    { R"({"version":1,"monitors":[{"source":"virtual","max_heads":2.0}]})", invalid_profile },
+    { R"({"version":1,"monitors":[{"source":"virtual","max_heads":"2"}]})", invalid_profile },
+    { R"({"version":1,"monitors":[{"source":"virtual","max_heads":3}]})", limit_exceeded },
+    { R"({"version":1,"monitors":[{"source":"physical","display":"os-A","max_heads":2}]})", invalid_profile },
+  };
+  for (const auto &[text, code] : cases) {
+    EXPECT_TRUE(error_is(dt::parse_native_profile(text), code)) << text;
+  }
+}
+
 TEST(NativeProfile, RejectsAnythingItCannotHonourExactly) {
   using enum dt::error_code_e;
   const std::vector<std::pair<std::string, dt::error_code_e>> cases {
@@ -3202,6 +3229,20 @@ namespace {
     with_capability(dt::command_kind_e::launch_prepare, [&](const auto &capability) { outcome = managed.prepare(capability); }, true);
     return outcome;
   }
+
+  dt::native_outcome_t
+  managed_prepare_group(dt::managed_native_t &managed, std::uint8_t heads) {
+    dt::native_outcome_t outcome;
+    with_capability(dt::command_kind_e::launch_prepare, [&](const auto &capability) { outcome = managed.prepare(capability, heads); }, true);
+    return outcome;
+  }
+
+  dt::native_profile_t
+  group_profile(std::uint8_t max_heads) {
+    auto profile = virtual_profile();
+    profile.max_heads = max_heads;
+    return profile;
+  }
 }  // namespace
 
 TEST_F(NativeExecutor, AnInvalidProfileIsInConflictFromConstructionAndAfterEveryEntryPoint) {
@@ -3283,6 +3324,49 @@ TEST_F(NativeExecutor, AValidPhysicalProfileTargetsExactlyThatDisplay) {
   ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok));
   EXPECT_TRUE(outcome.target == (dt::native_target_t { dt::os_display_id_t { "os-B" }, false }));
   EXPECT_EQ(log.host_writes(), 0u);
+}
+
+TEST_F(NativeExecutor, AGroupLaunchPreparesEveryHeadItsProfileOffers) {
+  platform.create_inactive = true;
+  platform.on_create = [&](std::size_t) -> dt::result_t<delivery_e> {
+    platform.add_head();
+    return delivery_e::accepted;
+  };
+  dt::managed_native_t managed { &executor, group_profile(2) };
+  EXPECT_EQ(managed.group_max_heads(), 2u);
+  const auto outcome = managed_prepare_group(managed, 2);
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok)) << outcome.reason;
+  EXPECT_TRUE((outcome.targets == std::vector<dt::native_target_t> {
+                { dt::os_display_id_t { "vdd-1" }, true }, { dt::os_display_id_t { "vdd-2" }, true } }));
+  EXPECT_EQ(platform.head_count(), 2u);
+  EXPECT_TRUE(healthy(managed_restore(managed)));
+  EXPECT_EQ(platform.head_count(), 0u);
+}
+
+TEST_F(NativeExecutor, AGroupLaunchBeyondWhatTheProfileOffersTouchesNothing) {
+  dt::managed_native_t single { &executor, virtual_profile() };
+  dt::managed_native_t physical { &executor, physical_profile("os-B") };
+  dt::managed_native_t invalid { &executor, invalid_setting() };
+  dt::managed_native_t offered { &executor, group_profile(2) };
+  EXPECT_EQ(single.group_max_heads(), 1u);
+  EXPECT_EQ(physical.group_max_heads(), 0u);
+  EXPECT_EQ(invalid.group_max_heads(), 0u);
+  EXPECT_TRUE(verdict_is(managed_prepare_group(single, 2), native_verdict_e::refused));
+  EXPECT_TRUE(verdict_is(managed_prepare_group(physical, 2), native_verdict_e::refused));
+  EXPECT_TRUE(verdict_is(managed_prepare_group(invalid, 2), native_verdict_e::conflict));
+  EXPECT_TRUE(verdict_is(managed_prepare_group(offered, 3), native_verdict_e::refused));
+  EXPECT_TRUE(verdict_is(managed_prepare_group(offered, 0), native_verdict_e::refused));
+  EXPECT_EQ(log.host_writes(), 0u);
+  EXPECT_EQ(store.saves, 0);
+}
+
+TEST_F(NativeExecutor, AnOrdinaryLaunchOfAGroupProfilePreparesOneHead) {
+  dt::managed_native_t managed { &executor, group_profile(2) };
+  const auto outcome = managed_prepare(managed);
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok)) << outcome.reason;
+  EXPECT_EQ(platform.head_count(), 1u);
+  EXPECT_TRUE((outcome.targets == std::vector<dt::native_target_t> { { dt::os_display_id_t { "vdd-1" }, true } }));
+  EXPECT_TRUE(healthy(managed_restore(managed)));
 }
 
 TEST_F(NativeExecutor, AValidProfileReportsAndResetsAnEarlierRunsJournal) {

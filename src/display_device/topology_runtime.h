@@ -28,6 +28,8 @@ namespace display_device::coordinated {
    * (`reconfigure`). Refused, without touching the head, when not admitted.
    */
   topology::native_mode_changed_t change_native_mode(std::uint32_t width, std::uint32_t height);
+  /** The most heads a display-group launch may ask for; 0 in legacy mode or without a usable virtual profile. */
+  std::uint8_t display_group_max_heads();
   /** The `display_topology_profile` this process latched; blank in legacy mode. */
   const std::string &latched_profile();
   /** Read-only admin report of the saved `display_topology_profile` against the one this process latched. */
