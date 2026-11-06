@@ -365,6 +365,12 @@ namespace nvhttp {
       return managed_;
     }
 
+    /** A display-group leader (/launch displayHeads=N, already validated) prepares all N heads. */
+    void
+    lead_display_group(std::uint8_t heads) {
+      display_heads_ = heads;
+    }
+
     /** A managed reference to an already prepared lease: capture its display, prepare nothing. */
     bool
     joiner() const {
@@ -408,10 +414,11 @@ namespace nvhttp {
           display_device::coordinated::coordinator(), *token_, {},
           []() { lifetime::force_terminate(EXIT_FAILURE); },
           {}, policy_,
-          [](const display_device::topology::mutation_capability_t &capability) {
-            return display_device::coordinated::prepare_native(capability);
+          [](const display_device::topology::mutation_capability_t &capability, std::uint8_t heads) {
+            return display_device::coordinated::prepare_native(capability, heads);
           },
-          cooldown, display_device::coordinated::latched_profile()
+          cooldown, display_device::coordinated::latched_profile(),
+          display_heads_, display_heads_ > 1 ? stream_start::random_display_group_id : std::function<display_device::topology::display_group_id_t()> {}
         };
       }
       return {
@@ -450,6 +457,7 @@ namespace nvhttp {
     display_device::automatic_vdd_policy_e policy_ { display_device::automatic_vdd_policy_e::suppress };
     bool bound_ {};
     bool managed_ {};
+    std::uint8_t display_heads_ {};
   };
 
   bool
@@ -738,6 +746,19 @@ namespace nvhttp {
       return;
     }
 
+    // GW display group: only a count the latched profile serves; a legacy or blank host serves none.
+    std::uint8_t display_heads {};
+    if (const auto requested = args.find("displayHeads"s); requested != std::end(args)) {
+      const auto heads = stream_start::parse_display_heads(requested->second, display_device::coordinated::display_group_max_heads());
+      if (!heads) {
+        tree.put("root.gamesession", 0);
+        tree.put("root.<xmlattr>.status_code", 400);
+        tree.put("root.<xmlattr>.status_message", "This host cannot serve the requested display group");
+        return;
+      }
+      display_heads = *heads;
+    }
+
     auto appid = util::from_view(get_arg(args, "appid"));
 
     auto current_appid = proc::proc.running();
@@ -797,6 +818,14 @@ namespace nvhttp {
       if (!display_launch.admit(tree, *launch_session, "gamesession")) {
         return;
       }
+      if (display_heads > 1 && display_launch.joiner()) {
+        // A leader prepares its own heads; it never joins a display another stream already holds.
+        tree.put("root.gamesession", 0);
+        tree.put("root.<xmlattr>.status_code", 409);
+        tree.put("root.<xmlattr>.status_message", "A display group cannot start while another stream holds the display");
+        return;
+      }
+      display_launch.lead_display_group(display_heads);
       if (display_launch.joiner()) {
         if (!display_launch.join(tree, *launch_session, "gamesession")) {
           return;
@@ -859,6 +888,9 @@ namespace nvhttp {
     tree.put("root.sessionUrl0", launch_session->rtsp_url_scheme +
                                    net::addr_to_url_escaped_string(request->local_endpoint().address()) + ':' +
                                    std::to_string(net::map_port(rtsp_stream::RTSP_SETUP_PORT)));
+    if (!launch_session->display_group.empty()) {
+      tree.put("root.displayGroup", launch_session->display_group);
+    }
     tree.put("root.gamesession", 1);
 
     try {

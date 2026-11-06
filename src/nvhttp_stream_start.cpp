@@ -23,6 +23,8 @@
 #include "video.h"
 
 #include <algorithm>
+#include <openssl/rand.h>
+#include <stdexcept>
 
 namespace nvhttp::stream_start {
 
@@ -108,9 +110,14 @@ namespace nvhttp::stream_start {
               !coordination_->cooldown || coordination_->cooldown_key.empty()) {
             throw std::invalid_argument { "Managed preparation requires managed ownership, a native prepare and a keyed cooldown, without legacy cleanup" };
           }
+          if (coordination_->display_heads > 1 &&
+              (coordination_->display_heads > topology::max_group_heads || !coordination_->group_id)) {
+            throw std::invalid_argument { "A display-group launch requires 2..8 heads and a group id source" };
+          }
         }
         else if (coordination_->coordinator.managed_mode() || coordination_->token.flavor != topology::launch_flavor_e::legacy ||
-                 !coordination_->legacy_cleanup || coordination_->managed_prepare || coordination_->cooldown) {
+                 !coordination_->legacy_cleanup || coordination_->managed_prepare || coordination_->cooldown ||
+                 coordination_->display_heads > 1) {
           throw std::invalid_argument { "Legacy preparation requires legacy ownership, cleanup and fatal supervision" };
         }
       }
@@ -130,11 +137,17 @@ namespace nvhttp::stream_start {
         return coordination_->cooldown_key;
       }
 
+      /** Heads this launch prepares: 1, or every head of the display group it leads. */
+      std::uint8_t
+      heads() const {
+        return std::max<std::uint8_t>(coordination_->display_heads, 1);
+      }
+
       topology::native_prepared_t
       prepare_native() {
         auto output = std::make_shared<std::optional<topology::native_prepared_t>>();
-        step([output, prepare = coordination_->managed_prepare](const auto &cap, const auto &) {
-          *output = prepare(cap);
+        step([output, prepare = coordination_->managed_prepare, heads = heads()](const auto &cap, const auto &) {
+          *output = prepare(cap, heads);
         });
         return std::move(output->value());
       }
@@ -142,6 +155,14 @@ namespace nvhttp::stream_start {
       bool
       record(const topology::managed_target_t &target) {
         return coordination_->coordinator.record_managed_display(coordination_->token, target);
+      }
+
+      /** Open the group this leader prepared; its id, or nothing when the coordinator refuses it. */
+      std::optional<topology::display_group_id_t>
+      open_group(const std::vector<topology::managed_target_t> &heads) {
+        const auto id = coordination_->group_id();
+        if (!coordination_->coordinator.open_display_group(coordination_->token, id, heads)) return std::nullopt;
+        return id;
       }
 
       std::chrono::steady_clock::time_point
@@ -879,6 +900,42 @@ namespace nvhttp::stream_start {
   }
 #endif
 
+  std::optional<std::uint8_t>
+  parse_display_heads(std::string_view value, std::uint8_t served) {
+    // Plain decimal only, no sign, space or leading zero: a malformed request is refused, never guessed.
+    if (value.empty() || value.size() > 3 || value.front() == '0' ||
+        !std::all_of(value.begin(), value.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+      return std::nullopt;
+    }
+    unsigned heads {};
+    for (const char c : value) heads = heads * 10 + static_cast<unsigned>(c - '0');
+    if (heads < 2 || heads > served || heads > display_device::topology::max_group_heads) return std::nullopt;
+    return static_cast<std::uint8_t>(heads);
+  }
+
+  std::string
+  display_group_hex(const display_device::topology::display_group_id_t &id) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string hex;
+    hex.reserve(id.size() * 2);
+    for (const auto byte : id) {
+      hex.push_back(digits[byte >> 4]);
+      hex.push_back(digits[byte & 0x0F]);
+    }
+    return hex;
+  }
+
+  display_device::topology::display_group_id_t
+  random_display_group_id() {
+    display_device::topology::display_group_id_t id {};
+    do {
+      if (RAND_bytes(id.data(), static_cast<int>(id.size())) != 1) {
+        throw std::runtime_error { "No random display group id is available" };
+      }
+    } while (id == display_device::topology::display_group_id_t {});
+    return id;
+  }
+
   static void
   adopt_managed_display(rtsp_stream::launch_session_t &launch_session, const display_device::topology::managed_target_t &target) {
     launch_session.env["SUNSHINE_CLIENT_DISPLAY_NAME"] = target.display;
@@ -940,6 +997,15 @@ namespace nvhttp::stream_start {
       set_managed_display_error(tree, reason);
       return false;
     }
+    const bool group = preparation.heads() > 1;
+    // All or nothing: a leader streams only when every head it asked for exists.
+    if (group && (prepared.heads.size() != preparation.heads() || prepared.heads.front() != *prepared.display)) {
+      const auto reason = "prepared " + std::to_string(prepared.heads.size()) + " of " +
+                          std::to_string(preparation.heads()) + " display group heads";
+      cooldown.fail(key, reason);
+      set_managed_display_error(tree, reason);
+      return false;
+    }
 #ifdef _WIN32
     start_touch_keyboard(launch_session);
 #endif
@@ -953,9 +1019,24 @@ namespace nvhttp::stream_start {
     if (!preparation.record(*prepared.display)) {
       throw preparation_error_t { { topology::outcome_e::rejected, topology::reject_reason_e::stale_transaction } };
     }
+    std::optional<topology::display_group_id_t> group_id;
+    if (group) {
+      try {
+        group_id = preparation.open_group(prepared.heads);
+      }
+      catch (const std::exception &failure) {
+        BOOST_LOG(warning) << "Display group id could not be generated: " << failure.what();
+        group_id.reset();
+      }
+      if (!group_id) {
+        set_managed_display_error(tree, "the display group could not be opened");
+        return false;
+      }
+    }
     cooldown.succeed(key);
     adopt_managed_display(launch_session, *prepared.display);
     carry_admission(launch_session, outcome);
+    if (group_id) launch_session.display_group = display_group_hex(*group_id);
     return true;
   }
 

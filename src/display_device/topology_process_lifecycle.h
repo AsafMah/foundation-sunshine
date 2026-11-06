@@ -83,8 +83,11 @@ namespace display_device::topology {
     std::function<native_health_t(const mutation_capability_t &)> restore;
     /** Administrator reset (`reset_persistence` authority). */
     std::function<native_health_t(const mutation_capability_t &)> reset;
-    /** Managed launch preparation (`launch_prepare` authority); `health` is published after it. */
-    std::function<native_prepared_t(const mutation_capability_t &)> prepare;
+    /**
+     * Managed launch preparation (`launch_prepare` authority) of `heads` heads: 1 for an
+     * ordinary launch, 2+ for a display-group leader. `health` is published after it.
+     */
+    std::function<native_prepared_t(const mutation_capability_t &, std::uint8_t heads)> prepare;
     /**
      * Optional: change the managed head's resolution (`native_mode` authority);
      * `health` is published after it. Absent refuses every mode change.
@@ -167,7 +170,7 @@ namespace display_device::topology {
      * also when the preparation throws (In conflict). Legacy mode refuses without running anything.
      */
     native_prepared_t
-    prepare_native(const mutation_capability_t &capability);
+    prepare_native(const mutation_capability_t &capability, std::uint8_t heads = 1);
 
     /**
      * Change the managed head's resolution under `capability` and publish the resulting

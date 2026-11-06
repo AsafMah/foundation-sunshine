@@ -251,13 +251,13 @@ namespace display_device::topology {
   }
 
   native_prepared_t
-  process_lifecycle_t::prepare_native(const mutation_capability_t &capability) {
+  process_lifecycle_t::prepare_native(const mutation_capability_t &capability, std::uint8_t heads) {
     if (!hooks_.native) {
       return { std::nullopt, "Managed display topology is not active" };
     }
     native_prepared_t prepared;
     try {
-      prepared = hooks_.native->prepare(capability);
+      prepared = hooks_.native->prepare(capability, heads);
     }
     catch (const std::exception &error) {
       prepared = { std::nullopt, std::string { "Native prepare failed: " } + error.what() };

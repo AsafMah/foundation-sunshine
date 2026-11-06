@@ -10,8 +10,11 @@
 #include "rtsp.h"
 
 #include <boost/property_tree/ptree.hpp>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 
 namespace nvhttp::stream_start {
 
@@ -31,11 +34,34 @@ namespace nvhttp::stream_start {
     display_device::topology::probe_thread_factory_t spawn_probe;
     /** The runtime's automatic-VDD policy, latched by the caller for this launch. */
     display_device::automatic_vdd_policy_e vdd_policy { display_device::automatic_vdd_policy_e::suppress };
-    std::function<display_device::topology::native_prepared_t(const display_device::topology::mutation_capability_t &)> managed_prepare;
+    /** Prepares `heads` heads (1, or display_heads for a group leader) under the launch_prepare capability. */
+    std::function<display_device::topology::native_prepared_t(const display_device::topology::mutation_capability_t &, std::uint8_t heads)> managed_prepare;
     /** Managed only, and required there: the failure cooldown and the profile target it is keyed on. */
     std::shared_ptr<launch_cooldown_t> cooldown;
     std::string cooldown_key;
+    /**
+     * Managed only: 2..max_group_heads makes this launch a display-group leader that
+     * prepares every head, all or nothing; 0 or 1 is an ordinary launch.
+     */
+    std::uint8_t display_heads {};
+    /** Required for a group leader: a fresh, never all-zero group id. */
+    std::function<display_device::topology::display_group_id_t()> group_id;
   };
+
+  /**
+   * The /launch displayHeads argument: plain decimal 2..`served` (and never beyond
+   * the wire limit), or nothing when the request must be refused.
+   */
+  std::optional<std::uint8_t>
+  parse_display_heads(std::string_view value, std::uint8_t served);
+
+  /** The group id as the client sees it: 32 lowercase hex digits, bytes in order. */
+  std::string
+  display_group_hex(const display_device::topology::display_group_id_t &id);
+
+  /** A cryptographically random group id that is never all zero. */
+  display_device::topology::display_group_id_t
+  random_display_group_id();
 
   void
   set_sunshine_error(

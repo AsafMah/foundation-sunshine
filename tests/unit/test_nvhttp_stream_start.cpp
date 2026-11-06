@@ -815,6 +815,7 @@ namespace {
     std::shared_ptr<std::atomic_int> restores = std::make_shared<std::atomic_int>();
     topology::native_prepared_t prepared { topology::managed_target_t { "{zako-head}", true }, {} };
     int prepares {};
+    std::vector<std::uint8_t> requested_heads;
     std::chrono::steady_clock::time_point now {};
     std::shared_ptr<nvhttp::stream_start::launch_cooldown_t> cooldown =
       std::make_shared<nvhttp::stream_start::launch_cooldown_t>([this] { return now; });
@@ -833,10 +834,11 @@ namespace {
     managed_route() {
       auto coordination = route();
       coordination.legacy_cleanup = {};
-      coordination.managed_prepare = [this](const topology::mutation_capability_t &cap) {
+      coordination.managed_prepare = [this](const topology::mutation_capability_t &cap, std::uint8_t heads) {
         cap.require(topology::operation_e::native_apply);
         EXPECT_TRUE(fake.on_worker());
         ++prepares;
+        requested_heads.push_back(heads);
         fake.events.push_back("native_prepare");
         return prepared;
       };
@@ -925,7 +927,7 @@ namespace {
   TEST_F(ManagedStreamStart, ThrowingPreparationRestoresAndPropagates) {
     managed();
     auto coordination = managed_route();
-    coordination.managed_prepare = [](const auto &) -> topology::native_prepared_t { throw std::runtime_error { "boom" }; };
+    coordination.managed_prepare = [](const auto &, std::uint8_t) -> topology::native_prepared_t { throw std::runtime_error { "boom" }; };
     EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination), std::runtime_error);
     settle();
     EXPECT_FALSE(coordinator->bind_launch(coordination.token));
@@ -1046,7 +1048,7 @@ namespace {
 
   TEST_F(CoordinatedStreamStart, LegacyBundlesCannotCarryAManagedPreparation) {
     auto coordination = route();
-    coordination.managed_prepare = [](const auto &) { return topology::native_prepared_t {}; };
+    coordination.managed_prepare = [](const auto &, std::uint8_t) { return topology::native_prepared_t {}; };
     EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination), std::invalid_argument);
     EXPECT_TRUE(coordinator->abort_launch(coordination.token, {}));
     auto with_cooldown = route();
@@ -1084,6 +1086,156 @@ namespace {
     EXPECT_TRUE(joiner.env.find("SUNSHINE_CLIENT_DISPLAY_NAME") == joiner.env.end());
     EXPECT_FALSE(joiner.video_admission);
     EXPECT_FALSE(fake.joiners_admitted[0].mode) << "no launch mode, no mode";
+  }
+}  // namespace
+
+// GW-H3b: a leader launch asking for displayHeads=N prepares every head, all or nothing.
+namespace {
+  const topology::display_group_id_t group_id {
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10
+  };
+  const topology::managed_target_t leader_head { "{zako-head}", true };
+  const topology::managed_target_t member_head { "{zako-head-2}", true };
+
+  class ManagedGroupLaunch: public ManagedStreamStart {
+  protected:
+    nvhttp::stream_start::launch_coordination_t
+    group_route(std::uint8_t heads = 2) {
+      auto coordination = managed_route();
+      coordination.display_heads = heads;
+      coordination.group_id = [] { return group_id; };
+      return coordination;
+    }
+  };
+
+  TEST_F(ManagedGroupLaunch, PreparesEveryHeadProbesTheLeadersAndOpensTheGroup) {
+    managed();
+    auto coordination = group_route();
+    prepared = { leader_head, {}, { leader_head, member_head } };
+    fake.probes = { probed(probe_error_e::none) };
+    ASSERT_TRUE(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination));
+    EXPECT_EQ(requested_heads, (std::vector<std::uint8_t> { 2 }));
+    ASSERT_EQ(fake.probed.size(), 1u) << "members are admitted when they join, not by the leader";
+    EXPECT_EQ(fake.probed[0].target.output_name, "{zako-head}");
+    EXPECT_EQ(client_display(), "{zako-head}");
+    EXPECT_TRUE(launch->display_exact);
+    EXPECT_EQ(launch->display_group, "0123456789abcdeffedcba9876543210");
+    EXPECT_EQ(coordinator->display_group(coordination.token), group_id);
+    ASSERT_TRUE(coordinator->status().lease);
+    EXPECT_EQ(coordinator->status().lease->group_heads, 2u);
+    EXPECT_TRUE(coordinator->bind_launch(coordination.token));
+    EXPECT_EQ(restores->load(), 0);
+  }
+
+  TEST_F(ManagedGroupLaunch, AnOrdinaryManagedLaunchPreparesOneHeadAndOpensNoGroup) {
+    managed();
+    auto coordination = managed_route();
+    prepared = { leader_head, {}, { leader_head } };
+    fake.probes = { probed(probe_error_e::none) };
+    ASSERT_TRUE(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination));
+    EXPECT_EQ(requested_heads, (std::vector<std::uint8_t> { 1 }));
+    EXPECT_TRUE(launch->display_group.empty());
+    EXPECT_FALSE(coordinator->display_group(coordination.token));
+    EXPECT_EQ(coordinator->status().lease->group_heads, 0u);
+    EXPECT_TRUE(coordinator->bind_launch(coordination.token));
+  }
+
+  TEST_F(ManagedGroupLaunch, FewerPreparedHeadsThanAskedIsA503BeforeProbingAndRestores) {
+    managed();
+    auto coordination = group_route();
+    prepared = { leader_head, {}, { leader_head } };
+    EXPECT_FALSE(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination));
+    settle();
+    events({ "native_prepare" });
+    EXPECT_EQ(tree.get<int>("root.<xmlattr>.status_code"), 503);
+    EXPECT_EQ(tree.get<std::string>("root.sunshine_error_code", "<none>"), "MANAGED_DISPLAY_UNAVAILABLE");
+    EXPECT_TRUE(launch->display_group.empty());
+    EXPECT_FALSE(launch->display_exact);
+    EXPECT_FALSE(launch->video_admission);
+    EXPECT_FALSE(coordinator->bind_launch(coordination.token));
+    EXPECT_EQ(restores->load(), 1);
+  }
+
+  TEST_F(ManagedGroupLaunch, AGroupThatCannotOpenIsA503AndRestores) {
+    managed();
+    auto coordination = group_route();
+    coordination.group_id = [] { return topology::display_group_id_t {}; };
+    prepared = { leader_head, {}, { leader_head, member_head } };
+    fake.probes = { probed(probe_error_e::none) };
+    EXPECT_FALSE(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination));
+    settle();
+    EXPECT_EQ(tree.get<int>("root.<xmlattr>.status_code"), 503);
+    EXPECT_TRUE(launch->display_group.empty());
+    EXPECT_FALSE(launch->display_exact) << "nothing is adopted for a group that is not open";
+    EXPECT_FALSE(launch->video_admission);
+    EXPECT_FALSE(coordinator->bind_launch(coordination.token));
+    EXPECT_EQ(restores->load(), 1);
+  }
+
+  TEST_F(ManagedGroupLaunch, AnIdSourceThatThrowsIsA503AndRestores) {
+    managed();
+    auto coordination = group_route();
+    coordination.group_id = []() -> topology::display_group_id_t { throw std::runtime_error("RAND_bytes failed"); };
+    prepared = { leader_head, {}, { leader_head, member_head } };
+    fake.probes = { probed(probe_error_e::none) };
+    bool ok = true;
+    EXPECT_NO_THROW(ok = nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination));
+    EXPECT_FALSE(ok);
+    settle();
+    EXPECT_EQ(tree.get<int>("root.<xmlattr>.status_code", 0), 503);
+    EXPECT_TRUE(launch->display_group.empty());
+    EXPECT_FALSE(launch->display_exact);
+    EXPECT_FALSE(launch->video_admission);
+    EXPECT_FALSE(coordinator->bind_launch(coordination.token));
+    EXPECT_EQ(restores->load(), 1);
+  }
+
+  TEST_F(ManagedGroupLaunch, GroupBundlesNeedAnIdSourceAndAServableHeadCount) {
+    managed();
+    auto coordination = group_route();
+    auto missing_id = coordination;
+    missing_id.group_id = {};
+    EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &missing_id), std::invalid_argument);
+    auto too_many = coordination;
+    too_many.display_heads = static_cast<std::uint8_t>(topology::max_group_heads + 1);
+    EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &too_many), std::invalid_argument);
+    EXPECT_EQ(prepares, 0);
+    EXPECT_TRUE(coordinator->abort_launch(coordination.token, {}));
+  }
+
+  TEST_F(CoordinatedStreamStart, LegacyBundlesCannotAskForADisplayGroup) {
+    auto coordination = route();
+    coordination.display_heads = 2;
+    EXPECT_THROW(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination), std::invalid_argument);
+    EXPECT_TRUE(fake.events.empty());
+    EXPECT_TRUE(coordinator->abort_launch(coordination.token, {}));
+  }
+
+  TEST(DisplayHeadsArgument, AcceptsOnlyAGroupTheHostServes) {
+    using nvhttp::stream_start::parse_display_heads;
+    EXPECT_EQ(parse_display_heads("2", 2), std::optional<std::uint8_t> { 2 });
+    EXPECT_EQ(parse_display_heads("8", 8), std::optional<std::uint8_t> { 8 });
+    EXPECT_FALSE(parse_display_heads("1", 2)) << "a group has at least two heads";
+    EXPECT_FALSE(parse_display_heads("0", 2));
+    EXPECT_FALSE(parse_display_heads("3", 2)) << "beyond what the profile offers";
+    EXPECT_FALSE(parse_display_heads("2", 0)) << "a host that offers no groups serves none";
+    EXPECT_FALSE(parse_display_heads("2", 1));
+    EXPECT_FALSE(parse_display_heads("9", 9)) << "never beyond the wire limit";
+    for (const auto *bad : { "", "-2", "+2", " 2", "2 ", "2x", "0x2", "02", "256", "4294967298" }) {
+      EXPECT_FALSE(parse_display_heads(bad, 8)) << '"' << bad << '"';
+    }
+  }
+
+  TEST(DisplayGroupId, IsThirtyTwoLowercaseHexDigitsInByteOrder) {
+    EXPECT_EQ(nvhttp::stream_start::display_group_hex(group_id), "0123456789abcdeffedcba9876543210");
+    EXPECT_EQ(nvhttp::stream_start::display_group_hex(topology::display_group_id_t {}), std::string(32, '0'));
+  }
+
+  TEST(DisplayGroupId, ARandomIdIsNeverAllZero) {
+    for (int i = 0; i < 64; ++i) {
+      EXPECT_NE(nvhttp::stream_start::random_display_group_id(), topology::display_group_id_t {});
+    }
+    EXPECT_NE(nvhttp::stream_start::random_display_group_id(), nvhttp::stream_start::random_display_group_id());
   }
 }  // namespace
 

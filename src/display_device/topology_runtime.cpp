@@ -106,8 +106,9 @@ namespace display_device::coordinated {
         [managed](const auto &capability) { return managed->recover(capability); },
         [managed](const auto &capability) { return managed->restore(capability); },
         [managed](const auto &capability) { return managed->reset(capability); },
-        [managed](const auto &capability) {
-          auto outcome = managed->prepare(capability);
+        [managed](const auto &capability, std::uint8_t heads) {
+          // One head is an ordinary launch of any valid profile; a group needs the profile's offer.
+          auto outcome = heads <= 1 ? managed->prepare(capability) : managed->prepare(capability, heads);
           if (outcome.verdict != topology::native_verdict_e::ok || !outcome.target) {
             auto reason = std::string { topology::to_string(outcome.verdict) };
             if (!outcome.reason.empty()) {
@@ -236,8 +237,8 @@ namespace display_device::coordinated {
   }
 
   topology::native_prepared_t
-  prepare_native(const topology::mutation_capability_t &capability) {
-    return lifecycle().prepare_native(capability);
+  prepare_native(const topology::mutation_capability_t &capability, std::uint8_t heads) {
+    return lifecycle().prepare_native(capability, heads);
   }
 
   topology::native_mode_changed_t

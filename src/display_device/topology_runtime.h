@@ -22,7 +22,7 @@ namespace display_device::coordinated {
   void shutdown_restore();
   void shutdown_vdd_destroy();
   /** Managed launches only: prepare the latched native profile on the topology worker. */
-  topology::native_prepared_t prepare_native(const topology::mutation_capability_t &capability);
+  topology::native_prepared_t prepare_native(const topology::mutation_capability_t &capability, std::uint8_t heads = 1);
   /**
    * Managed streams only: change the managed head's resolution on the topology worker
    * (`reconfigure`). Refused, without touching the head, when not admitted.

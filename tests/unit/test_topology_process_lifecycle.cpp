@@ -161,6 +161,7 @@ namespace display_device::topology {
       std::function<void()> native_restore_extra;
       native_prepared_t native_prepared { managed_target_t { "{zako-head}", true }, {} };
       std::function<void()> native_prepare_extra;
+      std::vector<std::uint8_t> native_prepare_heads;
 
       ~fixture_t() {
         observation = process_observation_e::exited;
@@ -273,9 +274,10 @@ namespace display_device::topology {
           saw(capability.kind(), "native_reset");
           return native_reset;
         };
-        result.prepare = [this](const mutation_capability_t &capability) {
+        result.prepare = [this](const mutation_capability_t &capability, std::uint8_t heads) {
           capability.require(operation_e::native_apply);
           saw(capability.kind(), "native_prepare");
+          native_prepare_heads.push_back(heads);
           if (native_prepare_extra) native_prepare_extra();
           return native_prepared;
         };
@@ -729,14 +731,14 @@ namespace display_device::topology {
       };
 
       prepared_in_launch_t
-      prepare_in_launch(process_lifecycle_t &lifecycle) {
+      prepare_in_launch(process_lifecycle_t &lifecycle, std::uint8_t heads = 1) {
         auto &coordinator = lifecycle.coordinator();
         const auto admission = coordinator.admit_launch({ 7, "cert:a" });
         EXPECT_TRUE(admission) << to_string(admission.reason);
         prepared_in_launch_t result;
         if (admission) {
           EXPECT_TRUE(coordinator.run_launch_prepare(*admission.token, [&](const mutation_capability_t &capability, const command_context_t &) {
-            result.prepared = lifecycle.prepare_native(capability);
+            result.prepared = lifecycle.prepare_native(capability, heads);
             result.published = coordinator.status().native;
           }).completed());
           coordinator.abort_launch(*admission.token, {});
@@ -756,6 +758,15 @@ namespace display_device::topology {
       const auto events = f.log.events();
       EXPECT_EQ(std::count(events.begin(), events.end(), "native_prepare"), 1);
       EXPECT_TRUE(same_health(published, f.native_initial)) << "the prepare's journal is published before the launch proceeds";
+    }
+
+    TEST(ProcessLifecycleManaged, PrepareNativeForwardsTheRequestedHeadCount) {
+      fixture_t f;
+      auto &lifecycle = f.make_managed();
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      EXPECT_TRUE(prepare_in_launch(lifecycle, 2).prepared.display);
+      EXPECT_TRUE(prepare_in_launch(lifecycle).prepared.display);
+      EXPECT_EQ(f.native_prepare_heads, (std::vector<std::uint8_t> { 2, 1 }));
     }
 
     TEST(ProcessLifecycleManaged, ARefusedNativePrepareHasNoTargetAndKeepsItsReason) {

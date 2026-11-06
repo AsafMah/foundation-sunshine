@@ -84,6 +84,8 @@ namespace rtsp_stream {
     // Managed topology: the admission the launch's probe granted, committed when
     // the stream's capture attaches. Null for legacy launches.
     std::shared_ptr<video::admission_ticket_t> video_admission;
+    // Managed display-group leader only: the group id as 32 lowercase hex digits.
+    std::string display_group;
     bool host_audio;
     std::string unique_id;
     std::string client_name;
