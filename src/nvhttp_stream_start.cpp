@@ -1272,6 +1272,54 @@ namespace nvhttp::stream_start {
   }
 
   bool
+  apply_member_mode(pt::ptree &tree, topology::coordinator_t &coordinator, const topology::launch_token_t &token,
+    const display_group_join_t &join, int width, int height, const head_mode_change_t &change) {
+    if (width <= 0 || height <= 0) {
+      return true;
+    }
+    const auto refuse = [&](const std::string &reason) {
+      BOOST_LOG(info) << "Display group head " << join.head << " could not take " << width << 'x' << height
+                      << "; the member join is refused: " << reason;
+      set_sunshine_error(tree, 503, "The display group member's mode could not be applied: " + reason,
+        "DISPLAY_GROUP_REFUSED", "Retry after the current display operation completes.", "retry_launch",
+        "display", "display_group", true);
+      return false;
+    };
+    topology::native_mode_changed_t changed;
+    try {
+      changed = change(join.head, static_cast<std::uint32_t>(width), static_cast<std::uint32_t>(height));
+    }
+    catch (const std::exception &e) {
+      return refuse(e.what());
+    }
+    catch (...) {
+      return refuse("unknown failure");
+    }
+    switch (changed.verdict) {
+      case topology::native_mode_verdict_e::applied:
+      case topology::native_mode_verdict_e::unchanged:
+        break;
+      case topology::native_mode_verdict_e::refused:
+        BOOST_LOG(info) << "Display group head " << join.head << " keeps its mode; " << width << 'x' << height
+                        << " was refused (the encoder scales): " << changed.reason;
+        return true;
+      case topology::native_mode_verdict_e::conflict:
+      default:
+        return refuse(changed.reason.empty() ? std::string { "mode change conflict" } : changed.reason);
+    }
+    if (!changed.display.empty()) {
+      const auto current = coordinator.managed_display(token);
+      if (!current || current->display != changed.display) {
+        if (!coordinator.retarget_group_head(token, { changed.display, true })) {
+          return refuse("the re-created head " + changed.display + " cannot join the group");
+        }
+        BOOST_LOG(info) << "Display group head " << join.head << " was re-created as " << changed.display;
+      }
+    }
+    return true;
+  }
+
+  bool
   join_managed_display(pt::ptree &tree, rtsp_stream::launch_session_t &launch_session, topology::coordinator_t &coordinator,
     const topology::launch_token_t &token) {
     const auto target = coordinator.managed_display(token);

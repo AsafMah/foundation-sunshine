@@ -2168,9 +2168,9 @@ namespace stream {
             session->config.monitor.display_name,
             [](auto &&body) { return stream::session::run_display_reconfiguration_if_single_video_session(body); },
             [&ticket](std::uint32_t w, std::uint32_t h) { return video::reserve_replacement(ticket, w, h); },
-            [](std::uint32_t w, std::uint32_t h) {
+            [session](std::uint32_t w, std::uint32_t h) {
               namespace topology = display_device::topology;
-              const auto changed = display_device::coordinated::change_native_mode(w, h);
+              const auto changed = display_device::coordinated::change_session_native_mode(session->launch_session_id, w, h);
               dm::head_change_t head;
               switch (changed.verdict) {
                 case topology::native_mode_verdict_e::applied:

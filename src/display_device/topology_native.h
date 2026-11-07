@@ -386,6 +386,10 @@ namespace display_device::topology {
     mode_change_outcome_t
     change_mode(const mutation_capability_t &capability, const resolution_t &resolution);
 
+    /** The executor's per-head `change_mode` (`head` in creation order); refused without a usable profile. */
+    mode_change_outcome_t
+    change_mode(const mutation_capability_t &capability, std::size_t head, const resolution_t &resolution);
+
   private:
     native_executor_t *executor_;
     result_t<native_profile_t> profile_;

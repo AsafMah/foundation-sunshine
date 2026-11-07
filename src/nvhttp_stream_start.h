@@ -5,6 +5,7 @@
 #pragma once
 
 #include "display_device/settings.h"
+#include "display_device/topology_process_lifecycle.h"
 #include "display_device/topology_routes.h"
 #include "nvhttp_launch_cooldown.h"
 #include "rtsp.h"
@@ -94,6 +95,26 @@ namespace nvhttp::stream_start {
     display_device::topology::coordinator_t &coordinator,
     const display_device::topology::launch_request_t &request,
     const display_group_join_t &join);
+
+  /** Changes the resolution of one head of the managed set (head, width, height). */
+  using head_mode_change_t = std::function<display_device::topology::native_mode_changed_t(std::size_t, std::uint32_t, std::uint32_t)>;
+
+  /**
+   * GW-H3d: apply a joining member's requested mode (`mode=` WxH) to its own head, before
+   * its capture is admitted. No mode, applied or unchanged joins. A refusal keeps the
+   * head's mode (the encoder scales) and still joins. A conflict or a throw refuses the
+   * join with 503 DISPLAY_GROUP_REFUSED. A head the driver re-created is retargeted in
+   * the group; if the group cannot follow it the join is refused the same way.
+   */
+  bool
+  apply_member_mode(
+    boost::property_tree::ptree &tree,
+    display_device::topology::coordinator_t &coordinator,
+    const display_device::topology::launch_token_t &token,
+    const display_group_join_t &join,
+    int width,
+    int height,
+    const head_mode_change_t &change);
 
   void
   set_sunshine_error(

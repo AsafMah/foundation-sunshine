@@ -1551,6 +1551,15 @@ namespace display_device::topology {
     return executor_->change_mode(capability, resolution);
   }
 
+  mode_change_outcome_t
+  managed_native_t::change_mode(const mutation_capability_t &capability, std::size_t head, const resolution_t &resolution) {
+    capability.require(operation_e::native_mode);
+    if (!profile_) {
+      return { mode_change_verdict_e::refused, std::nullopt, unusable(profile_.error()) };
+    }
+    return executor_->change_mode(capability, head, resolution);
+  }
+
   std::shared_ptr<managed_native_t>
   bind_native_profile(std::string_view setting, const native_executor_factory_t &make_executor) {
     auto parsed = parse_native_profile(setting);

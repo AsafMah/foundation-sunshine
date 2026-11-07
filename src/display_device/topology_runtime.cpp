@@ -128,8 +128,9 @@ namespace display_device::coordinated {
           }
           return prepared;
         },
-        [managed](const auto &capability, std::uint32_t width, std::uint32_t height) {
-          auto outcome = managed->change_mode(capability, resolution_t { width, height });
+        [managed](const auto &capability, std::size_t head, std::uint32_t width, std::uint32_t height) {
+          // Per head: with one owned head this is exactly the single-head change.
+          auto outcome = managed->change_mode(capability, head, resolution_t { width, height });
           topology::native_mode_changed_t changed;
           switch (outcome.verdict) {
             case topology::mode_change_verdict_e::applied:
@@ -242,15 +243,8 @@ namespace display_device::coordinated {
   }
 
   topology::native_mode_changed_t
-  change_native_mode(std::uint32_t width, std::uint32_t height) {
-    auto done = topology::run_for_value(coordinator(), topology::command_kind_e::reconfigure,
-      [width, height](const topology::mutation_capability_t &capability) {
-        return lifecycle().change_native_mode(capability, width, height);
-      });
-    if (!done) {
-      return { topology::native_mode_verdict_e::refused, {}, "not run: " + done.error().detail };
-    }
-    return std::move(*done);
+  change_session_native_mode(std::uint32_t launch_session_id, std::uint32_t width, std::uint32_t height) {
+    return lifecycle().change_session_native_mode(launch_session_id, width, height);
   }
 
   std::uint8_t

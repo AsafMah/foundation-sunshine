@@ -1653,6 +1653,11 @@ namespace {
       }
       EXPECT_EQ(calls[command].load(), expected_cleanup_kinds.contains(command) ? 1 : 0) << to_string(command);
     }
+    std::atomic_int managed_reconfigures {};
+    EXPECT_EQ(coordinator.run_managed_reconfigure(61, [&](const auto &, const auto &, std::size_t) { ++managed_reconfigures; }).reason,
+      reject_reason_e::managed_session)
+      << "the lease's own reconfigure is refused too while it is preparing";
+    EXPECT_EQ(managed_reconfigures.load(), 0);
   }
 
   TEST(DisplayTopologyCoordinator, LegacyLeaseLeavesOtherRoutesSerializedButAllowed) {
@@ -5373,6 +5378,210 @@ namespace {
     EXPECT_EQ(coordinator.managed_display(*second), three_heads[2]);
     EXPECT_EQ(coordinator.managed_display(fixture.leader), three_heads[0]);
     EXPECT_EQ(coordinator.status().lease->attachments, 3u);
+  }
+
+  TEST(DisplayTopologyGroup, AMembersRecreatedHeadIsFollowedByTheGroupAndNothingElse) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open());
+    auto &coordinator = *fixture.coordinator;
+    const auto join = coordinator.admit_group_join({ 740, "cert:a" }, group_a, 1);
+    ASSERT_TRUE(join);
+    const managed_target_t recreated { "{recreated-head-1}", true };
+    EXPECT_FALSE(coordinator.retarget_group_head(fixture.leader, recreated)) << "the leader's head is not a member's";
+    EXPECT_FALSE(coordinator.retarget_group_head(*join.token, { "", true })) << "an empty display is never a head";
+    EXPECT_FALSE(coordinator.retarget_group_head(*join.token, three_heads[0])) << "heads stay distinct";
+    EXPECT_FALSE(coordinator.retarget_group_head(*join.token, three_heads[2])) << "heads stay distinct";
+    auto stale = *join.token;
+    ++stale.transaction;
+    EXPECT_FALSE(coordinator.retarget_group_head(stale, recreated));
+    EXPECT_EQ(coordinator.managed_display(*join.token), three_heads[1]);
+
+    ASSERT_TRUE(coordinator.retarget_group_head(*join.token, recreated));
+    EXPECT_EQ(coordinator.managed_display(*join.token), recreated);
+    EXPECT_EQ(coordinator.managed_display(fixture.leader), three_heads[0]);
+    EXPECT_TRUE(coordinator.retarget_group_head(*join.token, recreated)) << "following the same display again is harmless";
+
+    ASSERT_TRUE(coordinator.bind_launch(*join.token));
+    ASSERT_TRUE(coordinator.launch_activated(*join.token));
+    ASSERT_TRUE(coordinator.end_managed_launch(fixture.leader));
+    EXPECT_FALSE(coordinator.retarget_group_head(*join.token, { "{after-the-end}", true })) << "an ended group never changes";
+  }
+
+  /** A managed reconfigure that records "session:head" for each body that ran. */
+  command_result_t
+  reconfigure_as(coordinator_t &coordinator, std::uint32_t session, std::vector<std::string> &ran) {
+    return coordinator.run_managed_reconfigure(session,
+      [&ran, session](const mutation_capability_t &capability, const command_context_t &, std::size_t head) {
+        capability.require(operation_e::native_mode);
+        ran.push_back(std::to_string(session) + ":" + std::to_string(head));
+      });
+  }
+
+  TEST(DisplayTopologyGroup, OnlyTheManagedLeasesOwnSessionsReconfigureAndOnlyTheirOwnHead) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open());
+    auto &coordinator = *fixture.coordinator;
+    ASSERT_TRUE(fixture.member(740, 1));
+    const auto joining = coordinator.admit_group_join({ 741, "cert:a" }, group_a, 2);
+    ASSERT_TRUE(joining);
+    std::vector<std::string> ran;
+
+    EXPECT_TRUE(reconfigure_as(coordinator, 700, ran).completed()) << "the leader";
+    EXPECT_TRUE(reconfigure_as(coordinator, 740, ran).completed()) << "an active member";
+    EXPECT_TRUE(reconfigure_as(coordinator, 741, ran).completed()) << "a joining member, before its capture is admitted";
+    EXPECT_EQ(ran, (std::vector<std::string> { "700:0", "740:1", "741:2" })) << "each on its own head";
+
+    const auto stranger = reconfigure_as(coordinator, 999, ran);
+    EXPECT_EQ(stranger.outcome, outcome_e::rejected);
+    EXPECT_EQ(stranger.reason, reject_reason_e::managed_session) << "not a reference of this lease";
+    std::atomic_int other {};
+    EXPECT_EQ(coordinator.run(command_kind_e::reconfigure, counting(other)).reason, reject_reason_e::managed_session)
+      << "a session-less reconfigure stays refused";
+    EXPECT_EQ(coordinator.post(command_kind_e::reconfigure, counting(other)), reject_reason_e::managed_session);
+
+    ASSERT_TRUE(coordinator.end_managed_launch(fixture.leader));
+    const auto after_end = reconfigure_as(coordinator, 740, ran);
+    EXPECT_EQ(after_end.outcome, outcome_e::rejected) << "a member of an ended group changes nothing";
+    EXPECT_EQ(reconfigure_as(coordinator, 700, ran).outcome, outcome_e::rejected) << "the ended leader is no reference";
+    ASSERT_TRUE(flush(coordinator).completed());
+    EXPECT_EQ(other.load(), 0);
+    EXPECT_EQ(ran.size(), 3u);
+  }
+
+  TEST(DisplayTopologyCoordinator, APreparingLeaseIsNeverReconfigured) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock, true) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    std::vector<std::string> ran;
+    EXPECT_EQ(reconfigure_as(coordinator, 63, ran).reason, reject_reason_e::stale_transaction) << "no managed lease";
+
+    const auto owner = coordinator.admit_launch({ 63, "cert:a" });
+    ASSERT_TRUE(owner);
+    EXPECT_EQ(reconfigure_as(coordinator, 63, ran).reason, reject_reason_e::managed_session) << "admitted";
+    ASSERT_TRUE(coordinator.run_launch_prepare(*owner.token, {}).completed());
+    ASSERT_TRUE(coordinator.record_managed_display(*owner.token, { "{head}", true }));
+    EXPECT_EQ(reconfigure_as(coordinator, 63, ran).reason, reject_reason_e::managed_session) << "prepared is not bound";
+    EXPECT_TRUE(ran.empty());
+
+    ASSERT_TRUE(coordinator.bind_launch(*owner.token));
+    EXPECT_TRUE(reconfigure_as(coordinator, 63, ran).completed()) << "bound";
+    ASSERT_TRUE(coordinator.launch_activated(*owner.token));
+    EXPECT_TRUE(reconfigure_as(coordinator, 63, ran).completed()) << "active";
+    EXPECT_EQ(ran, (std::vector<std::string> { "63:0", "63:0" }));
+  }
+
+  TEST(DisplayTopologyCoordinator, ALegacyLeaseHasNoManagedReconfigure) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    ASSERT_TRUE(coordinator.admit_launch({ 64, "cert:a" }));
+    std::vector<std::string> ran;
+    EXPECT_EQ(reconfigure_as(coordinator, 64, ran).reason, reject_reason_e::stale_transaction);
+    EXPECT_TRUE(ran.empty());
+  }
+
+  /**
+   * Queue the leader's managed reconfigure behind a blocked worker, run `meanwhile` while it
+   * waits, then let it dequeue. Returns its result; `ran` records any body that ran.
+   */
+  command_result_t
+  reconfigure_after(group_fixture_t &fixture, std::vector<std::string> &ran, const std::function<void()> &meanwhile) {
+    auto &coordinator = *fixture.coordinator;
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    EXPECT_EQ(coordinator.post(command_kind_e::stream_restore, [&](const auto &, const auto &) {
+      entered.set_value();
+      released.wait();
+    }), reject_reason_e::none);
+    entered.get_future().wait();
+
+    const auto before = coordinator.status().submitted_commands;
+    auto queued = std::async(std::launch::async, [&]() { return reconfigure_as(coordinator, 700, ran); });
+    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    while (coordinator.status().submitted_commands == before && queued.wait_for(0s) != std::future_status::ready &&
+           std::chrono::steady_clock::now() < give_up) {
+      std::this_thread::yield();
+    }
+    if (coordinator.status().submitted_commands == before) {
+      release.set_value();
+      ADD_FAILURE() << "the managed reconfigure was never queued";
+      return queued.get();
+    }
+    meanwhile();
+    release.set_value();
+    return queued.get();
+  }
+
+  TEST(DisplayTopologyGroup, AManagedReconfigureQueuedBehindItsReferencesEndNeverRuns) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open());
+    std::vector<std::string> ran;
+    const auto result = reconfigure_after(fixture, ran, [&]() {
+      ASSERT_TRUE(fixture.coordinator->end_managed_launch(fixture.leader));
+      ASSERT_TRUE(fixture.coordinator->status().lease) << "a live stream keeps the lease";
+    });
+    EXPECT_EQ(result.outcome, outcome_e::rejected);
+    EXPECT_EQ(result.reason, reject_reason_e::managed_session);
+    EXPECT_TRUE(ran.empty()) << "admitted at submission, refused when dequeued";
+  }
+
+  TEST(DisplayTopologyGroup, AManagedReconfigureQueuedBehindItsLeasesRestoreNeverRuns) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open());
+    std::vector<std::string> ran;
+    const auto result = reconfigure_after(fixture, ran, [&]() {
+      fixture.streams = 0;
+      ASSERT_TRUE(fixture.coordinator->end_managed_launch(fixture.leader));
+      fixture.clock.advance(1000ms);
+      fixture.coordinator->tick();
+      ASSERT_FALSE(fixture.coordinator->status().lease) << "the idle lease was released";
+    });
+    EXPECT_EQ(result.outcome, outcome_e::rejected);
+    EXPECT_EQ(result.reason, reject_reason_e::stale_transaction);
+    EXPECT_TRUE(ran.empty()) << "admitted at submission, refused when dequeued";
+  }
+
+  TEST(DisplayTopologyGroup, AnExpiredJoiningMemberIsNeverReconfigured) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open());
+    auto &coordinator = *fixture.coordinator;
+    ASSERT_TRUE(coordinator.admit_group_join({ 742, "cert:a" }, group_a, 1));
+    std::vector<std::string> ran;
+    fixture.clock.advance(1h);
+    const auto expired = reconfigure_as(coordinator, 742, ran);
+    EXPECT_EQ(expired.outcome, outcome_e::rejected);
+    EXPECT_EQ(expired.reason, reject_reason_e::managed_session) << "a join past its setup deadline is no reference";
+    EXPECT_TRUE(ran.empty());
+  }
+
+  TEST(DisplayTopologyGroup, AJoiningMemberThatExpiresWhileQueuedIsNeverReconfigured) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open());
+    auto &coordinator = *fixture.coordinator;
+    ASSERT_TRUE(coordinator.admit_group_join({ 743, "cert:a" }, group_a, 1));
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto released = release.get_future().share();
+    ASSERT_EQ(coordinator.post(command_kind_e::stream_restore, [&](const auto &, const auto &) {
+      entered.set_value();
+      released.wait();
+    }), reject_reason_e::none);
+    entered.get_future().wait();
+    const auto before = coordinator.status().submitted_commands;
+    std::vector<std::string> ran;
+    auto queued = std::async(std::launch::async, [&]() { return reconfigure_as(coordinator, 743, ran); });
+    const auto give_up = std::chrono::steady_clock::now() + 10s;
+    while (coordinator.status().submitted_commands == before && queued.wait_for(0s) != std::future_status::ready &&
+           std::chrono::steady_clock::now() < give_up) {
+      std::this_thread::yield();
+    }
+    fixture.clock.advance(1h);
+    release.set_value();
+    const auto result = queued.get();
+    EXPECT_EQ(result.outcome, outcome_e::rejected);
+    EXPECT_EQ(result.reason, reject_reason_e::managed_session);
+    EXPECT_TRUE(ran.empty()) << "the join expired while the command waited";
   }
 
   TEST(DisplayTopologyGroup, AnAnonymousLeadersGroupNeverAdmitsAnAnonymousMember) {

@@ -535,6 +535,30 @@ namespace display_device::topology {
     std::optional<display_group_id_t>
     display_group(const launch_token_t &token);
 
+    /**
+     * A member changed its own head's mode and the driver re-created that head as
+     * `display`: the group follows it. Only a live member reference (head 1..N-1) of a
+     * live group, for a non-empty display distinct from every other head. Returns false
+     * otherwise, leaving the group unchanged.
+     */
+    bool
+    retarget_group_head(const launch_token_t &token, managed_target_t display);
+
+    /** A managed reconfigure body, given the head its reference streams (0-based creation order). */
+    using managed_reconfigure_body_t = std::function<void(const mutation_capability_t &, const command_context_t &, std::size_t head)>;
+
+    /**
+     * The one reconfigure a managed lease admits: a mode change of the head a live reference
+     * of that lease streams, by that reference's launch session. The head comes from the
+     * reference, never from the caller. Refused (`managed_session`) while the lease is still
+     * preparing, for a session that is not exactly one reference of it, or for a member of an
+     * ended group; `stale_transaction` without a managed lease. Re-checked when dequeued: a
+     * restored or replaced lease is `stale_transaction` and the body never runs. Every other
+     * non-cleanup command stays refused under a managed lease.
+     */
+    command_result_t
+    run_managed_reconfigure(std::uint32_t launch_session_id, managed_reconfigure_body_t body);
+
     /** Consume a bound reference, under the ticket lock before removing its ticket. */
     bool
     launch_activated(const launch_token_t &token);
@@ -781,6 +805,10 @@ namespace display_device::topology {
 
     reject_reason_e
     evaluate_locked(command_kind_e kind, std::optional<std::uint64_t> transaction, bool legacy_restore_pending);
+
+    /** run_managed_reconfigure's admission; `transaction` is set when re-checking at dequeue. */
+    reject_reason_e
+    managed_reconfigure_reason_locked(std::uint32_t launch_session_id, std::optional<std::uint64_t> transaction, std::size_t &head);
 
     reject_reason_e
     admission_reason_locked();

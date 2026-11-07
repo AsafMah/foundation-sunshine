@@ -188,6 +188,9 @@ namespace display_device::topology {
     std::shared_ptr<startup_restore_t> startup_restore;
     std::shared_ptr<external_startup_t> external_startup;
     bool holds_startup_fence {};
+    /** run_managed_reconfigure: the reference's session, and the head resolved when dequeued. */
+    std::optional<std::uint32_t> managed_session;
+    std::size_t managed_head {};
 
     void
     complete_posted(command_result_t result) {
@@ -461,7 +464,15 @@ namespace display_device::topology {
       reject_reason_e reason;
       {
         std::lock_guard lock { mutex_ };
-        reason = startup_preflight != reject_reason_e::none ? startup_preflight : evaluate_locked(kind, transaction, legacy_pending);
+        if (startup_preflight != reject_reason_e::none) {
+          reason = startup_preflight;
+        }
+        else if (state->managed_session) {
+          reason = managed_reconfigure_reason_locked(*state->managed_session, transaction, state->managed_head);
+        }
+        else {
+          reason = evaluate_locked(kind, transaction, legacy_pending);
+        }
         if (kind == command_kind_e::legacy_startup_restore && reason == reject_reason_e::none) {
           if (startup_restore_ != state->startup_restore) {
             reason = reject_reason_e::stale_transaction;
@@ -1116,6 +1127,85 @@ namespace display_device::topology {
       return std::nullopt;
     }
     return lease_->group->id;
+  }
+
+  bool
+  coordinator_t::retarget_group_head(const launch_token_t &token, managed_target_t display) {
+    std::lock_guard lock { mutex_ };
+    if (phase_ != coordinator_phase_e::running || stopping_ || display.display.empty()) {
+      return false;
+    }
+    auto *ref = find_attachment_locked(token);
+    if (!ref || ref->head == 0 || !lease_->group || lease_->group->ended || ref->head >= lease_->group->heads.size()) {
+      return false;
+    }
+    auto &heads = lease_->group->heads;
+    for (std::size_t i = 0; i < heads.size(); ++i) {
+      if (i != ref->head && heads[i].display == display.display) {
+        return false;
+      }
+    }
+    heads[ref->head] = std::move(display);
+    return true;
+  }
+
+  command_result_t
+  coordinator_t::run_managed_reconfigure(std::uint32_t launch_session_id, managed_reconfigure_body_t body) {
+    if (on_worker_thread()) {
+      return outcome(outcome_e::reentrant);
+    }
+    auto state = std::make_shared<command_state_t>();
+    state->managed_session = launch_session_id;
+    submission_t submission;
+    {
+      std::lock_guard lock { mutex_ };
+      std::size_t head {};
+      if (const auto reason = managed_reconfigure_reason_locked(launch_session_id, std::nullopt, head); reason != reject_reason_e::none) {
+        return rejected(reason);
+      }
+      // The head is re-derived, with the transaction, when the worker dequeues the command.
+      submission = submit_locked(command_kind_e::reconfigure, state,
+        [state, body = std::move(body)](const mutation_capability_t &capability, const command_context_t &context) {
+          if (body) {
+            body(capability, context, state->managed_head);
+          }
+        },
+        lease_->transaction, no_deadline, false);
+    }
+    return wait(submission, state, no_deadline);
+  }
+
+  reject_reason_e
+  coordinator_t::managed_reconfigure_reason_locked(std::uint32_t launch_session_id, std::optional<std::uint64_t> transaction, std::size_t &head) {
+    if (const auto reason = evaluate_locked(command_kind_e::reconfigure, std::nullopt, false); reason != reject_reason_e::managed_session) {
+      // Not refused for a managed lease: either refused anyway, or there is no managed lease.
+      return reason == reject_reason_e::none ? reject_reason_e::stale_transaction : reason;
+    }
+    if (transaction && lease_->transaction != *transaction) {
+      return reject_reason_e::stale_transaction;
+    }
+    if (lease_->stage == lease_stage_e::preparing) {
+      return reject_reason_e::managed_session;
+    }
+    // A join past its setup deadline is no reference, even if nothing reaped it yet.
+    expire_joins_locked();
+    const attachment_t *found = nullptr;
+    for (const auto &ref : lease_->attachments) {
+      if (ref.launch_session_id == launch_session_id) {
+        if (found) {
+          return reject_reason_e::managed_session;
+        }
+        found = &ref;
+      }
+    }
+    if (!found) {
+      return reject_reason_e::managed_session;
+    }
+    if (found->head != 0 && (!lease_->group || lease_->group->ended || found->head >= lease_->group->heads.size())) {
+      return reject_reason_e::managed_session;
+    }
+    head = found->head;
+    return reject_reason_e::none;
   }
 
   bool

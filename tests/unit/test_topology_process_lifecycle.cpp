@@ -825,9 +825,9 @@ namespace display_device::topology {
       fixture_t f;
       std::vector<std::string> seen;
       auto &lifecycle = f.make_managed([&](native_lifecycle_hooks_t &hooks) {
-        hooks.change_mode = [&](const mutation_capability_t &capability, std::uint32_t width, std::uint32_t height) {
+        hooks.change_mode = [&](const mutation_capability_t &capability, std::size_t head, std::uint32_t width, std::uint32_t height) {
           capability.require(operation_e::native_mode);
-          seen.push_back(std::to_string(width) + "x" + std::to_string(height));
+          seen.push_back(std::to_string(head) + ":" + std::to_string(width) + "x" + std::to_string(height));
           return native_mode_changed_t { native_mode_verdict_e::applied, "{zako-head}", {} };
         };
       });
@@ -837,14 +837,71 @@ namespace display_device::topology {
       ASSERT_TRUE(run.completed);
       EXPECT_EQ(run.changed.verdict, native_mode_verdict_e::applied);
       EXPECT_EQ(run.changed.display, "{zako-head}");
-      EXPECT_EQ(seen, (std::vector<std::string> { "2560x1440" }));
+      EXPECT_EQ(seen, (std::vector<std::string> { "0:2560x1440" }));
       EXPECT_TRUE(same_health(run.published, f.native_initial)) << "the head's new journal is published";
+    }
+
+    TEST(ProcessLifecycleManaged, ChangeNativeModeTargetsTheRequestedHead) {
+      fixture_t f;
+      std::vector<std::string> seen;
+      auto &lifecycle = f.make_managed([&](native_lifecycle_hooks_t &hooks) {
+        hooks.change_mode = [&](const mutation_capability_t &, std::size_t head, std::uint32_t width, std::uint32_t height) {
+          seen.push_back(std::to_string(head) + ":" + std::to_string(width) + "x" + std::to_string(height));
+          return native_mode_changed_t { native_mode_verdict_e::applied, "{zako-head-2}", {} };
+        };
+      });
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      const auto ran = lifecycle.coordinator().run(kind::reconfigure, [&](const mutation_capability_t &capability, const command_context_t &) {
+        (void) lifecycle.change_native_mode(capability, std::size_t { 2 }, 1920, 1080);
+        (void) lifecycle.change_native_mode(capability, 1280, 720);
+      });
+      EXPECT_TRUE(ran.completed());
+      EXPECT_EQ(seen, (std::vector<std::string> { "2:1920x1080", "0:1280x720" })) << "a head-less change is head 0";
+    }
+
+    // The managed client-driven resolution change (stream.cpp -> coordinated::change_session_native_mode)
+    // runs under a live managed lease: it must be applied, not refused as managed_session.
+    TEST(ProcessLifecycleManaged, AManagedStreamsResolutionChangeIsAppliedToItsOwnHead) {
+      fixture_t f;
+      std::vector<std::string> seen;
+      auto &lifecycle = f.make_managed([&](native_lifecycle_hooks_t &hooks) {
+        hooks.change_mode = [&](const mutation_capability_t &capability, std::size_t head, std::uint32_t width, std::uint32_t height) {
+          capability.require(operation_e::native_mode);
+          seen.push_back(std::to_string(head) + ":" + std::to_string(width) + "x" + std::to_string(height));
+          return native_mode_changed_t { native_mode_verdict_e::applied, "{zako-head-" + std::to_string(head) + "}", {} };
+        };
+      });
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      auto &coordinator = lifecycle.coordinator();
+      const auto owner = coordinator.admit_launch({ 90, "cert:a" });
+      ASSERT_TRUE(owner);
+      ASSERT_TRUE(coordinator.run_launch_prepare(*owner.token, {}).completed());
+      ASSERT_TRUE(coordinator.record_managed_display(*owner.token, { "{zako-head-0}", true }));
+      const display_group_id_t group { 0x90, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+      ASSERT_TRUE(coordinator.open_display_group(*owner.token, group, { { "{zako-head-0}", true }, { "{zako-head-1}", true } }));
+      ASSERT_TRUE(coordinator.bind_launch(*owner.token));
+      ASSERT_TRUE(coordinator.launch_activated(*owner.token));
+
+      const auto leader = lifecycle.change_session_native_mode(90, 2560, 1440);
+      EXPECT_EQ(leader.verdict, native_mode_verdict_e::applied) << leader.reason;
+      EXPECT_EQ(leader.display, "{zako-head-0}");
+
+      const auto member = coordinator.admit_group_join({ 91, "cert:a" }, group, 1);
+      ASSERT_TRUE(member);
+      const auto joined = lifecycle.change_session_native_mode(91, 1920, 1080);
+      EXPECT_EQ(joined.verdict, native_mode_verdict_e::applied) << joined.reason;
+      EXPECT_EQ(joined.display, "{zako-head-1}");
+
+      const auto stranger = lifecycle.change_session_native_mode(92, 1280, 720);
+      EXPECT_EQ(stranger.verdict, native_mode_verdict_e::refused);
+      EXPECT_NE(stranger.reason.find("managed_session"), std::string::npos) << stranger.reason;
+      EXPECT_EQ(seen, (std::vector<std::string> { "0:2560x1440", "1:1920x1080" }));
     }
 
     TEST(ProcessLifecycleManaged, ARefusedNativeModeChangeKeepsItsReason) {
       fixture_t f;
       auto &lifecycle = f.make_managed([&](native_lifecycle_hooks_t &hooks) {
-        hooks.change_mode = [](const mutation_capability_t &, std::uint32_t, std::uint32_t) {
+        hooks.change_mode = [](const mutation_capability_t &, std::size_t, std::uint32_t, std::uint32_t) {
           return native_mode_changed_t { native_mode_verdict_e::refused, "{zako-head}", "mode not offered" };
         };
       });
@@ -858,7 +915,7 @@ namespace display_device::topology {
     TEST(ProcessLifecycleManaged, AThrowingNativeModeChangeIsInConflict) {
       fixture_t f;
       auto &lifecycle = f.make_managed([&](native_lifecycle_hooks_t &hooks) {
-        hooks.change_mode = [](const mutation_capability_t &, std::uint32_t, std::uint32_t) -> native_mode_changed_t {
+        hooks.change_mode = [](const mutation_capability_t &, std::size_t, std::uint32_t, std::uint32_t) -> native_mode_changed_t {
           throw std::runtime_error { "ioctl exploded" };
         };
       });
@@ -879,7 +936,7 @@ namespace display_device::topology {
           if (changed) throw std::runtime_error { "journal unreadable" };
           return health();
         };
-        hooks.change_mode = [&changed](const mutation_capability_t &, std::uint32_t, std::uint32_t) {
+        hooks.change_mode = [&changed](const mutation_capability_t &, std::size_t, std::uint32_t, std::uint32_t) {
           changed = true;
           return native_mode_changed_t { native_mode_verdict_e::applied, "{zako-head}", {} };
         };

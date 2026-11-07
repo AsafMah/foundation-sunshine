@@ -1279,6 +1279,128 @@ namespace {
     EXPECT_EQ(prepares, 0);
   }
 
+  // GW-H3d: a member's requested mode (mode= WxH) goes to its own head before its capture is admitted.
+  class DisplayGroupMemberMode: public DisplayGroupJoin {
+  protected:
+    struct call_t {
+      std::size_t head;
+      std::uint32_t width;
+      std::uint32_t height;
+    };
+
+    std::vector<call_t> calls;
+    topology::native_mode_changed_t answer { topology::native_mode_verdict_e::applied, member_head.display, {} };
+    boost::property_tree::ptree out;
+
+    std::optional<topology::launch_token_t>
+    joined() {
+      boost::property_tree::ptree join_tree;
+      const auto admission = member(join_tree);
+      return admission.token;
+    }
+
+    bool
+    apply(const topology::launch_token_t &token, int width, int height) {
+      return nvhttp::stream_start::apply_member_mode(out, *coordinator, token, { group_id, 1 }, width, height,
+        [this](std::size_t head, std::uint32_t w, std::uint32_t h) {
+          calls.push_back({ head, w, h });
+          return answer;
+        });
+    }
+
+    int
+    status() const {
+      return out.get<int>("root.<xmlattr>.status_code", 0);
+    }
+  };
+
+  TEST_F(DisplayGroupMemberMode, TheClientModeGoesToTheMembersOwnHead) {
+    lead();
+    const auto token = joined();
+    ASSERT_TRUE(token);
+    EXPECT_TRUE(apply(*token, 1920, 1080));
+    ASSERT_EQ(calls.size(), 1u);
+    EXPECT_EQ(calls[0].head, 1u);
+    EXPECT_EQ(calls[0].width, 1920u);
+    EXPECT_EQ(calls[0].height, 1080u);
+    EXPECT_TRUE(out.empty());
+    EXPECT_EQ(coordinator->managed_display(*token), member_head);
+    EXPECT_EQ(prepares, 1);
+    EXPECT_EQ(restores->load(), 0);
+  }
+
+  TEST_F(DisplayGroupMemberMode, WithoutAModeTheHeadIsLeftAlone) {
+    lead();
+    const auto token = joined();
+    ASSERT_TRUE(token);
+    EXPECT_TRUE(apply(*token, 0, 1080));
+    EXPECT_TRUE(apply(*token, 1920, -1));
+    EXPECT_TRUE(calls.empty());
+    EXPECT_TRUE(out.empty());
+  }
+
+  TEST_F(DisplayGroupMemberMode, ARefusedModeKeepsTheHeadAndStillJoins) {
+    lead();
+    const auto token = joined();
+    ASSERT_TRUE(token);
+    answer = { topology::native_mode_verdict_e::refused, {}, "mode not offered" };
+    EXPECT_TRUE(apply(*token, 1920, 1080));
+    EXPECT_EQ(calls.size(), 1u);
+    EXPECT_TRUE(out.empty());
+    EXPECT_EQ(coordinator->managed_display(*token), member_head);
+  }
+
+  TEST_F(DisplayGroupMemberMode, AConflictRefusesTheJoinWithA503CarryingTheReason) {
+    lead();
+    const auto token = joined();
+    ASSERT_TRUE(token);
+    answer = { topology::native_mode_verdict_e::conflict, {}, "ioctl exploded" };
+    EXPECT_FALSE(apply(*token, 1920, 1080));
+    EXPECT_EQ(status(), 503);
+    EXPECT_EQ(out.get<std::string>("root.sunshine_error_code", "<none>"), "DISPLAY_GROUP_REFUSED");
+    EXPECT_NE(out.get<std::string>("root.<xmlattr>.status_message", "").find("ioctl exploded"), std::string::npos);
+    EXPECT_EQ(restores->load(), 0) << "a member's refusal never restores";
+  }
+
+  TEST_F(DisplayGroupMemberMode, AThrowingChangeIsAConflict) {
+    lead();
+    const auto token = joined();
+    ASSERT_TRUE(token);
+    bool ok = true;
+    EXPECT_NO_THROW(ok = nvhttp::stream_start::apply_member_mode(out, *coordinator, *token, { group_id, 1 }, 1920, 1080,
+                      [](std::size_t, std::uint32_t, std::uint32_t) -> topology::native_mode_changed_t {
+                        throw std::runtime_error("edge exploded");
+                      }));
+    EXPECT_FALSE(ok);
+    EXPECT_EQ(status(), 503);
+    EXPECT_NE(out.get<std::string>("root.<xmlattr>.status_message", "").find("edge exploded"), std::string::npos);
+  }
+
+  TEST_F(DisplayGroupMemberMode, ARecreatedHeadIsFollowedByTheGroupAndCaptured) {
+    lead();
+    const auto token = joined();
+    ASSERT_TRUE(token);
+    answer = { topology::native_mode_verdict_e::applied, "{zako-head-2b}", {} };
+    EXPECT_TRUE(apply(*token, 1920, 1080));
+    EXPECT_TRUE(out.empty());
+    EXPECT_EQ(coordinator->managed_display(*token), (topology::managed_target_t { "{zako-head-2b}", true }));
+    rtsp_stream::launch_session_t joiner {};
+    joiner.id = 77;
+    fake.joiner_admissions = { probed(probe_error_e::none) };
+    ASSERT_TRUE(nvhttp::stream_start::join_managed_display(out, joiner, *coordinator, *token));
+    EXPECT_EQ(joiner.env["SUNSHINE_CLIENT_DISPLAY_NAME"].to_string(), "{zako-head-2b}");
+  }
+
+  TEST_F(DisplayGroupMemberMode, ARecreatedHeadTheGroupCannotFollowRefusesTheJoin) {
+    lead();
+    const auto token = joined();
+    ASSERT_TRUE(token);
+    answer = { topology::native_mode_verdict_e::applied, leader_head.display, {} };
+    EXPECT_FALSE(apply(*token, 1920, 1080));
+    EXPECT_EQ(status(), 503);
+    EXPECT_EQ(coordinator->managed_display(*token), member_head);
+  }
+
   TEST(DisplayGroupJoinStatus, ARefusalIsA503CarryingTheReason) {
     boost::property_tree::ptree tree;
     nvhttp::stream_start::set_group_join_error(tree,

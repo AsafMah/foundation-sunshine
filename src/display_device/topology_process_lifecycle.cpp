@@ -291,6 +291,11 @@ namespace display_device::topology {
 
   native_mode_changed_t
   process_lifecycle_t::change_native_mode(const mutation_capability_t &capability, std::uint32_t width, std::uint32_t height) {
+    return change_native_mode(capability, std::size_t { 0 }, width, height);
+  }
+
+  native_mode_changed_t
+  process_lifecycle_t::change_native_mode(const mutation_capability_t &capability, std::size_t head, std::uint32_t width, std::uint32_t height) {
     if (!hooks_.native) {
       return { native_mode_verdict_e::refused, {}, "Managed display topology is not active" };
     }
@@ -299,7 +304,7 @@ namespace display_device::topology {
     }
     native_mode_changed_t changed;
     try {
-      changed = hooks_.native->change_mode(capability, width, height);
+      changed = hooks_.native->change_mode(capability, head, width, height);
     }
     catch (const std::exception &error) {
       changed = { native_mode_verdict_e::conflict, {}, std::string { "Native mode change failed: " } + error.what() };
@@ -323,6 +328,24 @@ namespace display_device::topology {
       return { native_mode_verdict_e::conflict, {}, "Native health is unknown after the mode change" };
     }
     return changed;
+  }
+
+  native_mode_changed_t
+  process_lifecycle_t::change_session_native_mode(std::uint32_t launch_session_id, std::uint32_t width, std::uint32_t height) {
+    std::optional<native_mode_changed_t> changed;
+    const auto result = coordinator_.run_managed_reconfigure(launch_session_id,
+      [&](const mutation_capability_t &capability, const command_context_t &, std::size_t head) {
+        changed = change_native_mode(capability, head, width, height);
+      });
+    if (changed) {
+      return std::move(*changed);
+    }
+    std::string detail { to_string(result.outcome) };
+    if (result.reason != reject_reason_e::none) {
+      detail += " / ";
+      detail += to_string(result.reason);
+    }
+    return { native_mode_verdict_e::refused, {}, "not run: " + detail };
   }
 
   void

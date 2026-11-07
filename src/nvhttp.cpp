@@ -383,6 +383,24 @@ namespace nvhttp {
 
   public:
 
+    /**
+     * GW-H3d: a member's requested mode (mode= WxH) goes to its own head before its capture
+     * is admitted, as the managed lease's reconfigure for this member's session.
+     */
+    bool
+    apply_member_mode(pt::ptree &tree, const rtsp_stream::launch_session_t &session, const stream_start::display_group_join_t &join,
+      std::string_view result_node) {
+      const auto launch_session_id = session.id;
+      if (stream_start::apply_member_mode(tree, display_device::coordinated::coordinator(), *token_, join, session.width, session.height,
+            [launch_session_id](std::size_t, std::uint32_t width, std::uint32_t height) {
+              return display_device::coordinated::change_session_native_mode(launch_session_id, width, height);
+            })) {
+        return true;
+      }
+      tree.put(std::string { "root." } + std::string { result_node }, 0);
+      return false;
+    }
+
     /** Whether this request runs the managed native topology (decided at admission). */
     bool
     managed() const {
@@ -1061,6 +1079,7 @@ namespace nvhttp {
 
     if (group_join) {
       if (!display_launch.admit_member(tree, *launch_session, *group_join, "resume") ||
+          !display_launch.apply_member_mode(tree, *launch_session, *group_join, "resume") ||
           !display_launch.join(tree, *launch_session, "resume")) {
         return;
       }

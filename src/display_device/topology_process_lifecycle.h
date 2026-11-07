@@ -89,10 +89,10 @@ namespace display_device::topology {
      */
     std::function<native_prepared_t(const mutation_capability_t &, std::uint8_t heads)> prepare;
     /**
-     * Optional: change the managed head's resolution (`native_mode` authority);
-     * `health` is published after it. Absent refuses every mode change.
+     * Optional: change the resolution of managed head `head` (0-based creation order;
+     * `native_mode` authority); `health` is published after it. Absent refuses every mode change.
      */
-    std::function<native_mode_changed_t(const mutation_capability_t &, std::uint32_t width, std::uint32_t height)> change_mode;
+    std::function<native_mode_changed_t(const mutation_capability_t &, std::size_t head, std::uint32_t width, std::uint32_t height)> change_mode;
   };
 
   struct lifecycle_hooks_t {
@@ -179,6 +179,18 @@ namespace display_device::topology {
      */
     native_mode_changed_t
     change_native_mode(const mutation_capability_t &capability, std::uint32_t width, std::uint32_t height);
+
+    /** The same for head `head` of the managed set (0 is the launch's own head). */
+    native_mode_changed_t
+    change_native_mode(const mutation_capability_t &capability, std::size_t head, std::uint32_t width, std::uint32_t height);
+
+    /**
+     * A client-driven mode change of the head launch session `launch_session_id` streams,
+     * as the managed lease's one admitted reconfigure (coordinator_t::run_managed_reconfigure).
+     * Refused, without touching any head, when the coordinator does not run it.
+     */
+    native_mode_changed_t
+    change_session_native_mode(std::uint32_t launch_session_id, std::uint32_t width, std::uint32_t height);
 
   private:
     coordinator_options_t

@@ -4022,6 +4022,33 @@ TEST_F(NativeExecutor, ChangeModeOfOneOfTwoHeadsFollowsAHeadTheDriverRecreated) 
   EXPECT_FALSE(store.bytes);
 }
 
+TEST_F(NativeExecutor, AManagedModeChangeTargetsTheRequestedHeadOfItsGroup) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  dt::managed_native_t managed { &executor, group_profile(2) };
+  const auto first = mode_of(platform, "vdd-1");
+  dt::mode_change_outcome_t outcome;
+  with_capability(dt::command_kind_e::reconfigure, [&](const auto &capability) {
+    outcome = managed.change_mode(capability, std::size_t { 1 }, { 2560, 1440 });
+  }, true);
+  ASSERT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::applied)) << outcome.reason;
+  EXPECT_EQ(outcome.display, dt::os_display_id_t { "vdd-2" });
+  EXPECT_EQ(resolution_of(find(platform.host, "vdd-2")).width, 2560u);
+  EXPECT_TRUE(same_mode(mode_of(platform, "vdd-1"), first)) << "the leader's head keeps its mode";
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+  EXPECT_EQ(platform.head_count(), 0u);
+}
+
+TEST_F(NativeExecutor, AManagedHeadModeChangeWithoutAUsableProfileTouchesNothing) {
+  dt::managed_native_t managed { &executor, invalid_setting() };
+  dt::mode_change_outcome_t outcome;
+  with_capability(dt::command_kind_e::reconfigure, [&](const auto &capability) {
+    outcome = managed.change_mode(capability, std::size_t { 1 }, { 2560, 1440 });
+  }, true);
+  EXPECT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::refused));
+  EXPECT_TRUE(mentions(outcome.reason, "display_topology_profile")) << outcome.reason;
+  EXPECT_EQ(log.host_writes(), 0u);
+}
+
 TEST_F(NativeExecutor, ChangeModeOfOneOfTwoHeadsThatAlsoChangesTheOtherRollsBack) {
   ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
   const auto first = mode_of(platform, "vdd-1");
