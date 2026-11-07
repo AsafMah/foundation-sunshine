@@ -381,12 +381,20 @@ namespace {
     }
 
     dt::result_t<void>
-    do_arrange(const dt::mutation_capability_t &capability, const std::vector<dt::placement_t> &placements) override {
+    do_arrange(const dt::mutation_capability_t &capability, const std::vector<dt::placement_t> &placements,
+      const std::vector<dt::os_display_id_t> &off) override {
       if (on_mutation) on_mutation(&capability);
       log_.add("arrange");
       arrangements.push_back(placements);
+      deactivations.push_back(off);
       if (on_arrange) {
         return on_arrange(arrangements.size(), placements);
+      }
+      for (const auto &id : off) {
+        auto &target = find(host, id.value);
+        target.info.device_state = state_e::inactive;
+        target.info.display_name.clear();
+        target.layout.reset();
       }
       place(placements);
       return {};
@@ -505,6 +513,8 @@ namespace {
     /** Replaces the default activation (the head goes active in place). */
     std::function<dt::result_t<void>(const dt::observed_display_t &)> on_activate;
     std::vector<std::vector<dt::placement_t>> arrangements;
+    /** The `off` list of each arrange, parallel to `arrangements`. */
+    std::vector<std::vector<dt::os_display_id_t>> deactivations;
     /** Replaces the default placement (every corner moves); receives the 1-based call. */
     std::function<dt::result_t<void>(std::size_t, const std::vector<dt::placement_t> &)> on_arrange;
     /** A head that reaches the desktop takes the origin and the primary (`take_origin_for`). */
@@ -4425,6 +4435,109 @@ TEST_F(NativeExecutor, ARestoreWhoseRemovalDisplacesThePrimaryPutsItBack) {
   EXPECT_EQ(state_of(platform.host, "pnk"), state_e::primary);
   EXPECT_EQ(corner(platform.host, "pnk"), (dt::position_t { 0, 0 }));
   EXPECT_FALSE(store.bytes);
+}
+
+namespace {
+  /** os-B is connected but off the desktop, as Windows lists it: no layout, no OS display name. */
+  void
+  take_off_desktop(dt::inventory_t &inventory, const std::string &name) {
+    auto &display = find(inventory, name);
+    display.info.device_state = state_e::inactive;
+    display.info.display_name.clear();
+    display.layout.reset();
+  }
+
+  /**
+   * What Windows did on hardware (kit 2, run 20261107-090020): removing the last virtual head made it
+   * apply its saved layout for the remaining displays, turning os-B (off at baseline) on as the primary at 0,0
+   * and moving os-A right of it.
+   */
+  void
+  reactivate_on_removal(fake_platform_t &platform) {
+    platform.on_remove = [&platform]() -> dt::result_t<void> {
+      platform.drop_heads();
+      auto &b = find(platform.host, "os-B");
+      b.info.device_state = state_e::primary;
+      b.info.display_name = "\\\\.\\DISPLAY-os-B";
+      b.layout = display_topology_test::layout(0);
+      auto &a = find(platform.host, "os-A");
+      a.info.device_state = state_e::active;
+      a.layout->position = { 1920, 0 };
+      return {};
+    };
+  }
+}  // namespace
+
+TEST_F(NativeExecutor, ARestoreWhoseRemovalTurnsAnOffDisplayOnPutsTheBaselineDesktopBackInOneWrite) {
+  take_off_desktop(platform.host, "os-B");
+  ASSERT_TRUE(verdict_is(managed_prepare_with(executor), native_verdict_e::ok));
+  reactivate_on_removal(platform);
+  platform.arrangements.clear();
+  const auto outcome = restore_with(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::ok)) << outcome.reason;
+  ASSERT_EQ(platform.arrangements.size(), 1u) << "one desktop write";
+  EXPECT_EQ(platform.deactivations.back(), (std::vector<dt::os_display_id_t> { dt::os_display_id_t { "os-B" } }));
+  EXPECT_EQ(state_of(platform.host, "os-B"), state_e::inactive) << "off again, as at baseline";
+  EXPECT_EQ(state_of(platform.host, "os-A"), state_e::primary);
+  EXPECT_EQ(corner(platform.host, "os-A"), (dt::position_t { 0, 0 }));
+  EXPECT_FALSE(store.bytes);
+  EXPECT_TRUE(healthy(executor.health()));
+}
+
+TEST_F(NativeExecutor, AnOffDisplayThatStaysOnAfterPuttingTheBaselineBackIsAConflict) {
+  take_off_desktop(platform.host, "os-B");
+  ASSERT_TRUE(verdict_is(managed_prepare_with(executor), native_verdict_e::ok));
+  reactivate_on_removal(platform);
+  platform.on_arrange = [](std::size_t, const std::vector<dt::placement_t> &) { return dt::result_t<void> {}; };
+  const auto outcome = restore_with(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
+  EXPECT_TRUE(mentions(outcome.reason, "did not restore it")) << outcome.reason;
+  EXPECT_TRUE(store.bytes);
+}
+
+TEST_F(NativeExecutor, AnOffDisplayTurnedOnWhileAVirtualHeadRemainsIsNotTouched) {
+  take_off_desktop(platform.host, "os-B");
+  ASSERT_TRUE(verdict_is(managed_prepare_with(executor), native_verdict_e::ok));
+  platform.on_remove = [&]() -> dt::result_t<void> {
+    auto &b = find(platform.host, "os-B");
+    b.info.device_state = state_e::active;
+    b.info.display_name = "\\\\.\\DISPLAY-os-B";
+    b.layout = display_topology_test::layout(3840);
+    return {};  // the head is still listed
+  };
+  platform.arrangements.clear();
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
+  EXPECT_TRUE(platform.deactivations.empty() || platform.deactivations.back().empty()) << "nothing is turned off beside a head";
+  EXPECT_TRUE(store.bytes);
+}
+
+TEST_F(NativeExecutor, ADisplayTheBaselineHadOnThatWentOffIsAConflictNotAGuess) {
+  ASSERT_TRUE(verdict_is(managed_prepare_with(executor), native_verdict_e::ok));
+  platform.on_remove = [&]() -> dt::result_t<void> {
+    platform.drop_heads();
+    take_off_desktop(platform.host, "os-B");
+    return {};
+  };
+  platform.arrangements.clear();
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
+  EXPECT_TRUE(platform.arrangements.empty()) << "turning a display on is never put back automatically";
+  EXPECT_TRUE(store.bytes);
+}
+
+TEST_F(NativeExecutor, AnOffDisplayTurnedOnTogetherWithAReshapedOneIsAConflict) {
+  take_off_desktop(platform.host, "os-B");
+  ASSERT_TRUE(verdict_is(managed_prepare_with(executor), native_verdict_e::ok));
+  reactivate_on_removal(platform);
+  const auto remove = platform.on_remove;
+  platform.on_remove = [this, remove]() {
+    auto result = remove();
+    find(platform.host, "os-A").layout->mode = mode(2560, 1440);
+    return result;
+  };
+  platform.arrangements.clear();
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
+  EXPECT_TRUE(platform.arrangements.empty());
+  EXPECT_TRUE(store.bytes);
 }
 
 TEST_F(NativeExecutor, ARestoreLeavesDisplaysTheUserMovedWhereTheyAre) {

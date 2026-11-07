@@ -133,13 +133,14 @@ namespace display_device::topology {
     activate_head(const mutation_capability_t &capability, const observed_display_t &head) final;
 
     /**
-     * Move each listed desktop display's top-left corner to its placement in one desktop
-     * write, then wait (bounded) for them to be listed there. The display placed at 0,0
-     * becomes the primary. Modes, HDR and topology groups are not changed, and displays not
-     * listed keep their corners. An error leaves the applied state unknown.
+     * Move each listed desktop display's top-left corner to its placement, and take each `off`
+     * display off the desktop, in one desktop write, then wait (bounded) for them to be listed so.
+     * The display placed at 0,0 becomes the primary. Modes, HDR and topology groups are not
+     * changed, and displays not listed keep their corners. An error leaves the applied state unknown.
      */
     virtual result_t<void>
-    arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements) final;
+    arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements,
+      const std::vector<os_display_id_t> &off = {}) final;
 
   protected:
     // Keep concrete hooks nonpublic and carry the capability through to raw setters.
@@ -160,7 +161,8 @@ namespace display_device::topology {
     do_activate_head(const mutation_capability_t &capability, const observed_display_t &head) = 0;
 
     virtual result_t<void>
-    do_arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements) = 0;
+    do_arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements,
+      const std::vector<os_display_id_t> &off) = 0;
   };
 
   enum class native_verdict_e : std::uint8_t {

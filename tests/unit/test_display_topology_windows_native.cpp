@@ -124,10 +124,19 @@ namespace {
     }
 
     dt::edge_send_t
-    arrange(const dt::mutation_capability_t &capability, const std::vector<dt::placement_t> &placements) override {
+    arrange(const dt::mutation_capability_t &capability, const std::vector<dt::placement_t> &placements,
+      const std::vector<dt::os_display_id_t> &off) override {
       capability.require(dt::arrange_operation(capability.kind()));
       arrangements.push_back(placements);
+      offs.push_back(off);
       if (on_arrange) return on_arrange(placements);
+      for (auto &listed : displays) {
+        if (std::ranges::find(off, listed.id) != off.end()) {
+          listed.info.device_state = state_e::inactive;
+          listed.info.display_name.clear();
+          listed.layout.reset();
+        }
+      }
       for (const auto &placement : placements) {
         for (auto &listed : displays) {
           if (listed.id == placement.display && listed.layout) listed.layout->position = placement.position;
@@ -231,6 +240,7 @@ namespace {
     std::vector<dt::os_display_id_t> activations;
     std::function<dt::edge_send_t(const dt::os_display_id_t &)> on_activate;
     std::vector<std::vector<dt::placement_t>> arrangements;
+    std::vector<std::vector<dt::os_display_id_t>> offs;
     std::function<dt::edge_send_t(const std::vector<dt::placement_t> &)> on_arrange;
   };
 
@@ -989,9 +999,10 @@ TEST_F(WindowsNative, TheExecutorAddsAColdCreatedHeadToTheDesktopAndStillRemoves
 
 namespace {
   dt::result_t<void>
-  arrange_with(dt::windows_native_platform_t &platform, const std::vector<dt::placement_t> &plan, dt::command_kind_e kind = dt::command_kind_e::launch_prepare) {
+  arrange_with(dt::windows_native_platform_t &platform, const std::vector<dt::placement_t> &plan, dt::command_kind_e kind = dt::command_kind_e::launch_prepare,
+    const std::vector<dt::os_display_id_t> &off = {}) {
     std::optional<dt::result_t<void>> result;
-    with_capability(kind, [&](const auto &capability) { result = platform.arrange(capability, plan); }, true);
+    with_capability(kind, [&](const auto &capability) { result = platform.arrange(capability, plan, off); }, true);
     return *result;
   }
 
@@ -1037,6 +1048,29 @@ TEST_F(WindowsNative, ArrangeWaitsForAnOffDesktopDisplayToBeAtItsPlace) {
     return dt::edge_send_t { edge_delivery_e::delivered, {} };
   };
   EXPECT_TRUE(fails_with(arrange_with(platform, { swapped[0] }), dt::error_code_e::unknown_applied_state, "not at their places"));
+}
+
+TEST_F(WindowsNative, ArrangeTakesTheOffDisplaysOffInTheSameWriteAndWaitsForThem) {
+  const std::vector<dt::os_display_id_t> off { dt::os_display_id_t { "os-B" } };
+  const std::vector<dt::placement_t> origin { { dt::os_display_id_t { "os-A" }, { 0, 0 } } };
+  ASSERT_TRUE(arrange_with(platform, origin, dt::command_kind_e::native_restore, off));
+  ASSERT_EQ(edge.arrangements.size(), 1u) << "one write";
+  EXPECT_EQ(edge.offs[0], off);
+  const auto inventory = platform.inventory();
+  EXPECT_EQ(find(inventory, "os-B")->info.device_state, state_e::inactive);
+  EXPECT_EQ(find(inventory, "os-A")->layout->position, (dt::position_t { 0, 0 }));
+}
+
+TEST_F(WindowsNative, ArrangeWaitsForAnOffDisplayToLeaveTheDesktop) {
+  edge.on_arrange = [](const auto &) { return dt::edge_send_t { edge_delivery_e::delivered, {} }; };
+  const std::vector<dt::placement_t> stay { { dt::os_display_id_t { "os-A" }, find(platform.inventory(), "os-A")->layout->position } };
+  EXPECT_TRUE(fails_with(arrange_with(platform, stay, dt::command_kind_e::native_restore, { dt::os_display_id_t { "os-B" } }),
+    dt::error_code_e::unknown_applied_state, "not at their places"));
+}
+
+TEST_F(WindowsNative, ArrangeOfOnlyAnOffDisplayIsAWrite) {
+  ASSERT_TRUE(arrange_with(platform, {}, dt::command_kind_e::native_restore, { dt::os_display_id_t { "os-B" } }));
+  EXPECT_EQ(edge.arrangements.size(), 1u);
 }
 
 TEST_F(WindowsNative, ArrangeIsOnlyForAPrepareOrRestore) {

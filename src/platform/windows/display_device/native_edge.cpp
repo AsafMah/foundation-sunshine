@@ -238,10 +238,19 @@ namespace display_device::topology::win32_edge {
   }
 
   edge_send_t
-  win32_native_edge_t::arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements) {
+  win32_native_edge_t::arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements,
+    const std::vector<os_display_id_t> &off) {
     capability.require(arrange_operation(capability.kind()));
     auto data = w_utils::query_display_config(w_utils::ACTIVE_ONLY_DEVICES);
     if (!data) return { edge_delivery_e::not_sent, "the desktop could not be read" };
+
+    // A display taken off the desktop is left out of the supplied active paths, in the same write.
+    // One already off the desktop is not listed here, which is what was asked.
+    std::erase_if(data->paths, [&](const DISPLAYCONFIG_PATH_INFO &path) {
+      const auto info = w_utils::get_device_info_for_valid_path(path, w_utils::ACTIVE_ONLY_DEVICES);
+      return info && std::ranges::any_of(off, [&](const os_display_id_t &id) { return id.value == info->device_id; });
+    });
+    if (data->paths.empty()) return { edge_delivery_e::not_sent, "no display would be left on the desktop" };
 
     std::vector<bool> placed(placements.size(), false);
     std::vector<UINT32> moved;

@@ -346,9 +346,10 @@ namespace display_device::topology {
   }
 
   result_t<void>
-  windows_native_platform_t::do_arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements) {
-    if (placements.empty()) return {};
-    const auto sent = edge_.arrange(capability, placements);
+  windows_native_platform_t::do_arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements,
+    const std::vector<os_display_id_t> &off) {
+    if (placements.empty() && off.empty()) return {};
+    const auto sent = edge_.arrange(capability, placements, off);
     switch (sent.delivery) {
       case edge_delivery_e::not_sent:
         return fail(error_code_e::resource_unavailable, "the displays were not placed: " + sent.detail);
@@ -358,7 +359,12 @@ namespace display_device::topology {
         break;
     }
     const bool placed = wait_for([&](const inventory_t &observed) {
-      return std::all_of(placements.begin(), placements.end(), [&](const placement_t &placement) {
+      const bool all_off = std::none_of(off.begin(), off.end(), [&](const os_display_id_t &id) {
+        return std::any_of(observed.displays.begin(), observed.displays.end(), [&](const observed_display_t &display) {
+          return display.id == id && on_desktop(display);
+        });
+      });
+      return all_off && std::all_of(placements.begin(), placements.end(), [&](const placement_t &placement) {
         const auto matches = std::count_if(observed.displays.begin(), observed.displays.end(), [&](const observed_display_t &display) {
           return display.id == placement.display;
         });

@@ -71,7 +71,8 @@ namespace display_device::topology::win32_edge {
 
     /** One `SetDisplayConfig` of the active paths with moved source corners, not saved to the database. */
     edge_send_t
-    arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements) override;
+    arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements,
+      const std::vector<os_display_id_t> &off) override;
 
     std::chrono::steady_clock::time_point
     now() override;

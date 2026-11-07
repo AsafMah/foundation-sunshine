@@ -151,7 +151,8 @@ namespace display_device::topology {
      * is not on the desktop, or shares its source, is not_sent with nothing written.
      */
     virtual edge_send_t
-    arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements) = 0;
+    arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements,
+      const std::vector<os_display_id_t> &off) = 0;
 
     virtual std::chrono::steady_clock::time_point
     now() = 0;
@@ -221,7 +222,8 @@ namespace display_device::topology {
 
     /** One desktop write of every corner (`native_edge_t::arrange`), then waits for each display there. */
     result_t<void>
-    do_arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements) override;
+    do_arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements,
+      const std::vector<os_display_id_t> &off) override;
 
     /** Adds the head with `guid` to the desktop unless it is already on it, and waits for it there. */
     result_t<void>

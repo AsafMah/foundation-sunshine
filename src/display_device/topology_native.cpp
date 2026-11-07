@@ -316,6 +316,41 @@ namespace display_device::topology {
     }
 
     /**
+     * The displays that were off the desktop at baseline and are on it now, when that and corner or
+     * primary drift is all that changed: the same unmanaged displays, every display on at baseline still
+     * on with its baseline mode, rotation and HDR. nullopt for any other change (a conflict).
+     */
+    std::optional<std::vector<os_display_id_t>>
+    turned_on(const native_platform_t &platform, const inventory_t &current, const journal_record_t &record) {
+      std::vector<std::string> ids_now;
+      std::vector<std::string> ids_before;
+      for (const auto &display : current.displays) {
+        if (unmanaged(platform, record, display)) ids_now.push_back(display.id.value);
+      }
+      for (const auto &display : record.baseline.displays) {
+        if (unmanaged(platform, record, display)) ids_before.push_back(display.id.value);
+      }
+      std::sort(ids_now.begin(), ids_now.end());
+      std::sort(ids_before.begin(), ids_before.end());
+      if (ids_now != ids_before || std::adjacent_find(ids_now.begin(), ids_now.end()) != ids_now.end()) {
+        return std::nullopt;
+      }
+      std::vector<os_display_id_t> on;
+      for (const auto &before : record.baseline.displays) {
+        if (!unmanaged(platform, record, before)) continue;
+        const auto *now = find_unique(current, before.id);
+        const bool was_off = before.info.device_state == device_state_e::inactive || !before.layout;
+        const bool is_off = !now || now->info.device_state == device_state_e::inactive || !now->layout;
+        if (was_off) {
+          if (!is_off) on.push_back(before.id);
+          continue;
+        }
+        if (is_off || !same_shape(*before.layout, *now->layout)) return std::nullopt;
+      }
+      return on;
+    }
+
+    /**
      * Puts unmanaged displays back at their baseline corners and `heads` right of them, in
      * one desktop write, when only corners or the primary drifted. nullopt when everything is
      * in place (`observed` is then the latest inventory); otherwise why it failed, starting
@@ -638,9 +673,10 @@ namespace display_device::topology {
   }
 
   result_t<void>
-  native_platform_t::arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements) {
+  native_platform_t::arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements,
+    const std::vector<os_display_id_t> &off) {
     capability.require(arrange_operation(capability.kind()));
-    return do_arrange(capability, placements);
+    return do_arrange(capability, placements, off);
   }
 
   std::string_view
@@ -1429,6 +1465,26 @@ namespace display_device::topology {
       return std::nullopt;
     }
     const auto no_heads = [this](const inventory_t &inventory) { return inventory.available && virtual_heads(platform_, inventory).empty(); };
+    if (const auto off = turned_on(platform_, after, record); off && !off->empty() && no_heads(after)) {
+      // Windows applied its saved layout for the remaining displays when the last virtual head went,
+      // turning on displays that were off at baseline (and moving the primary). Put the baseline
+      // desktop back, active set and corners together, in one write.
+      const auto plan = placement_plan(platform_, record, after, {});
+      if (!plan) {
+        return what + "; the baseline desktop could not be planned";
+      }
+      if (const auto arranged = platform_.arrange(capability, *plan, *off); !arranged) {
+        return what + "; turning the displays that were off back off failed: " + arranged.error().detail;
+      }
+      after = platform_.inventory();
+      if (!no_heads(after)) {
+        return what + "; a virtual display appeared while the baseline desktop was put back";
+      }
+      if (misplaced(platform_, after, record, *plan)) {
+        return what + "; putting the baseline desktop back did not restore it";
+      }
+      return std::nullopt;
+    }
     return place(platform_, capability, record, {}, after, no_heads, what);
   }
 
