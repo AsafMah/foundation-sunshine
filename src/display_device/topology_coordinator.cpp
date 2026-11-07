@@ -951,6 +951,10 @@ namespace display_device::topology {
 
   void
   coordinator_t::remove_attachment_locked(std::uint64_t serial, command_kind_e restore_kind) {
+    if (const auto it = std::find_if(lease_->attachments.begin(), lease_->attachments.end(), [&](const auto &ref) { return ref.serial == serial; });
+        it != lease_->attachments.end()) {
+      retire_member_state_locked(*it);
+    }
     std::erase_if(lease_->attachments, [&](const auto &ref) { return ref.serial == serial; });
     if (serial == 0 && lease_->group && !lease_->group->ended) {
       end_group_locked();
@@ -967,9 +971,15 @@ namespace display_device::topology {
       return;
     }
     const auto current = now();
-    const auto removed = std::erase_if(lease_->attachments, [&](const auto &ref) {
+    const auto expired = [&](const attachment_t &ref) {
       return ref.serial != 0 && ref.stage == lease_stage_e::preparing && current >= ref.setup_deadline;
-    });
+    };
+    for (const auto &ref : lease_->attachments) {
+      if (expired(ref)) {
+        retire_member_state_locked(ref);
+      }
+    }
+    const auto removed = std::erase_if(lease_->attachments, expired);
     if (removed != 0) {
       if (!lease_->restore_kind) {
         lease_->restore_kind = command_kind_e::native_restore;
@@ -1022,6 +1032,7 @@ namespace display_device::topology {
   void
   coordinator_t::end_group_locked() {
     lease_->group->ended = true;
+    bump_group_locked();
     std::vector<std::uint32_t> members;
     // Members stream heads 1..N-1; the owner and ordinary resumes stream head 0 and are not members.
     for (const auto &ref : lease_->attachments) {
@@ -1077,7 +1088,9 @@ namespace display_device::topology {
         }
       }
     }
-    lease_->group = group_t { id, std::move(heads), false };
+    const auto count = heads.size();
+    lease_->group = group_t { id, std::move(heads), std::vector<group_head_state_t>(count), false };
+    bump_group_locked();
     return true;
   }
 
@@ -1114,6 +1127,7 @@ namespace display_device::topology {
     const auto serial = lease_->next_attachment_serial++;
     const auto deadline = now() + options_.setup_timeout;
     lease_->attachments.push_back({ serial, request.launch_session_id, lease_stage_e::preparing, deadline, head });
+    set_head_state_locked(head, {});
     touch_managed_locked();
     return { launch_token_t { lease_->transaction, request.launch_session_id, launch_flavor_e::managed, deadline, serial },
       group_join_e::joined };
@@ -1146,6 +1160,7 @@ namespace display_device::topology {
       }
     }
     heads[ref->head] = std::move(display);
+    bump_group_locked();
     return true;
   }
 
@@ -1175,6 +1190,101 @@ namespace display_device::topology {
     return wait(submission, state, no_deadline);
   }
 
+  bool
+  coordinator_t::note_group_head(const launch_token_t &member, group_head_state_t state) {
+    std::lock_guard lock { mutex_ };
+    const auto *ref = find_attachment_locked(member);
+    if (!ref || ref->serial == 0 || ref->head == 0 || !lease_->group || lease_->group->ended || ref->head >= lease_->group->states.size()) {
+      return false;
+    }
+    set_head_state_locked(ref->head, state);
+    return true;
+  }
+
+  std::optional<group_layout_t>
+  coordinator_t::display_group_layout(std::uint32_t launch_session_id) {
+    std::lock_guard lock { mutex_ };
+    const auto *ref = managed_reference_locked(launch_session_id);
+    // A head-0 joiner of a group lease negotiated no group: only the leader and members are sent it.
+    if (!ref || !lease_->group || lease_->group->ended || (ref->serial != 0 && ref->head == 0)) {
+      return std::nullopt;
+    }
+    const auto &group = *lease_->group;
+    group_layout_t layout;
+    layout.id = group.id;
+    layout.this_head = static_cast<std::uint8_t>(ref->head);
+    for (std::size_t i = 0; i < group.heads.size(); ++i) {
+      layout.heads.push_back({ group.states[i], group.heads[i].geometry });
+    }
+    return layout;
+  }
+
+  std::uint64_t
+  coordinator_t::display_group_revision() const noexcept {
+    return group_revision_.load(std::memory_order_acquire);
+  }
+
+  void
+  coordinator_t::set_head_state_locked(std::size_t head, group_head_state_t state) {
+    auto &states = lease_->group->states;
+    if (head < states.size() && states[head] != state) {
+      states[head] = state;
+      bump_group_locked();
+    }
+  }
+
+  void
+  coordinator_t::retire_member_state_locked(const attachment_t &ref) {
+    if (ref.serial == 0 || ref.head == 0 || !lease_->group || lease_->group->ended || ref.head >= lease_->group->states.size()) {
+      return;
+    }
+    // A member that streamed leaves its head ended (it stays on the desktop until the leader ends); one that never
+    // streamed is refused, so no client waits on a pending head forever. A noted refusal keeps its reason.
+    switch (lease_->group->states[ref.head].admission) {
+      case group_head_admission_e::streaming:
+        set_head_state_locked(ref.head, { group_head_admission_e::ended, group_head_reason_e::none });
+        break;
+      case group_head_admission_e::pending:
+        set_head_state_locked(ref.head, { group_head_admission_e::refused, group_head_reason_e::other });
+        break;
+      default:
+        break;
+    }
+  }
+
+  void
+  coordinator_t::bump_group_locked() noexcept {
+    group_revision_.fetch_add(1, std::memory_order_acq_rel);
+  }
+
+  bool
+  coordinator_t::follow_session_head(std::uint32_t launch_session_id, managed_target_t now) {
+    std::lock_guard lock { mutex_ };
+    if (now.display.empty()) {
+      return false;
+    }
+    // Bookkeeping for a change that already happened: admission fences do not apply.
+    const auto *ref = managed_reference_locked(launch_session_id);
+    if (!ref) {
+      return false;
+    }
+    const auto head = ref->head;
+    if (lease_->group) {
+      const auto &heads = lease_->group->heads;
+      for (std::size_t i = 0; i < heads.size(); ++i) {
+        if (i != head && heads[i].display == now.display) {
+          return false;
+        }
+      }
+      lease_->group->heads[head] = now;
+      bump_group_locked();
+    }
+    if (head == 0) {
+      lease_->display = std::move(now);
+    }
+    return true;
+  }
+
   reject_reason_e
   coordinator_t::managed_reconfigure_reason_locked(std::uint32_t launch_session_id, std::optional<std::uint64_t> transaction, std::size_t &head) {
     if (const auto reason = evaluate_locked(command_kind_e::reconfigure, std::nullopt, false); reason != reject_reason_e::managed_session) {
@@ -1184,8 +1294,18 @@ namespace display_device::topology {
     if (transaction && lease_->transaction != *transaction) {
       return reject_reason_e::stale_transaction;
     }
-    if (lease_->stage == lease_stage_e::preparing) {
+    const auto *ref = managed_reference_locked(launch_session_id);
+    if (!ref) {
       return reject_reason_e::managed_session;
+    }
+    head = ref->head;
+    return reject_reason_e::none;
+  }
+
+  const coordinator_t::attachment_t *
+  coordinator_t::managed_reference_locked(std::uint32_t launch_session_id) {
+    if (!lease_ || lease_->flavor != launch_flavor_e::managed || lease_->stage == lease_stage_e::preparing) {
+      return nullptr;
     }
     // A join past its setup deadline is no reference, even if nothing reaped it yet.
     expire_joins_locked();
@@ -1193,19 +1313,15 @@ namespace display_device::topology {
     for (const auto &ref : lease_->attachments) {
       if (ref.launch_session_id == launch_session_id) {
         if (found) {
-          return reject_reason_e::managed_session;
+          return nullptr;
         }
         found = &ref;
       }
     }
-    if (!found) {
-      return reject_reason_e::managed_session;
+    if (!found || (found->head != 0 && (!lease_->group || lease_->group->ended || found->head >= lease_->group->heads.size()))) {
+      return nullptr;
     }
-    if (found->head != 0 && (!lease_->group || lease_->group->ended || found->head >= lease_->group->heads.size())) {
-      return reject_reason_e::managed_session;
-    }
-    head = found->head;
-    return reject_reason_e::none;
+    return found;
   }
 
   bool
@@ -1227,6 +1343,9 @@ namespace display_device::topology {
     }
     ref->stage = lease_stage_e::active;
     lease_->stage = lease_stage_e::active;
+    if (lease_->group && !lease_->group->ended && (ref->serial == 0 || ref->head != 0) && ref->head < lease_->group->states.size()) {
+      set_head_state_locked(ref->head, { group_head_admission_e::streaming, lease_->group->states[ref->head].reason });
+    }
     touch_managed_locked();
     return true;
   }

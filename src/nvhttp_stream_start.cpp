@@ -1280,6 +1280,7 @@ namespace nvhttp::stream_start {
     const auto refuse = [&](const std::string &reason) {
       BOOST_LOG(info) << "Display group head " << join.head << " could not take " << width << 'x' << height
                       << "; the member join is refused: " << reason;
+      coordinator.note_group_head(token, { topology::group_head_admission_e::refused, topology::group_head_reason_e::mode_change_refused });
       set_sunshine_error(tree, 503, "The display group member's mode could not be applied: " + reason,
         "DISPLAY_GROUP_REFUSED", "Retry after the current display operation completes.", "retry_launch",
         "display", "display_group", true);
@@ -1302,6 +1303,7 @@ namespace nvhttp::stream_start {
       case topology::native_mode_verdict_e::refused:
         BOOST_LOG(info) << "Display group head " << join.head << " keeps its mode; " << width << 'x' << height
                         << " was refused (the encoder scales): " << changed.reason;
+        coordinator.note_group_head(token, { topology::group_head_admission_e::pending, topology::group_head_reason_e::mode_change_refused });
         return true;
       case topology::native_mode_verdict_e::conflict:
       default:
@@ -1325,6 +1327,8 @@ namespace nvhttp::stream_start {
     const auto target = coordinator.managed_display(token);
     if (!target) {
       set_managed_display_error(tree, "the shared topology has no prepared target");
+      // A display-group member's head is shown refused in the group layout (no-op for anyone else).
+      coordinator.note_group_head(token, { topology::group_head_admission_e::refused, topology::group_head_reason_e::other });
       return false;
     }
     // Admitted against the selection the owner was probed on; a reprobe here
@@ -1332,6 +1336,7 @@ namespace nvhttp::stream_start {
     auto outcome = video::admit_existing(managed_probe_target(launch_session, target->display));
     if (outcome.status != 0) {
       set_video_probe_error(tree, outcome.result);
+      coordinator.note_group_head(token, { topology::group_head_admission_e::refused, topology::group_head_reason_e::admission_budget });
       return false;
     }
     adopt_managed_display(launch_session, *target);

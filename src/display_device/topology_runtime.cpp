@@ -116,12 +116,16 @@ namespace display_device::coordinated {
             }
             return topology::native_prepared_t { std::nullopt, std::move(reason) };
           }
-          topology::native_prepared_t prepared {
-            topology::managed_target_t { outcome.target->display.value, outcome.target->virtual_head },
-            {},
+          const auto target_of = [](const topology::native_target_t &head) {
+            topology::managed_target_t target { head.display.value, head.virtual_head };
+            if (head.layout) {
+              target.geometry = topology::to_head_geometry(*head.layout);
+            }
+            return target;
           };
+          topology::native_prepared_t prepared { target_of(*outcome.target), {} };
           for (const auto &head : outcome.targets) {
-            prepared.heads.push_back({ head.display.value, head.virtual_head });
+            prepared.heads.push_back(target_of(head));
           }
           if (prepared.heads.empty()) {
             prepared.heads.push_back(*prepared.display);
@@ -149,6 +153,9 @@ namespace display_device::coordinated {
           }
           changed.display = outcome.display ? outcome.display->value : std::string {};
           changed.reason = std::move(outcome.reason);
+          if (outcome.layout) {
+            changed.geometry = topology::to_head_geometry(*outcome.layout);
+          }
           return changed;
         },
       };
@@ -245,6 +252,16 @@ namespace display_device::coordinated {
   topology::native_mode_changed_t
   change_session_native_mode(std::uint32_t launch_session_id, std::uint32_t width, std::uint32_t height) {
     return lifecycle().change_session_native_mode(launch_session_id, width, height);
+  }
+
+  std::uint64_t
+  display_group_revision() {
+    return coordinator().display_group_revision();
+  }
+
+  std::optional<topology::group_layout_t>
+  display_group_layout(std::uint32_t launch_session_id) {
+    return coordinator().display_group_layout(launch_session_id);
   }
 
   std::uint8_t

@@ -336,6 +336,12 @@ namespace display_device::topology {
     const auto result = coordinator_.run_managed_reconfigure(launch_session_id,
       [&](const mutation_capability_t &capability, const command_context_t &, std::size_t head) {
         changed = change_native_mode(capability, head, width, height);
+        // The head may have been re-created: what the group and later joiners see follows it.
+        if (changed->verdict != native_mode_verdict_e::conflict && !changed->display.empty() &&
+            !coordinator_.follow_session_head(launch_session_id, { changed->display, true, changed->geometry })) {
+          report("The managed head of launch session " + std::to_string(launch_session_id) + " is now " + changed->display +
+                 ", which its display group cannot follow");
+        }
       });
     if (changed) {
       return std::move(*changed);

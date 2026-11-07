@@ -958,6 +958,7 @@ namespace display_device::topology {
       }
     }
 
+    std::optional<inventory_t> settled_placement;
     if (count > 1) {
       // Adding a head can move or deactivate the ones added before it.
       const auto settled_heads = platform_.inventory();
@@ -974,14 +975,18 @@ namespace display_device::topology {
       if (const auto error = place(platform_, capability, record, ids_of(owned), placed, exactly(owned), "Adding the virtual displays changed other displays")) {
         return roll_back_heads(capability, record, exactly(owned), *error);
       }
+      settled_placement = std::move(placed);
     }
 
     created_in_this_run_ = record.transaction;
     health_ = { true, false, {} };
-    native_outcome_t outcome { native_verdict_e::ok, native_target_t { owned.front().id, true }, {} };
+    native_outcome_t outcome { native_verdict_e::ok, std::nullopt, {} };
     for (const auto &head : owned) {
-      outcome.targets.push_back({ head.id, true });
+      // Where each head ended up: the last verified placement of the whole set, or its own.
+      const auto *now = settled_placement ? find_unique(*settled_placement, head.id) : &head;
+      outcome.targets.push_back({ head.id, true, now ? now->layout : std::nullopt });
     }
+    outcome.target = outcome.targets.front();
     return outcome;
   }
 
@@ -1099,7 +1104,7 @@ namespace display_device::topology {
       }
       const auto previous = head->layout->mode;
       if (same_resolution(previous.resolution, resolution)) {
-        return { mode_change_verdict_e::unchanged, head->id, {} };
+        return { mode_change_verdict_e::unchanged, head->id, {}, head->layout };
       }
 
       const auto guid = expected->head->guid;
@@ -1190,7 +1195,7 @@ namespace display_device::topology {
       }
       const auto previous = head->layout->mode;
       if (same_resolution(previous.resolution, resolution)) {
-        return { mode_change_verdict_e::unchanged, head->id, {} };
+        return { mode_change_verdict_e::unchanged, head->id, {}, head->layout };
       }
 
       // The other heads of the set, exactly as listed now: same identity, state and mode afterwards.
@@ -1308,7 +1313,7 @@ namespace display_device::topology {
     if (const auto saved = store_.save(record); !saved) {
       return fail("the native journal could not record the virtual display as it is now: " + saved.error().detail);
     }
-    return { verdict, head.id, std::move(reason) };
+    return { verdict, head.id, std::move(reason), head.layout };
   }
 
   mode_change_outcome_t
@@ -1339,7 +1344,7 @@ namespace display_device::topology {
       conflict(detail);
       return { mode_change_verdict_e::conflict, std::nullopt, detail };
     }
-    return { verdict, head.id, std::move(reason) };
+    return { verdict, head.id, std::move(reason), head.layout };
   }
 
   native_outcome_t
@@ -1614,6 +1619,20 @@ namespace display_device::topology {
       return { mode_change_verdict_e::refused, std::nullopt, unusable(profile_.error()) };
     }
     return executor_->change_mode(capability, head, resolution);
+  }
+
+  head_geometry_t
+  to_head_geometry(const layout_t &layout) {
+    const auto &rate = layout.mode.refresh_rate;
+    const std::uint64_t millihz = rate.denominator == 0 ? 0 :
+                                                          (std::uint64_t { rate.numerator } * 1000 + rate.denominator / 2) / rate.denominator;
+    return {
+      layout.position.x,
+      layout.position.y,
+      layout.mode.resolution.width,
+      layout.mode.resolution.height,
+      static_cast<std::uint32_t>(std::min<std::uint64_t>(millihz, UINT32_MAX)),
+    };
   }
 
   std::shared_ptr<managed_native_t>

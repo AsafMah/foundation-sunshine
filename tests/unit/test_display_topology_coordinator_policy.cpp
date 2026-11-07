@@ -27,7 +27,7 @@
 #include "src/display_device/topology_toggle.h"
 #include "src/display_device/topology_capability.h"
 #include "src/display_device/topology_coordinator.h"
-
+#include "src/display_device/topology_group_layout.h"
 namespace display_device::topology {
   inline void
   PrintTo(outcome_e value, std::ostream *os) {
@@ -5540,6 +5540,345 @@ namespace {
     EXPECT_EQ(result.outcome, outcome_e::rejected);
     EXPECT_EQ(result.reason, reject_reason_e::stale_transaction);
     EXPECT_TRUE(ran.empty()) << "admitted at submission, refused when dequeued";
+  }
+
+  // GW-H4: the coordinator follows a head a managed mode change re-created, with where it is now.
+  TEST(DisplayTopologyGroup, AFollowedHeadIsWhatTheGroupShowsNextAndHeadsStayDistinct) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open());
+    auto &coordinator = *fixture.coordinator;
+    const auto member = fixture.member(740, 1);
+    ASSERT_TRUE(member);
+
+    const head_geometry_t moved { 2560, 0, 1920, 1080, 60000 };
+    ASSERT_TRUE(coordinator.follow_session_head(740, { "{head-1b}", true, moved }));
+    auto shown = coordinator.managed_display(*member);
+    ASSERT_TRUE(shown);
+    EXPECT_EQ(shown->display, "{head-1b}");
+    EXPECT_EQ(shown->geometry, moved);
+    EXPECT_EQ(coordinator.managed_display(fixture.leader), three_heads[0]) << "only the member's own head";
+
+    const head_geometry_t leader_now { 0, 0, 2560, 1440, 144000 };
+    ASSERT_TRUE(coordinator.follow_session_head(700, { "{head-0b}", true, leader_now }));
+    shown = coordinator.managed_display(fixture.leader);
+    ASSERT_TRUE(shown);
+    EXPECT_EQ(shown->display, "{head-0b}");
+    EXPECT_EQ(shown->geometry, leader_now);
+
+    EXPECT_FALSE(coordinator.follow_session_head(740, three_heads[2])) << "another head's display";
+    EXPECT_FALSE(coordinator.follow_session_head(740, { "{head-0b}", true })) << "the leader's display";
+    EXPECT_FALSE(coordinator.follow_session_head(700, { "{head-1b}", true })) << "a member's display";
+    EXPECT_FALSE(coordinator.follow_session_head(740, { "", true })) << "an empty display";
+    EXPECT_FALSE(coordinator.follow_session_head(999, { "{elsewhere}", true })) << "no reference";
+    EXPECT_EQ(coordinator.managed_display(*member)->display, "{head-1b}");
+    EXPECT_EQ(coordinator.managed_display(fixture.leader)->display, "{head-0b}");
+    EXPECT_TRUE(coordinator.follow_session_head(740, { "{head-1b}", true, moved })) << "following the same display again";
+
+    ASSERT_TRUE(coordinator.end_managed_launch(fixture.leader));
+    EXPECT_FALSE(coordinator.follow_session_head(740, { "{head-1c}", true })) << "an ended group never changes";
+  }
+
+  TEST(DisplayTopologyCoordinator, ASingleHeadLeaseFollowsItsRecreatedHeadForLaterJoiners) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock, true) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 66, "cert:a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(coordinator.run_launch_prepare(*owner.token, {}).completed());
+    ASSERT_TRUE(coordinator.record_managed_display(*owner.token, { "{head}", true }));
+    EXPECT_FALSE(coordinator.follow_session_head(66, { "{head-b}", true })) << "a preparing lease";
+    ASSERT_TRUE(coordinator.bind_launch(*owner.token));
+    ASSERT_TRUE(coordinator.launch_activated(*owner.token));
+
+    ASSERT_TRUE(coordinator.follow_session_head(66, { "{head-b}", true, head_geometry_t { 0, 0, 1280, 720, 60000 } }));
+    EXPECT_EQ(coordinator.managed_display(*owner.token)->display, "{head-b}");
+    const auto joiner = coordinator.admit_managed_join({ 67, "cert:a" });
+    ASSERT_TRUE(joiner);
+    EXPECT_EQ(coordinator.managed_display(*joiner.token)->display, "{head-b}") << "a later joiner captures the head as it is now";
+  }
+
+  // ---------------------------------------------------------------------------
+  // GW-H4: the display group layout (0x55F0 v1) every session of a group is sent
+  // ---------------------------------------------------------------------------
+
+  const head_geometry_t geometry_0 { 0, 0, 2560, 1440, 144000 };
+  const head_geometry_t geometry_1 { 2560, 0, 1920, 1080, 60000 };
+  const head_geometry_t geometry_2 { -1920, 180, 1920, 1080, 59940 };
+  const std::vector<managed_target_t> placed_heads {
+    { "{head-0}", true, geometry_0 }, { "{head-1}", true, geometry_1 }, { "{head-2}", true, geometry_2 }
+  };
+
+  std::vector<group_head_state_t>
+  states_of(const std::optional<group_layout_t> &layout) {
+    std::vector<group_head_state_t> states;
+    if (layout) {
+      for (const auto &head : layout->heads) {
+        states.push_back(head.state);
+      }
+    }
+    return states;
+  }
+
+  constexpr group_head_state_t pending_head {};
+  constexpr group_head_state_t streaming_head { group_head_admission_e::streaming, group_head_reason_e::none };
+  constexpr group_head_state_t ended_head { group_head_admission_e::ended, group_head_reason_e::none };
+
+  TEST(DisplayTopologyGroupLayout, EachSessionSeesEveryHeadWhereItIsAndWhichOneIsItsOwn) {
+    group_fixture_t fixture;
+    EXPECT_EQ(fixture.coordinator->display_group_revision(), 0u) << "no group yet";
+    ASSERT_TRUE(fixture.open(placed_heads));
+    auto &coordinator = *fixture.coordinator;
+    EXPECT_GT(coordinator.display_group_revision(), 0u);
+
+    const auto leader = coordinator.display_group_layout(700);
+    ASSERT_TRUE(leader);
+    EXPECT_EQ(leader->id, group_a);
+    EXPECT_EQ(leader->this_head, 0u);
+    ASSERT_EQ(leader->heads.size(), 3u);
+    EXPECT_EQ(states_of(leader), (std::vector<group_head_state_t> { streaming_head, pending_head, pending_head }));
+    EXPECT_EQ(leader->heads[0].geometry, geometry_0);
+    EXPECT_EQ(leader->heads[1].geometry, geometry_1);
+    EXPECT_EQ(leader->heads[2].geometry, geometry_2);
+
+    const auto opened = coordinator.display_group_revision();
+    const auto join = coordinator.admit_group_join({ 740, "cert:a" }, group_a, 1);
+    ASSERT_TRUE(join);
+    const auto joining = coordinator.display_group_layout(740);
+    ASSERT_TRUE(joining) << "a joining member is sent the layout too";
+    EXPECT_EQ(joining->this_head, 1u);
+    EXPECT_EQ(states_of(joining), (std::vector<group_head_state_t> { streaming_head, pending_head, pending_head }));
+    EXPECT_EQ(coordinator.display_group_revision(), opened) << "pending stays pending";
+
+    ASSERT_TRUE(coordinator.bind_launch(*join.token));
+    ASSERT_TRUE(coordinator.launch_activated(*join.token));
+    const auto streaming = coordinator.display_group_revision();
+    EXPECT_GT(streaming, opened);
+    EXPECT_EQ(states_of(coordinator.display_group_layout(700)), (std::vector<group_head_state_t> { streaming_head, streaming_head, pending_head }));
+
+    const head_geometry_t moved { 2560, 0, 1280, 720, 60000 };
+    ASSERT_TRUE(coordinator.follow_session_head(740, { "{head-1b}", true, moved }));
+    const auto followed = coordinator.display_group_revision();
+    EXPECT_GT(followed, streaming) << "a followed head is a new layout";
+    EXPECT_EQ(coordinator.display_group_layout(700)->heads[1].geometry, moved);
+
+    ASSERT_TRUE(coordinator.end_managed_launch(*join.token));
+    EXPECT_GT(coordinator.display_group_revision(), followed);
+    EXPECT_EQ(states_of(coordinator.display_group_layout(700)), (std::vector<group_head_state_t> { streaming_head, ended_head, pending_head }))
+      << "an ended member's head stays, ended";
+    EXPECT_FALSE(coordinator.display_group_layout(740)) << "the ended member is no reference";
+    EXPECT_FALSE(coordinator.display_group_layout(999));
+
+    const auto before_end = coordinator.display_group_revision();
+    ASSERT_TRUE(coordinator.end_managed_launch(fixture.leader));
+    EXPECT_GT(coordinator.display_group_revision(), before_end) << "the group's end is a change";
+    EXPECT_FALSE(coordinator.display_group_layout(700));
+  }
+
+  TEST(DisplayTopologyGroupLayout, OpeningTheGroupIsANewLayoutBeforeAnyoneStreams) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock, true) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 69, "cert:a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(coordinator.run_launch_prepare(*owner.token, {}).completed());
+    ASSERT_TRUE(coordinator.record_managed_display(*owner.token, placed_heads[0]));
+    ASSERT_EQ(coordinator.display_group_revision(), 0u);
+    ASSERT_TRUE(coordinator.open_display_group(*owner.token, group_a, placed_heads));
+    EXPECT_GT(coordinator.display_group_revision(), 0u);
+  }
+
+  TEST(DisplayTopologyGroupLayout, AFollowIsBookkeepingThatAnAdmissionFenceDoesNotBlock) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open(placed_heads));
+    auto &coordinator = *fixture.coordinator;
+    ASSERT_TRUE(fixture.member(747, 1));
+    const auto fence = coordinator.hold_fence();
+    EXPECT_TRUE(coordinator.follow_session_head(747, { "{head-1-recreated}", true, geometry_1 }))
+      << "the head already changed; a teardown fence must not leave the group naming the old one";
+    EXPECT_EQ(coordinator.display_group_layout(700)->heads[1].geometry, geometry_1);
+  }
+
+  TEST(DisplayTopologyGroupLayout, AJoinThatExpiresOrIsAbortedBeforeStreamingIsShownRefused) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open(placed_heads));
+    auto &coordinator = *fixture.coordinator;
+    const group_head_state_t gone { group_head_admission_e::refused, group_head_reason_e::other };
+
+    const auto aborted = coordinator.admit_group_join({ 748, "cert:a" }, group_a, 2);
+    ASSERT_TRUE(aborted);
+    const auto before_abort = coordinator.display_group_revision();
+    ASSERT_TRUE(coordinator.abort_launch(*aborted.token, {}));
+    EXPECT_EQ(coordinator.display_group_layout(700)->heads[2].state, gone) << "not left pending forever";
+    EXPECT_GT(coordinator.display_group_revision(), before_abort);
+
+    const auto expiring = coordinator.admit_group_join({ 749, "cert:a" }, group_a, 1);
+    ASSERT_TRUE(expiring);
+    const auto before_expiry = coordinator.display_group_revision();
+    fixture.clock.advance(1h);
+    EXPECT_EQ(coordinator.display_group_layout(700)->heads[1].state, gone) << "an expired join is no member";
+    EXPECT_GT(coordinator.display_group_revision(), before_expiry);
+  }
+
+  TEST(DisplayTopologyGroupLayout, ARefusedOrModeKeepingMemberHeadCarriesItsReason) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open(placed_heads));
+    auto &coordinator = *fixture.coordinator;
+    const group_head_state_t budget { group_head_admission_e::refused, group_head_reason_e::admission_budget };
+    const group_head_state_t kept_mode { group_head_admission_e::pending, group_head_reason_e::mode_change_refused };
+
+    const auto refused = coordinator.admit_group_join({ 741, "cert:a" }, group_a, 2);
+    ASSERT_TRUE(refused);
+    const auto before = coordinator.display_group_revision();
+    ASSERT_TRUE(coordinator.note_group_head(*refused.token, budget));
+    EXPECT_GT(coordinator.display_group_revision(), before);
+    EXPECT_EQ(coordinator.display_group_layout(700)->heads[2].state, budget);
+    const auto noted = coordinator.display_group_revision();
+    EXPECT_TRUE(coordinator.note_group_head(*refused.token, budget));
+    EXPECT_EQ(coordinator.display_group_revision(), noted) << "the same state is no change";
+    ASSERT_TRUE(coordinator.abort_launch(*refused.token, {}));
+    EXPECT_EQ(coordinator.display_group_layout(700)->heads[2].state, budget) << "the aborted join stays refused";
+    EXPECT_FALSE(coordinator.note_group_head(*refused.token, pending_head)) << "no longer a reference";
+
+    const auto retry = coordinator.admit_group_join({ 742, "cert:a" }, group_a, 2);
+    ASSERT_TRUE(retry);
+    EXPECT_EQ(coordinator.display_group_layout(700)->heads[2].state, pending_head) << "a new attempt is pending again";
+
+    const auto keeps = coordinator.admit_group_join({ 743, "cert:a" }, group_a, 1);
+    ASSERT_TRUE(keeps);
+    ASSERT_TRUE(coordinator.note_group_head(*keeps.token, kept_mode));
+    ASSERT_TRUE(coordinator.bind_launch(*keeps.token));
+    ASSERT_TRUE(coordinator.launch_activated(*keeps.token));
+    EXPECT_EQ(coordinator.display_group_layout(743)->heads[1].state,
+      (group_head_state_t { group_head_admission_e::streaming, group_head_reason_e::mode_change_refused }))
+      << "streaming at the mode it kept";
+
+    EXPECT_FALSE(coordinator.note_group_head(fixture.leader, budget)) << "the leader's head is not a member's";
+    auto stale = *keeps.token;
+    ++stale.transaction;
+    EXPECT_FALSE(coordinator.note_group_head(stale, budget));
+  }
+
+  TEST(DisplayTopologyGroupLayout, AnUngroupedManagedStreamIsSentNoLayout) {
+    fake_clock_t clock;
+    coordinator_t coordinator { make_options(clock, true) };
+    ASSERT_TRUE(start_ready(coordinator).completed());
+    const auto owner = coordinator.admit_launch({ 68, "cert:a" });
+    ASSERT_TRUE(owner);
+    ASSERT_TRUE(coordinator.run_launch_prepare(*owner.token, {}).completed());
+    ASSERT_TRUE(coordinator.record_managed_display(*owner.token, { "{head}", true }));
+    ASSERT_TRUE(coordinator.bind_launch(*owner.token));
+    ASSERT_TRUE(coordinator.launch_activated(*owner.token));
+    EXPECT_FALSE(coordinator.display_group_layout(68));
+    EXPECT_EQ(coordinator.display_group_revision(), 0u);
+  }
+
+  TEST(DisplayTopologyGroupLayout, AHeadZeroJoinerOfAGroupLeaseIsSentNoLayout) {
+    group_fixture_t fixture;
+    ASSERT_TRUE(fixture.open(placed_heads));
+    const auto joiner = fixture.coordinator->admit_managed_join({ 744, "cert:a" });
+    ASSERT_TRUE(joiner);
+    EXPECT_FALSE(fixture.coordinator->display_group_layout(744)) << "it negotiated no group";
+  }
+
+  // The contract's golden message (moonlight-common-c tests/DisplayGroupStreamGoldenTest.c):
+  // two heads, leader 2560x1440@144 at the origin, member 1920x1080@60 at -1920,180 refused by the budget.
+  std::vector<std::uint8_t>
+  golden_layout(std::uint8_t heads, std::uint8_t this_head) {
+    const auto put32 = [](std::vector<std::uint8_t> &wire, std::size_t at, std::uint32_t value) {
+      for (int i = 0; i < 4; ++i) wire[at + i] = static_cast<std::uint8_t>(value >> (8 * i));
+    };
+    std::vector<std::uint8_t> wire(20 + 24 * heads, 0);
+    wire[0] = 1;
+    wire[1] = heads;
+    wire[2] = this_head;
+    for (int i = 0; i < 16; ++i) wire[4 + i] = static_cast<std::uint8_t>(0xA0 + i);
+    for (std::uint8_t h = 0; h < heads; ++h) {
+      const std::size_t e = 20 + 24 * h;
+      wire[e] = h;
+      wire[e + 1] = h == 0 ? 1 : 2;
+      wire[e + 2] = h == 0 ? 0 : 1;
+      put32(wire, e + 4, h == 0 ? 0 : static_cast<std::uint32_t>(-1920));
+      put32(wire, e + 8, h == 0 ? 0 : 180);
+      put32(wire, e + 12, h == 0 ? 2560 : 1920);
+      put32(wire, e + 16, h == 0 ? 1440 : 1080);
+      put32(wire, e + 20, h == 0 ? 144000 : 60000);
+    }
+    return wire;
+  }
+
+  group_layout_t
+  golden_fixture(std::uint8_t heads, std::uint8_t this_head) {
+    group_layout_t layout;
+    for (int i = 0; i < 16; ++i) layout.id[i] = static_cast<std::uint8_t>(0xA0 + i);
+    layout.this_head = this_head;
+    for (std::uint8_t h = 0; h < heads; ++h) {
+      if (h == 0) {
+        layout.heads.push_back({ streaming_head, head_geometry_t { 0, 0, 2560, 1440, 144000 } });
+      }
+      else {
+        layout.heads.push_back({ { group_head_admission_e::refused, group_head_reason_e::admission_budget },
+          head_geometry_t { -1920, 180, 1920, 1080, 60000 } });
+      }
+    }
+    return layout;
+  }
+
+  TEST(DisplayGroupLayoutWire, EncodesTheContractsGoldenMessage) {
+    const auto wire = encode_group_layout(golden_fixture(2, 0));
+    EXPECT_EQ(wire.size(), 68u);
+    EXPECT_EQ(wire, golden_layout(2, 0));
+    EXPECT_EQ(encode_group_layout(golden_fixture(2, 1)), golden_layout(2, 1)) << "a member's copy names its own head";
+    EXPECT_EQ(encode_group_layout(golden_fixture(8, 7)), golden_layout(8, 7)) << "the most heads";
+    EXPECT_EQ(display_group_layout_type, 0x55F0);
+  }
+
+  TEST(DisplayGroupLayoutWire, UnknownGeometryIsZerosAndReasonsAreLittleEndian) {
+    group_layout_t layout;
+    layout.id = group_a;
+    layout.heads = { { streaming_head, std::nullopt }, { { group_head_admission_e::ended, group_head_reason_e::other }, std::nullopt } };
+    const auto wire = encode_group_layout(layout);
+    ASSERT_EQ(wire.size(), 68u);
+    EXPECT_TRUE(std::all_of(wire.begin() + 24, wire.begin() + 44, [](auto b) { return b == 0; })) << "head 0's geometry";
+    EXPECT_EQ(wire[44], 1u) << "index";
+    EXPECT_EQ(wire[45], 3u) << "ended";
+    EXPECT_EQ(wire[46], 0xFFu);
+    EXPECT_EQ(wire[47], 0xFFu);
+    EXPECT_TRUE(std::equal(group_a.begin(), group_a.end(), wire.begin() + 4));
+  }
+
+  TEST(DisplayGroupLayoutWire, ALayoutTheContractCannotCarryIsNotEncoded) {
+    EXPECT_TRUE(encode_group_layout(golden_fixture(0, 0)).empty()) << "no heads";
+    EXPECT_TRUE(encode_group_layout(golden_fixture(9, 0)).empty()) << "too many heads";
+    EXPECT_TRUE(encode_group_layout(golden_fixture(2, 2)).empty()) << "its own head is not in the group";
+  }
+
+  TEST(DisplayGroupLayoutWire, EachRevisionIsSentOnceAndAFailedSendIsRetried) {
+    group_layout_sender_t sender;
+    int snapshots = 0;
+    std::optional<group_layout_t> layout = golden_fixture(2, 1);
+    const auto snapshot = [&]() {
+      ++snapshots;
+      return layout;
+    };
+    EXPECT_FALSE(sender.due(0, snapshot)) << "revision 0: no group ever opened";
+    EXPECT_EQ(snapshots, 0);
+
+    auto first = sender.due(3, snapshot);
+    ASSERT_TRUE(first);
+    EXPECT_EQ(*first, golden_layout(2, 1));
+    EXPECT_TRUE(sender.due(3, snapshot)) << "not delivered yet: retried";
+    sender.delivered(3);
+    EXPECT_FALSE(sender.due(3, snapshot)) << "delivered";
+    EXPECT_EQ(snapshots, 2);
+
+    layout.reset();
+    EXPECT_FALSE(sender.due(4, snapshot)) << "not a group session";
+    EXPECT_EQ(snapshots, 3);
+    EXPECT_FALSE(sender.due(4, snapshot)) << "asked once per revision";
+    EXPECT_EQ(snapshots, 3);
+
+    layout = golden_fixture(2, 1);
+    EXPECT_TRUE(sender.due(5, snapshot));
   }
 
   TEST(DisplayTopologyGroup, AnExpiredJoiningMemberIsNeverReconfigured) {

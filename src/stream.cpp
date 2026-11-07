@@ -46,6 +46,7 @@ extern "C" {
 #include "streaming/fec.h"
 #include "display_device/display_device.h"
 #include "display_device/session.h"
+#include "display_device/topology_group_layout.h"
 #include "display_device/topology_runtime.h"
 #include "globals.h"
 #include "haptics/authored_ir.h"
@@ -667,6 +668,8 @@ namespace stream {
       std::array<platf::ds5_haptics_state_event_t, 16> ds5_haptics_states;
       safe::mail_raw_t::event_t<video::hdr_info_t> hdr_queue;
       safe::mail_raw_t::event_t<std::pair<std::uint32_t, std::uint32_t>> resolution_change_queue;  // width, height
+      /** GW-H4: the display group layout revision this session was last sent (control thread only). */
+      display_device::topology::group_layout_sender_t display_group;
 
       bool local_cursor_mode = false;
       std::uint64_t cursor_revision = 0;
@@ -1820,6 +1823,36 @@ namespace stream {
     return 0;
   }
 
+  /**
+   * GW-H4: send the display group layout (0x55F0 v1, wire built by
+   * display_device::topology::encode_group_layout) to one session of a group.
+   * Returns 0 on success, -1 when it could not be sent (retried on the next poll).
+   */
+  int
+  send_display_group_layout(session_t *session, const std::vector<std::uint8_t> &wire) {
+    if (!session->control.peer || wire.empty()) {
+      return -1;
+    }
+    std::vector<std::uint8_t> plaintext(sizeof(control_header_v2) + wire.size());
+    auto *hdr = reinterpret_cast<control_header_v2 *>(plaintext.data());
+    hdr->type = util::endian::little<std::uint16_t>(display_device::topology::display_group_layout_type);
+    hdr->payloadLength = util::endian::little<std::uint16_t>(static_cast<std::uint16_t>(wire.size()));
+    std::memcpy(plaintext.data() + sizeof(control_header_v2), wire.data(), wire.size());
+
+    std::vector<std::uint8_t> encrypted(
+      sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(plaintext.size()) + crypto::cipher::tag_size);
+    auto view = encode_control_buf(session, std::string_view { (char *) plaintext.data(), plaintext.size() }, encrypted.data(), encrypted.size());
+    if (view.empty()) {
+      return -1;
+    }
+    if (session->broadcast_ref->control_server.send(view, session->control.peer)) {
+      BOOST_LOG(warning) << "Couldn't send the display group layout"sv;
+      return -1;
+    }
+    BOOST_LOG(info) << "Sent the display group layout ("sv << wire.size() << " bytes) to launch session "sv << session->launch_session_id;
+    return 0;
+  }
+
   int
   send_text_context(session_t *session, const text_context::payload_t &payload) {
     if (!session->control.peer || session->config.controlProtocolType != 13 ||
@@ -2606,6 +2639,18 @@ namespace stream {
                 send_resolution_change(session, resolution->first, resolution->second);
               }
             }
+            // GW-H4: every session of a display group is sent the group layout once the control stream
+            // is up, and again whenever it changes. Revision 0 (no group ever opened) costs one atomic load.
+            if (session->control.peer) {
+              const auto revision = display_device::coordinated::display_group_revision();
+              auto &group = session->control.display_group;
+              if (auto wire = group.due(revision, [session]() { return display_device::coordinated::display_group_layout(session->launch_session_id); })) {
+                if (send_display_group_layout(session, *wire) == 0) {
+                  group.delivered(revision);
+                }
+              }
+            }
+
 
             if (session->control.local_cursor_mode) {
               cursor_channel::snapshot_t cursor;

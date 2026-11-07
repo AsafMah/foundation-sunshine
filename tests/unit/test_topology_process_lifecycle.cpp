@@ -898,6 +898,36 @@ namespace display_device::topology {
       EXPECT_EQ(seen, (std::vector<std::string> { "0:2560x1440", "1:1920x1080" }));
     }
 
+    TEST(ProcessLifecycleManaged, AManagedModeChangeThatRecreatesTheHeadIsFollowedWithWhereItIs) {
+      fixture_t f;
+      const head_geometry_t now { 2560, 0, 1920, 1080, 60000 };
+      auto &lifecycle = f.make_managed([&](native_lifecycle_hooks_t &hooks) {
+        hooks.change_mode = [&](const mutation_capability_t &, std::size_t head, std::uint32_t, std::uint32_t) {
+          return native_mode_changed_t { native_mode_verdict_e::applied, "{zako-head-" + std::to_string(head) + "b}", {}, now };
+        };
+      });
+      ASSERT_EQ(lifecycle.start(), lifecycle_start_e::completed);
+      auto &coordinator = lifecycle.coordinator();
+      const auto owner = coordinator.admit_launch({ 93, "cert:a" });
+      ASSERT_TRUE(owner);
+      ASSERT_TRUE(coordinator.run_launch_prepare(*owner.token, {}).completed());
+      ASSERT_TRUE(coordinator.record_managed_display(*owner.token, { "{zako-head-0}", true }));
+      const display_group_id_t group { 0x93, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+      ASSERT_TRUE(coordinator.open_display_group(*owner.token, group, { { "{zako-head-0}", true }, { "{zako-head-1}", true } }));
+      ASSERT_TRUE(coordinator.bind_launch(*owner.token));
+      ASSERT_TRUE(coordinator.launch_activated(*owner.token));
+      const auto member = coordinator.admit_group_join({ 94, "cert:a" }, group, 1);
+      ASSERT_TRUE(member);
+
+      const auto changed = lifecycle.change_session_native_mode(94, 1920, 1080);
+      ASSERT_EQ(changed.verdict, native_mode_verdict_e::applied) << changed.reason;
+      const auto shown = coordinator.managed_display(*member.token);
+      ASSERT_TRUE(shown);
+      EXPECT_EQ(shown->display, "{zako-head-1b}");
+      EXPECT_EQ(shown->geometry, now);
+      EXPECT_EQ(coordinator.managed_display(*owner.token)->display, "{zako-head-0}");
+    }
+
     TEST(ProcessLifecycleManaged, ARefusedNativeModeChangeKeepsItsReason) {
       fixture_t f;
       auto &lifecycle = f.make_managed([&](native_lifecycle_hooks_t &hooks) {

@@ -1401,6 +1401,39 @@ namespace {
     EXPECT_EQ(coordinator->managed_display(*token), member_head);
   }
 
+  TEST_F(DisplayGroupMemberMode, AKeptModeAndARefusedJoinAreShownInTheLayout) {
+    lead();
+    const auto token = joined();
+    ASSERT_TRUE(token);
+    answer = { topology::native_mode_verdict_e::refused, {}, "mode not offered" };
+    EXPECT_TRUE(apply(*token, 1920, 1080));
+    auto layout = coordinator->display_group_layout(77);
+    ASSERT_TRUE(layout);
+    EXPECT_EQ(layout->heads[1].state,
+      (topology::group_head_state_t { topology::group_head_admission_e::pending, topology::group_head_reason_e::mode_change_refused }));
+
+    answer = { topology::native_mode_verdict_e::conflict, {}, "ioctl exploded" };
+    EXPECT_FALSE(apply(*token, 1920, 1080));
+    layout = coordinator->display_group_layout(77);
+    ASSERT_TRUE(layout);
+    EXPECT_EQ(layout->heads[1].state,
+      (topology::group_head_state_t { topology::group_head_admission_e::refused, topology::group_head_reason_e::mode_change_refused }));
+  }
+
+  TEST_F(DisplayGroupMemberMode, AMemberTheBudgetRefusesIsShownRefusedInTheLayout) {
+    lead();
+    const auto token = joined();
+    ASSERT_TRUE(token);
+    rtsp_stream::launch_session_t joiner {};
+    joiner.id = 77;
+    fake.joiner_admissions = { probed(probe_error_e::no_working_encoder) };
+    EXPECT_FALSE(nvhttp::stream_start::join_managed_display(out, joiner, *coordinator, *token));
+    const auto layout = coordinator->display_group_layout(77);
+    ASSERT_TRUE(layout);
+    EXPECT_EQ(layout->heads[1].state,
+      (topology::group_head_state_t { topology::group_head_admission_e::refused, topology::group_head_reason_e::admission_budget }));
+  }
+
   TEST(DisplayGroupJoinStatus, ARefusalIsA503CarryingTheReason) {
     boost::property_tree::ptree tree;
     nvhttp::stream_start::set_group_join_error(tree,

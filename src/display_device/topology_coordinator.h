@@ -136,14 +136,30 @@ namespace display_device::topology {
   };
 
   /** Display a managed lease prepared; every reference captures exactly this one. */
+  /** Where a managed head is on the host desktop, as last verified on the worker (host pixels). */
+  struct head_geometry_t {
+    std::int32_t x {};
+    std::int32_t y {};
+    std::uint32_t width {};
+    std::uint32_t height {};
+    std::uint32_t refresh_millihz {};
+
+    friend bool
+    operator==(const head_geometry_t &, const head_geometry_t &) = default;
+  };
+
   struct managed_target_t {
     /** OS display id accepted by capture (CCD device id). */
     std::string display;
     /** Whether the target is a virtual head (vsync override applies). */
     bool virtual_head {};
+    /** An observation, not identity: equality ignores it. */
+    std::optional<head_geometry_t> geometry {};
 
     friend bool
-    operator==(const managed_target_t &, const managed_target_t &) = default;
+    operator==(const managed_target_t &a, const managed_target_t &b) {
+      return a.display == b.display && a.virtual_head == b.virtual_head;
+    }
   };
 
   /** Result of a managed launch preparation: `display` is set exactly when it succeeded. */
@@ -160,6 +176,44 @@ namespace display_device::topology {
 
   /** Most heads one display group holds (the IDX_DISPLAY_GROUP wire limit). */
   inline constexpr std::size_t max_group_heads = 8;
+
+  /** A group head's admission, as the 0x55F0 layout names it (wire values). */
+  enum class group_head_admission_e : std::uint8_t {
+    pending = 0,
+    streaming = 1,
+    refused = 2,
+    ended = 3,
+  };
+
+  /** Why a group head is refused, or a note on a streaming one (wire values). */
+  enum class group_head_reason_e : std::uint16_t {
+    none = 0,
+    admission_budget = 1,
+    mode_change_refused = 2,
+    head_lost = 3,
+    other = 0xFFFF,
+  };
+
+  struct group_head_state_t {
+    group_head_admission_e admission { group_head_admission_e::pending };
+    group_head_reason_e reason { group_head_reason_e::none };
+
+    friend bool
+    operator==(const group_head_state_t &, const group_head_state_t &) = default;
+  };
+
+  struct group_layout_head_t {
+    group_head_state_t state;
+    /** Unknown geometry is sent as zeros. */
+    std::optional<head_geometry_t> geometry;
+  };
+
+  /** One session's view of its display group: every head, and which one it streams. */
+  struct group_layout_t {
+    std::array<std::uint8_t, 16> id {};
+    std::uint8_t this_head {};
+    std::vector<group_layout_head_t> heads;
+  };
 
   enum class group_join_e : std::uint8_t {
     joined,
@@ -559,6 +613,35 @@ namespace display_device::topology {
     command_result_t
     run_managed_reconfigure(std::uint32_t launch_session_id, managed_reconfigure_body_t body);
 
+    /**
+     * After a managed mode change, record the head launch session `launch_session_id`
+     * streams as it is now (the driver may have re-created it): head 0 updates the lease's
+     * display, and the group's head 0 with it; a member updates its group head. Same
+     * reference rules as run_managed_reconfigure. A display another head of the group
+     * already has is refused. Returns false, changing nothing, otherwise.
+     */
+    bool
+    follow_session_head(std::uint32_t launch_session_id, managed_target_t now);
+
+    /**
+     * Record a member head's admission and reason (a refused join, or a mode the head kept),
+     * for the group layout. Only a live member reference (head 1..N-1) of a live group.
+     */
+    bool
+    note_group_head(const launch_token_t &member, group_head_state_t state);
+
+    /**
+     * The group layout launch session `launch_session_id` is sent (0x55F0): every head's
+     * admission and geometry, and its own head. nullopt unless it is a live reference of a
+     * bound/active lease's live group (a leader or a member, not a head-0 joiner).
+     */
+    std::optional<group_layout_t>
+    display_group_layout(std::uint32_t launch_session_id);
+
+    /** Bumped whenever any group layout may have changed; 0 until a group opens. Lock-free. */
+    std::uint64_t
+    display_group_revision() const noexcept;
+
     /** Consume a bound reference, under the ticket lock before removing its ticket. */
     bool
     launch_activated(const launch_token_t &token);
@@ -769,6 +852,8 @@ namespace display_device::topology {
     struct group_t {
       display_group_id_t id {};
       std::vector<managed_target_t> heads;
+      /** Per head, parallel to `heads`. */
+      std::vector<group_head_state_t> states;
       bool ended {};
     };
 
@@ -809,6 +894,13 @@ namespace display_device::topology {
     /** run_managed_reconfigure's admission; `transaction` is set when re-checking at dequeue. */
     reject_reason_e
     managed_reconfigure_reason_locked(std::uint32_t launch_session_id, std::optional<std::uint64_t> transaction, std::size_t &head);
+
+    /**
+     * The one live, unexpired reference of a bound/active managed lease with this launch
+     * session id, of a live group when it is a member's; nullptr otherwise.
+     */
+    const attachment_t *
+    managed_reference_locked(std::uint32_t launch_session_id);
 
     reject_reason_e
     admission_reason_locked();
@@ -868,6 +960,17 @@ namespace display_device::topology {
     /** Mark the lease's group ended and queue its member list for delivery. */
     void
     end_group_locked();
+
+    /** Set head `head`'s layout state; bumps the group revision when it changed. */
+    void
+    set_head_state_locked(std::size_t head, group_head_state_t state);
+
+    void
+    bump_group_locked() noexcept;
+
+    /** A member reference is going away: its head becomes ended (it streamed) or refused (it never did). */
+    void
+    retire_member_state_locked(const attachment_t &ref);
 
     /** Deliver queued group ends outside the mutex; never throws. */
     void
@@ -930,6 +1033,8 @@ namespace display_device::topology {
     std::unique_ptr<topology_command_queue_t> queue_;
     std::uint64_t queue_generation_ {};
     std::optional<lease_t> lease_;
+    /** display_group_revision(); written under mutex_. */
+    std::atomic<std::uint64_t> group_revision_ {};
     std::vector<std::function<bool()>> fences_;
     std::shared_ptr<std::atomic_bool> external_mutation_ { std::make_shared<std::atomic_bool>(false) };
     std::shared_ptr<external_startup_t> external_startup_;

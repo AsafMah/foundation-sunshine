@@ -180,9 +180,13 @@ namespace display_device::topology {
   struct native_target_t {
     os_display_id_t display;
     bool virtual_head {};
+    /** Where the display was when the executor last verified it; an observation, not identity. */
+    std::optional<layout_t> layout {};
 
     bool
-    operator==(const native_target_t &) const = default;
+    operator==(const native_target_t &other) const {
+      return display == other.display && virtual_head == other.virtual_head;
+    }
   };
 
   struct native_outcome_t {
@@ -212,7 +216,13 @@ namespace display_device::topology {
     /** The head's OS identity afterwards (set for applied, unchanged and a verified refusal). */
     std::optional<os_display_id_t> display;
     std::string reason;
+    /** Where the head is afterwards, when `display` is set and it is listed with a layout. */
+    std::optional<layout_t> layout {};
   };
+
+  /** The wire form of a verified layout: refresh in millihertz, rounded to nearest. */
+  head_geometry_t
+  to_head_geometry(const layout_t &layout);
 
   struct native_executor_options_t {
     /** Source of fresh, non-null identities (owner, transaction, request, head intent). */

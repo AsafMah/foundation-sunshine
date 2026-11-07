@@ -30,6 +30,10 @@ namespace display_device::coordinated {
    * not admitted.
    */
   topology::native_mode_changed_t change_session_native_mode(std::uint32_t launch_session_id, std::uint32_t width, std::uint32_t height);
+  /** GW-H4: bumped whenever a display group layout may have changed; 0 until a group opens (lock-free). */
+  std::uint64_t display_group_revision();
+  /** GW-H4: the display group layout launch session `launch_session_id` is sent; nullopt unless it leads or joins a live group. */
+  std::optional<topology::group_layout_t> display_group_layout(std::uint32_t launch_session_id);
   /** The most heads a display-group launch may ask for; 0 in legacy mode or without a usable virtual profile. */
   std::uint8_t display_group_max_heads();
   /** The `display_topology_profile` this process latched; blank in legacy mode. */

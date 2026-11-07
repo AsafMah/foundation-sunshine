@@ -4059,6 +4059,90 @@ TEST_F(NativeExecutor, AManagedHeadModeChangeWithoutAUsableProfileTouchesNothing
   EXPECT_EQ(log.host_writes(), 0u);
 }
 
+// --- GW-H4: where each managed head is, as the executor last verified it ---
+
+namespace {
+  ::testing::AssertionResult
+  listed_as(const std::optional<dt::layout_t> &reported, fake_platform_t &platform, const std::string &name) {
+    if (!reported) {
+      return ::testing::AssertionFailure() << name << ": no layout reported";
+    }
+    const auto &listed = find(platform.host, name);
+    if (!listed.layout) {
+      return ::testing::AssertionFailure() << name << ": not listed with a layout";
+    }
+    if (!(reported->position == listed.layout->position) || !same_mode(reported->mode, listed.layout->mode)) {
+      return ::testing::AssertionFailure() << name << ": reported " << reported->position.x << ',' << reported->position.y << ' '
+                                           << reported->mode.resolution.width << 'x' << reported->mode.resolution.height << ", listed "
+                                           << listed.layout->position.x << ',' << listed.layout->position.y << ' '
+                                           << listed.layout->mode.resolution.width << 'x' << listed.layout->mode.resolution.height;
+    }
+    return ::testing::AssertionSuccess();
+  }
+}  // namespace
+
+TEST_F(NativeExecutor, APreparedGroupReportsEachHeadWhereItWasPlaced) {
+  const auto outcome = prepare_heads(executor, 2);
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok));
+  ASSERT_EQ(outcome.targets.size(), 2u);
+  EXPECT_TRUE(listed_as(outcome.targets[0].layout, platform, "vdd-1"));
+  EXPECT_TRUE(listed_as(outcome.targets[1].layout, platform, "vdd-2"));
+  ASSERT_TRUE(outcome.targets[0].layout && outcome.targets[1].layout);
+  EXPECT_FALSE(outcome.targets[0].layout->position == outcome.targets[1].layout->position) << "placed side by side";
+  ASSERT_TRUE(outcome.target);
+  EXPECT_TRUE(listed_as(outcome.target->layout, platform, "vdd-1"));
+}
+
+TEST_F(NativeExecutor, APreparedSingleHeadReportsWhereItWasPlaced) {
+  const auto outcome = prepare_heads(executor, 1);
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok));
+  ASSERT_EQ(outcome.targets.size(), 1u);
+  EXPECT_TRUE(listed_as(outcome.targets[0].layout, platform, "vdd-1"));
+}
+
+TEST_F(NativeExecutor, AHeadModeChangeReportsTheHeadAsItIsAfterwards) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
+  const auto applied = change_head_with(executor, 1, 2560, 1440);
+  ASSERT_TRUE(mode_verdict_is(applied, dt::mode_change_verdict_e::applied));
+  EXPECT_TRUE(listed_as(applied.layout, platform, "vdd-2"));
+  ASSERT_TRUE(applied.layout);
+  EXPECT_EQ(applied.layout->mode.resolution.width, 2560u);
+
+  const auto unchanged = change_head_with(executor, 1, 2560, 1440);
+  ASSERT_TRUE(mode_verdict_is(unchanged, dt::mode_change_verdict_e::unchanged));
+  EXPECT_TRUE(listed_as(unchanged.layout, platform, "vdd-2"));
+
+  platform.recreate_on_mode = true;
+  const auto recreated = change_head_with(executor, 0, 1280, 720);
+  ASSERT_TRUE(mode_verdict_is(recreated, dt::mode_change_verdict_e::applied));
+  ASSERT_EQ(recreated.display, dt::os_display_id_t { "vdd-3" });
+  EXPECT_TRUE(listed_as(recreated.layout, platform, "vdd-3"));
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+}
+
+TEST_F(NativeExecutor, ASingleHeadModeChangeReportsTheHeadAsItIsAfterwards) {
+  ASSERT_TRUE(verdict_is(prepare_heads(executor, 1), native_verdict_e::ok));
+  dt::mode_change_outcome_t outcome;
+  with_capability(dt::command_kind_e::reconfigure, [&](const auto &capability) {
+    outcome = executor.change_mode(capability, { 2560, 1440 });
+  }, true);
+  ASSERT_TRUE(mode_verdict_is(outcome, dt::mode_change_verdict_e::applied)) << outcome.reason;
+  EXPECT_TRUE(listed_as(outcome.layout, platform, "vdd-1"));
+}
+
+TEST(NativeHeadGeometry, TheWireFormRoundsRefreshToMillihertz) {
+  dt::layout_t layout;
+  layout.position = { -1920, 180 };
+  layout.mode = { { 1920, 1080 }, { 60000, 1001 } };
+  EXPECT_EQ(dt::to_head_geometry(layout), (dt::head_geometry_t { -1920, 180, 1920, 1080, 59940 }));
+  layout.mode.refresh_rate = { 144, 1 };
+  EXPECT_EQ(dt::to_head_geometry(layout).refresh_millihz, 144000u);
+  layout.mode.refresh_rate = { 2, 3 };
+  EXPECT_EQ(dt::to_head_geometry(layout).refresh_millihz, 667u) << "rounded to nearest";
+  layout.mode.refresh_rate = { 60, 0 };
+  EXPECT_EQ(dt::to_head_geometry(layout).refresh_millihz, 0u) << "an unknown rate is 0";
+}
+
 TEST_F(NativeExecutor, ChangeModeOfOneOfTwoHeadsThatAlsoChangesTheOtherRollsBack) {
   ASSERT_TRUE(verdict_is(prepare_heads(executor), native_verdict_e::ok));
   const auto first = mode_of(platform, "vdd-1");
@@ -4302,6 +4386,10 @@ TEST_F(NativeExecutor, TwoHeadsBesideASoleVirtualPrimaryGoLeftToRightAfterIt) {
   EXPECT_EQ(corner(platform.host, "vdd-1"), (dt::position_t { 2560, 0 }));
   EXPECT_EQ(corner(platform.host, "vdd-2"), (dt::position_t { 2560 + 1920, 0 }));
   EXPECT_EQ(outcome.targets.size(), 2u);
+  // GW-H4: each head is reported where the final placement put it, not where it was first seen.
+  ASSERT_EQ(outcome.targets.size(), 2u);
+  EXPECT_TRUE(listed_as(outcome.targets[0].layout, platform, "vdd-1"));
+  EXPECT_TRUE(listed_as(outcome.targets[1].layout, platform, "vdd-2"));
 }
 
 TEST_F(NativeExecutor, AHeadPushedBetweenTwoDisplaysIsMovedToTheRightEdge) {

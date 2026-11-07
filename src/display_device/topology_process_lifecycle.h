@@ -68,6 +68,8 @@ namespace display_device::topology {
     /** The head's display after the change; empty when unknown. */
     std::string display;
     std::string reason;
+    /** Where the head is after the change, when known. */
+    std::optional<head_geometry_t> geometry {};
   };
 
   /**
