@@ -63,6 +63,38 @@ namespace nvhttp::stream_start {
   display_device::topology::display_group_id_t
   random_display_group_id();
 
+  /** GW-H3c /resume displayGroup: exactly 32 lowercase hex digits, bytes in order. */
+  std::optional<display_device::topology::display_group_id_t>
+  parse_display_group(std::string_view value);
+
+  /** GW-H3c /resume displayHead: a plain decimal; the coordinator decides its range. */
+  std::optional<std::size_t>
+  parse_display_head(std::string_view value);
+
+  /** The serverinfo DisplayGroupMaxHeads value: only when two or more heads can be served, at most eight. */
+  std::optional<std::uint8_t>
+  advertised_display_group_heads(std::uint8_t served);
+
+  struct display_group_join_t {
+    display_device::topology::display_group_id_t id {};
+    std::size_t head {};
+  };
+
+  /** Sets the wire contract's status for a refused join: 404 unknown, 403 client, 400 head, 409 busy, 503 refused. */
+  void
+  set_group_join_error(boost::property_tree::ptree &tree, const display_device::topology::group_admission_t &admission);
+
+  /**
+   * Reserve a member head of a live display group. A member never prepares, launches
+   * or restores anything; on refusal the tree carries the contract's status.
+   */
+  display_device::topology::group_admission_t
+  admit_group_member(
+    boost::property_tree::ptree &tree,
+    display_device::topology::coordinator_t &coordinator,
+    const display_device::topology::launch_request_t &request,
+    const display_group_join_t &join);
+
   void
   set_sunshine_error(
     boost::property_tree::ptree &tree,

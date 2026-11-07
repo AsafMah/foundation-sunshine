@@ -36,6 +36,7 @@ extern "C" {
 #include "text_context/bridge.h"
 #include "config.h"
 #include "cursor_channel.h"
+#include "display_device/topology_runtime.h"
 #include "globals.h"
 #include "hdr/dynamic_hdr_selection.h"
 #include "input.h"
@@ -44,6 +45,7 @@ extern "C" {
 #include "pyrowave/runtime.h"
 #include "pyrowave/packet.h"
 #include "nvhttp.h"
+#include "nvhttp_stream_start.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "streaming/fec.h"
@@ -1264,6 +1266,9 @@ namespace rtsp_stream {
       }
       if (text_context::bridge_t::instance().gui_alive()) {
         caps |= platf::platform_caps::remote_text_context;
+      }
+      if (nvhttp::stream_start::advertised_display_group_heads(display_device::coordinated::display_group_max_heads())) {
+        caps |= platf::platform_caps::display_group;
       }
       ss << "a=x-ss-general.featureFlags:" << caps << std::endl;
 #ifdef _WIN32

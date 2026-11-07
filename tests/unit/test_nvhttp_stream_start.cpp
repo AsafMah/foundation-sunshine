@@ -1211,6 +1211,114 @@ namespace {
     EXPECT_TRUE(coordinator->abort_launch(coordination.token, {}));
   }
 
+  // GW-H3c: /resume displayGroup=&displayHead= joins a member head; it never prepares or restores.
+  class DisplayGroupJoin: public ManagedGroupLaunch {
+  protected:
+    void
+    lead() {
+      managed();
+      auto coordination = group_route();
+      prepared = { leader_head, {}, { leader_head, member_head } };
+      fake.probes = { probed(probe_error_e::none) };
+      ASSERT_TRUE(nvhttp::stream_start::prepare_display_and_probe_encoders(tree, launch, true, &coordination));
+      ASSERT_TRUE(coordinator->bind_launch(coordination.token));
+    }
+
+    topology::group_admission_t
+    member(boost::property_tree::ptree &out, std::string key = "fixture", std::size_t head = 1, std::uint32_t id = 77,
+      const topology::display_group_id_t &group = group_id) {
+      return nvhttp::stream_start::admit_group_member(out, *coordinator, { id, std::move(key) }, { group, head });
+    }
+  };
+
+  TEST_F(DisplayGroupJoin, AMemberCapturesItsOwnHeadWithoutPreparingOrRestoring) {
+    lead();
+    boost::property_tree::ptree join_tree;
+    const auto joined = member(join_tree);
+    ASSERT_TRUE(joined);
+    EXPECT_TRUE(join_tree.empty());
+    rtsp_stream::launch_session_t joiner {};
+    joiner.id = 77;
+    fake.joiner_admissions = { probed(probe_error_e::none) };
+    ASSERT_TRUE(nvhttp::stream_start::join_managed_display(join_tree, joiner, *coordinator, *joined.token));
+    EXPECT_TRUE(joiner.display_exact);
+    EXPECT_EQ(joiner.env["SUNSHINE_CLIENT_DISPLAY_NAME"].to_string(), "{zako-head-2}");
+    ASSERT_EQ(fake.joiners_admitted.size(), 1u);
+    EXPECT_EQ(fake.joiners_admitted[0].output_name, "{zako-head-2}");
+    EXPECT_TRUE(coordinator->bind_launch(*joined.token));
+    EXPECT_EQ(prepares, 1) << "only the leader prepared";
+    EXPECT_EQ(restores->load(), 0);
+  }
+
+  TEST_F(DisplayGroupJoin, RefusalsCarryTheStatusTheWireContractNames) {
+    lead();
+    const auto status = [](const boost::property_tree::ptree &t) { return t.get<int>("root.<xmlattr>.status_code", 0); };
+    auto other_group = group_id;
+    other_group[15] ^= 0xff;
+    boost::property_tree::ptree unknown, foreign, leader, beyond, busy, first;
+    EXPECT_FALSE(member(unknown, "fixture", 1, 77, other_group));
+    EXPECT_EQ(status(unknown), 404);
+    EXPECT_FALSE(member(foreign, "another-client"));
+    EXPECT_EQ(status(foreign), 403);
+    EXPECT_FALSE(member(leader, "fixture", 0));
+    EXPECT_EQ(status(leader), 400) << "head 0 is the leader's";
+    EXPECT_FALSE(member(beyond, "fixture", 2));
+    EXPECT_EQ(status(beyond), 400);
+    ASSERT_TRUE(member(first));
+    EXPECT_FALSE(member(busy, "fixture", 1, 78));
+    EXPECT_EQ(status(busy), 409);
+    EXPECT_EQ(prepares, 1);
+    EXPECT_EQ(restores->load(), 0);
+  }
+
+  TEST_F(DisplayGroupJoin, WithoutALiveGroupEveryJoinIsUnknown) {
+    managed();
+    boost::property_tree::ptree join_tree;
+    EXPECT_FALSE(member(join_tree));
+    EXPECT_EQ(join_tree.get<int>("root.<xmlattr>.status_code", 0), 404);
+    EXPECT_EQ(prepares, 0);
+  }
+
+  TEST(DisplayGroupJoinStatus, ARefusalIsA503CarryingTheReason) {
+    boost::property_tree::ptree tree;
+    nvhttp::stream_start::set_group_join_error(tree,
+      { std::nullopt, topology::group_join_e::refused, topology::reject_reason_e::owner_busy });
+    EXPECT_EQ(tree.get<int>("root.<xmlattr>.status_code", 0), 503);
+    EXPECT_NE(tree.get<std::string>("root.<xmlattr>.status_message", "").find(std::string { topology::to_string(topology::reject_reason_e::owner_busy) }),
+      std::string::npos);
+  }
+
+  TEST(DisplayGroupArgument, IsExactlyThirtyTwoLowercaseHexDigits) {
+    using nvhttp::stream_start::parse_display_group;
+    EXPECT_EQ(parse_display_group("0123456789abcdeffedcba9876543210"), std::optional { group_id });
+    EXPECT_FALSE(parse_display_group("0123456789ABCDEFFEDCBA9876543210")) << "the host only ever sends lowercase";
+    EXPECT_FALSE(parse_display_group("0123456789abcdeffedcba987654321"));
+    EXPECT_FALSE(parse_display_group("0123456789abcdeffedcba98765432100"));
+    EXPECT_FALSE(parse_display_group("0123456789abcdeffedcba987654321g"));
+    EXPECT_FALSE(parse_display_group(""));
+  }
+
+  TEST(DisplayHeadArgument, IsAPlainDecimalTheCoordinatorRanges) {
+    using nvhttp::stream_start::parse_display_head;
+    EXPECT_EQ(parse_display_head("1"), std::optional<std::size_t> { 1 });
+    EXPECT_EQ(parse_display_head("7"), std::optional<std::size_t> { 7 });
+    EXPECT_EQ(parse_display_head("0"), std::optional<std::size_t> { 0 }) << "the coordinator refuses the leader's head";
+    EXPECT_FALSE(parse_display_head("01"));
+    EXPECT_FALSE(parse_display_head("-1"));
+    EXPECT_FALSE(parse_display_head("+1"));
+    EXPECT_FALSE(parse_display_head("1000"));
+    EXPECT_FALSE(parse_display_head(""));
+  }
+
+  TEST(DisplayGroupCapability, IsAdvertisedOnlyWhenTwoOrMoreHeadsCanBeServed) {
+    using nvhttp::stream_start::advertised_display_group_heads;
+    EXPECT_FALSE(advertised_display_group_heads(0)) << "the blank profile advertises nothing";
+    EXPECT_FALSE(advertised_display_group_heads(1));
+    EXPECT_EQ(advertised_display_group_heads(2), std::optional<std::uint8_t> { 2 });
+    EXPECT_EQ(advertised_display_group_heads(8), std::optional<std::uint8_t> { 8 });
+    EXPECT_EQ(advertised_display_group_heads(9), std::optional<std::uint8_t> { 8 }) << "the wire carries at most eight";
+  }
+
   TEST(DisplayHeadsArgument, AcceptsOnlyAGroupTheHostServes) {
     using nvhttp::stream_start::parse_display_heads;
     EXPECT_EQ(parse_display_heads("2", 2), std::optional<std::uint8_t> { 2 });

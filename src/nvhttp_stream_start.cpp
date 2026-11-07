@@ -1194,6 +1194,83 @@ namespace nvhttp::stream_start {
     }
   }
 
+  std::optional<topology::display_group_id_t>
+  parse_display_group(std::string_view value) {
+    topology::display_group_id_t id {};
+    if (value.size() != id.size() * 2) return std::nullopt;
+    const auto nibble = [](char c) -> int {
+      if (c >= '0' && c <= '9') return c - '0';
+      if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+      return -1;
+    };
+    for (std::size_t i = 0; i < id.size(); ++i) {
+      const auto high = nibble(value[2 * i]);
+      const auto low = nibble(value[2 * i + 1]);
+      if (high < 0 || low < 0) return std::nullopt;
+      id[i] = static_cast<std::uint8_t>(high << 4 | low);
+    }
+    return id;
+  }
+
+  std::optional<std::size_t>
+  parse_display_head(std::string_view value) {
+    if (value.empty() || value.size() > 3 || (value.size() > 1 && value.front() == '0')) return std::nullopt;
+    std::size_t head = 0;
+    for (const char c : value) {
+      if (c < '0' || c > '9') return std::nullopt;
+      head = head * 10 + static_cast<std::size_t>(c - '0');
+    }
+    return head;
+  }
+
+  std::optional<std::uint8_t>
+  advertised_display_group_heads(std::uint8_t served) {
+    if (served < 2) return std::nullopt;
+    return static_cast<std::uint8_t>(std::min<std::size_t>(served, topology::max_group_heads));
+  }
+
+  void
+  set_group_join_error(pt::ptree &tree, const topology::group_admission_t &admission) {
+    switch (admission.result) {
+      case topology::group_join_e::joined:
+        return;
+      case topology::group_join_e::unknown_group:
+        set_sunshine_error(tree, 404, "No live display group has this id", "DISPLAY_GROUP_UNKNOWN",
+          "The group's leader stream has ended or never started.", "relaunch_app_from_client", "display", "display_group", false);
+        return;
+      case topology::group_join_e::wrong_client:
+        set_sunshine_error(tree, 403, "The display group belongs to another client", "DISPLAY_GROUP_FORBIDDEN",
+          "Only the client that launched the group can stream its heads.", "relaunch_app_from_client", "display", "display_group", false);
+        return;
+      case topology::group_join_e::bad_head:
+        set_sunshine_error(tree, 400, "The display group has no such member head", "DISPLAY_GROUP_BAD_HEAD",
+          "Members stream heads 1..N-1; head 0 is the leader's.", "relaunch_app_from_client", "display", "display_group", false);
+        return;
+      case topology::group_join_e::head_busy:
+        set_sunshine_error(tree, 409, "A live member already streams this head", "DISPLAY_GROUP_HEAD_BUSY",
+          "Disconnect the other member of this head first.", "retry_launch", "display", "display_group", true);
+        return;
+      case topology::group_join_e::refused:
+      default:
+        set_sunshine_error(tree, 503,
+          "The display group refused the member: " + std::string { topology::to_string(admission.reason) },
+          "DISPLAY_GROUP_REFUSED", "Retry after the current display operation completes.", "retry_launch",
+          "display", "display_group", true);
+        return;
+    }
+  }
+
+  topology::group_admission_t
+  admit_group_member(pt::ptree &tree, topology::coordinator_t &coordinator, const topology::launch_request_t &request,
+    const display_group_join_t &join) {
+    auto admission = coordinator.admit_group_join(request, join.id, join.head);
+    if (!admission) {
+      BOOST_LOG(info) << "Display group join of head " << join.head << " refused: " << topology::to_string(admission.result);
+      set_group_join_error(tree, admission);
+    }
+    return admission;
+  }
+
   bool
   join_managed_display(pt::ptree &tree, rtsp_stream::launch_session_t &launch_session, topology::coordinator_t &coordinator,
     const topology::launch_token_t &token) {

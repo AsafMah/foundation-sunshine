@@ -342,6 +342,29 @@ namespace nvhttp {
         return false;
       }
       token_ = admission.token;
+      attach(session);
+      return true;
+    }
+
+    /** A display-group member (/resume displayGroup=&displayHead=): reserves its head, prepares nothing. */
+    bool
+    admit_member(pt::ptree &tree, rtsp_stream::launch_session_t &session, const stream_start::display_group_join_t &join,
+      std::string_view result_node) {
+      auto admission = stream_start::admit_group_member(tree, display_device::coordinated::coordinator(),
+        { session.id, session.client_cert_uuid }, join);
+      if (!admission) {
+        tree.put(std::string { "root." } + std::string { result_node }, 0);
+        return false;
+      }
+      managed_ = true;
+      token_ = admission.token;
+      attach(session);
+      return true;
+    }
+
+  private:
+    void
+    attach(rtsp_stream::launch_session_t &session) {
       policy_ = display_device::coordinated::automatic_vdd_policy();
       session.display_activation = [token = *token_]() {
         return display_device::coordinated::coordinator().launch_activated(token);
@@ -356,8 +379,9 @@ namespace nvhttp {
           }
         };
       }
-      return true;
     }
+
+  public:
 
     /** Whether this request runs the managed native topology (decided at admission). */
     bool
@@ -705,6 +729,10 @@ namespace nvhttp {
 #else
     tree.put("root.VddCapabilityVersion", 0);
 #endif
+    // GW-H3c: only a profile that can serve a display group advertises one.
+    if (const auto heads = stream_start::advertised_display_group_heads(display_device::coordinated::display_group_max_heads())) {
+      tree.put("root.DisplayGroupMaxHeads", static_cast<int>(*heads));
+    }
 
     std::ostringstream data;
 
@@ -977,6 +1005,21 @@ namespace nvhttp {
       return;
     }
 
+    // GW-H3c: a display-group member joins a head of the leader's live group; it never prepares or restores.
+    std::optional<stream_start::display_group_join_t> group_join;
+    if (const auto group = args.find("displayGroup"s), head = args.find("displayHead"s);
+        group != std::end(args) || head != std::end(args)) {
+      const auto id = group != std::end(args) ? stream_start::parse_display_group(group->second) : std::nullopt;
+      const auto index = head != std::end(args) ? stream_start::parse_display_head(head->second) : std::nullopt;
+      if (!id || !index) {
+        tree.put("root.resume", 0);
+        tree.put("root.<xmlattr>.status_code", 400);
+        tree.put("root.<xmlattr>.status_message", "A display group join needs displayGroup (32 lowercase hex) and displayHead");
+        return;
+      }
+      group_join = stream_start::display_group_join_t { *id, *index };
+    }
+
     // Newer Moonlight clients send localAudioPlayMode on /resume too,
     // so we should use it if it's present in the args and there are
     // no active sessions we could be interfering with.
@@ -1016,7 +1059,13 @@ namespace nvhttp {
                          << ", rule_source=" << fingerprint_match.source << ']';
     }
 
-    if (no_active_sessions || display_device::coordinated::coordinator().managed_mode()) {
+    if (group_join) {
+      if (!display_launch.admit_member(tree, *launch_session, *group_join, "resume") ||
+          !display_launch.join(tree, *launch_session, "resume")) {
+        return;
+      }
+    }
+    else if (no_active_sessions || display_device::coordinated::coordinator().managed_mode()) {
       // Prepare before publishing the ticket so the handshake expiration
       // window starts only when the host is ready to accept RTSP.
       if (!display_launch.admit(tree, *launch_session, "resume")) {
