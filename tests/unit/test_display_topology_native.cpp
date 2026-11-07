@@ -4667,3 +4667,130 @@ TEST_F(NativeExecutor, PlacingNeedsAPrepareRestoreOrRecoveryCapability) {
   }
   EXPECT_TRUE(platform.arrangements.empty());
 }
+
+// --- An arriving head makes Windows turn a connected, off-desktop panel on (gh-all run 20261107-192244) ---
+
+namespace {
+  void
+  bring_on(fake_platform_t &platform, const std::string &name) {
+    auto &display = find(platform.host, name);
+    display.info.device_state = state_e::active;
+    display.info.display_name = "\\\\.\\DISPLAY-" + name;
+    display.layout = display_topology_test::layout(platform.right_edge());
+  }
+
+  /**
+   * What Windows does on the Punktfunk-only desktop with the DELL connected but off: when a head
+   * reaches the desktop it applies its saved layout for the new display set, which has `name` on.
+   * (In the 6 Nov kit-3 run the DELL was not connected and only Punktfunk's corner moved.)
+   */
+  void
+  reactivate_on_arrival(fake_platform_t &platform, const std::string &name) {
+    platform.on_create = [&platform, name](std::size_t) -> dt::result_t<delivery_e> {
+      platform.add_head();
+      if (!platform.create_inactive) bring_on(platform, name);
+      return delivery_e::accepted;
+    };
+    platform.on_activate = [&platform, name](const dt::observed_display_t &head) -> dt::result_t<void> {
+      auto &target = find(platform.host, head.id.value);
+      target.info.device_state = state_e::active;
+      target.info.display_name = "\\\\.\\DISPLAY-" + head.id.value;
+      target.layout = display_topology_test::layout(platform.right_edge());
+      if (platform.take_origin) platform.take_origin_for(head.id.value);
+      bring_on(platform, name);
+      return {};
+    };
+  }
+}  // namespace
+
+TEST_F(NativeExecutor, AHeadWhoseArrivalTurnsAnOffPanelOnPutsItBackOffInTheSamePlacingWrite) {
+  for (const bool cold : { false, true }) {
+    SCOPED_TRACE(cold ? "arrives off the desktop" : "arrives on the desktop");
+    ASSERT_TRUE(healthy(reset_with(executor)));
+    platform.host = sole_virtual_primary();
+    platform.take_origin = true;
+    platform.create_inactive = cold;
+    platform.arrangements.clear();
+    platform.deactivations.clear();
+    reactivate_on_arrival(platform, "os-A");
+    const auto outcome = managed_prepare_with(executor);
+    ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok)) << outcome.reason;
+    const auto head = "vdd-" + std::to_string(platform.created);
+    ASSERT_EQ(platform.arrangements.size(), 1u) << "corners, primary and the active set in one write";
+    EXPECT_EQ(platform.deactivations.back(), (std::vector<dt::os_display_id_t> { dt::os_display_id_t { "os-A" } }));
+    EXPECT_EQ(state_of(platform.host, "os-A"), state_e::inactive) << "off again, as at baseline";
+    EXPECT_EQ(state_of(platform.host, "os-B"), state_e::inactive);
+    EXPECT_EQ(state_of(platform.host, "pnk"), state_e::primary);
+    EXPECT_EQ(corner(platform.host, "pnk"), (dt::position_t { 0, 0 }));
+    EXPECT_EQ(corner(platform.host, head), (dt::position_t { 2560, 0 }));
+    EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+    EXPECT_EQ(platform.head_count(), 0u);
+    EXPECT_EQ(state_of(platform.host, "os-A"), state_e::inactive);
+    EXPECT_EQ(corner(platform.host, "pnk"), (dt::position_t { 0, 0 }));
+    EXPECT_FALSE(store.bytes);
+  }
+}
+
+TEST_F(NativeExecutor, TwoHeadsWhoseArrivalsTurnAnOffPanelOnLeaveItOff) {
+  platform.host = sole_virtual_primary();
+  platform.take_origin = true;
+  platform.create_inactive = true;
+  reactivate_on_arrival(platform, "os-A");
+  const auto outcome = prepare_heads(executor);
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok)) << outcome.reason;
+  EXPECT_EQ(state_of(platform.host, "os-A"), state_e::inactive);
+  EXPECT_EQ(corner(platform.host, "pnk"), (dt::position_t { 0, 0 }));
+  EXPECT_EQ(corner(platform.host, "vdd-1"), (dt::position_t { 2560, 0 }));
+  EXPECT_EQ(corner(platform.host, "vdd-2"), (dt::position_t { 2560 + 1920, 0 }));
+  ASSERT_EQ(outcome.targets.size(), 2u);
+}
+
+TEST_F(NativeExecutor, AnArrivalThatTurnsAPanelOnAndReshapesTheVirtualPrimaryIsStillRefused) {
+  platform.host = sole_virtual_primary();
+  platform.take_origin = true;
+  platform.create_inactive = true;
+  reactivate_on_arrival(platform, "os-A");
+  const auto activate = platform.on_activate;
+  platform.on_activate = [&, activate](const dt::observed_display_t &head) -> dt::result_t<void> {
+    const auto result = activate(head);
+    find(platform.host, "pnk").layout->hdr = display_device::hdr_state_e::disabled;
+    return result;
+  };
+  const auto outcome = managed_prepare_with(executor);
+  EXPECT_FALSE(verdict_is(outcome, native_verdict_e::ok));
+  EXPECT_TRUE(mentions(outcome.reason, "changed other displays")) << outcome.reason;
+  EXPECT_TRUE(mentions(outcome.reason, "pnk")) << outcome.reason;
+  EXPECT_TRUE(mentions(outcome.reason, "HDR on -> off")) << outcome.reason;
+  EXPECT_TRUE(mentions(outcome.reason, "os-A")) << outcome.reason;
+  EXPECT_TRUE(mentions(outcome.reason, "off -> on")) << outcome.reason;
+  EXPECT_EQ(platform.head_count(), 0u);
+}
+
+TEST_F(NativeExecutor, EveryOtherDisplaysRefusalNamesEachChangedField) {
+  const std::vector<std::tuple<std::string, std::function<void(dt::observed_display_t &)>, std::string>> cases {
+    { "mode", [](auto &display) { display.layout->mode = mode(2560, 1440); }, "mode 1920x1080@60Hz -> 2560x1440@60Hz" },
+    { "hdr", [](auto &display) { display.layout->hdr = display_device::hdr_state_e::enabled; }, "HDR off -> on" },
+    { "rotation", [](auto &display) { display.layout->rotation = dt::rotation_e::clockwise90; }, "rotation 0 -> 90" },
+    { "off", [](auto &display) { display.info.device_state = state_e::inactive; display.layout.reset(); }, "on -> off" },
+  };
+  for (const auto &[name, reshape, expected] : cases) {
+    SCOPED_TRACE(name);
+    ASSERT_TRUE(healthy(reset_with(executor)));
+    platform.host = host_inventory();
+    platform.create_inactive = true;
+    platform.on_activate = [&, reshape = reshape](const dt::observed_display_t &head) -> dt::result_t<void> {
+      auto &target = find(platform.host, head.id.value);
+      target.info.device_state = state_e::active;
+      target.info.display_name = "\\\\.\\DISPLAY-" + head.id.value;
+      target.layout = display_topology_test::layout(3840);
+      reshape(find(platform.host, "os-B"));
+      return {};
+    };
+    const auto outcome = managed_prepare_with(executor);
+    EXPECT_FALSE(verdict_is(outcome, native_verdict_e::ok));
+    EXPECT_TRUE(mentions(outcome.reason, "changed other displays")) << outcome.reason;
+    EXPECT_TRUE(mentions(outcome.reason, "os-B")) << outcome.reason;
+    EXPECT_TRUE(mentions(outcome.reason, expected)) << outcome.reason;
+    EXPECT_FALSE(mentions(outcome.reason, "os-A")) << "unchanged displays are not listed: " << outcome.reason;
+  }
+}

@@ -350,16 +350,124 @@ namespace display_device::topology {
       return on;
     }
 
+    std::string
+    state_text(device_state_e state) {
+      switch (state) {
+        case device_state_e::inactive: return "off";
+        case device_state_e::active: return "on";
+        case device_state_e::primary: return "primary";
+      }
+      return "?";
+    }
+
+    std::string
+    hdr_text(hdr_state_e hdr) {
+      switch (hdr) {
+        case hdr_state_e::enabled: return "on";
+        case hdr_state_e::disabled: return "off";
+        case hdr_state_e::unknown: return "unknown";
+      }
+      return "?";
+    }
+
+    std::string
+    mode_text(const display_device::display_mode_t &mode) {
+      const auto &rate = mode.refresh_rate;
+      std::string hz;
+      if (rate.denominator == 0) {
+        hz = "?";
+      }
+      else if (rate.numerator % rate.denominator == 0) {
+        hz = std::to_string(rate.numerator / rate.denominator);
+      }
+      else {
+        const auto hundredths = static_cast<unsigned long long>(rate.numerator) * 100ULL / rate.denominator;
+        hz = std::to_string(hundredths / 100) + "." + (hundredths % 100 < 10 ? "0" : "") + std::to_string(hundredths % 100);
+      }
+      return std::to_string(mode.resolution.width) + "x" + std::to_string(mode.resolution.height) + "@" + hz + "Hz";
+    }
+
+    std::string
+    display_name(const observed_display_t &display) {
+      return display.info.friendly_name.empty() ? display.id.value : display.info.friendly_name + " (" + display.id.value + ")";
+    }
+
+    /**
+     * Every field of every display this transaction does not manage that differs between the
+     * baseline and `current`: disappeared, appeared, on/off/primary, corner, mode, rotation, scale
+     * and HDR. Empty when nothing differs. Part of every "changed other displays" refusal, so a
+     * hardware run shows exactly what Windows did.
+     */
+    std::string
+    other_display_changes(const native_platform_t &platform, const inventory_t &current, const journal_record_t &record) {
+      std::vector<std::string> parts;
+      for (const auto &before : record.baseline.displays) {
+        if (!unmanaged(platform, record, before)) continue;
+        const auto *now = find_unique(current, before.id);
+        if (!now) {
+          parts.push_back(display_name(before) + ": disappeared");
+          continue;
+        }
+        std::vector<std::string> fields;
+        if (before.info.device_state != now->info.device_state) {
+          fields.push_back(state_text(before.info.device_state) + " -> " + state_text(now->info.device_state));
+        }
+        if (before.layout && now->layout) {
+          const auto &a = *before.layout;
+          const auto &b = *now->layout;
+          if (a.position != b.position) {
+            fields.push_back("corner " + std::to_string(a.position.x) + "," + std::to_string(a.position.y) + " -> " +
+                             std::to_string(b.position.x) + "," + std::to_string(b.position.y));
+          }
+          if (mode_text(a.mode) != mode_text(b.mode)) fields.push_back("mode " + mode_text(a.mode) + " -> " + mode_text(b.mode));
+          if (a.rotation != b.rotation) {
+            fields.push_back("rotation " + std::to_string(static_cast<int>(a.rotation)) + " -> " + std::to_string(static_cast<int>(b.rotation)));
+          }
+          if (a.scale_percent != b.scale_percent) {
+            const auto scale = [](const std::optional<std::uint32_t> &value) { return value ? std::to_string(*value) + "%" : std::string { "?" }; };
+            fields.push_back("scale " + scale(a.scale_percent) + " -> " + scale(b.scale_percent));
+          }
+          if (a.hdr != b.hdr) fields.push_back("HDR " + hdr_text(a.hdr) + " -> " + hdr_text(b.hdr));
+        }
+        else if (now->layout && !before.layout) {
+          fields.push_back("now at " + std::to_string(now->layout->position.x) + "," + std::to_string(now->layout->position.y) + " " + mode_text(now->layout->mode));
+        }
+        if (!fields.empty()) {
+          std::string joined;
+          for (const auto &field : fields) joined += (joined.empty() ? "" : ", ") + field;
+          parts.push_back(display_name(before) + ": " + joined);
+        }
+      }
+      for (const auto &display : current.displays) {
+        if (unmanaged(platform, record, display) && !find_unique(record.baseline, display.id)) {
+          parts.push_back(display_name(display) + ": appeared (" + state_text(display.info.device_state) + ")");
+        }
+      }
+      std::string text;
+      for (const auto &part : parts) text += (text.empty() ? "" : "; ") + part;
+      return text;
+    }
+
+    /** `what`, followed by exactly what differs on the other displays. */
+    std::string
+    with_changes(const std::string &what, const native_platform_t &platform, const inventory_t &current, const journal_record_t &record) {
+      const auto changes = other_display_changes(platform, current, record);
+      return changes.empty() ? what : what + " [" + changes + "]";
+    }
+
     /**
      * Puts unmanaged displays back at their baseline corners and `heads` right of them, in
-     * one desktop write, when only corners or the primary drifted. nullopt when everything is
-     * in place (`observed` is then the latest inventory); otherwise why it failed, starting
-     * with `what`. The write is not journaled: a recovery that finds the same drift puts it back.
+     * one desktop write, when only corners or the primary drifted. With `restore_active_set`
+     * (only while preparing, where every virtual head is this run's) displays that were off at
+     * baseline and that Windows turned on are taken off the desktop in the same write. nullopt
+     * when everything is in place (`observed` is then the latest inventory); otherwise why it
+     * failed, starting with `what`. The write is not journaled: a recovery that finds the same
+     * drift puts it back.
      */
     std::optional<std::string>
     place(native_platform_t &platform, const mutation_capability_t &capability, const journal_record_t &record,
       const std::vector<os_display_id_t> &heads, inventory_t &observed, const std::function<bool(const inventory_t &)> &proven,
-      const std::string &what) {
+      const std::string &what, bool restore_active_set) {
       const auto plan = placement_plan(platform, record, observed, heads);
       if (!plan) {
         return what + "; a virtual display is not on the desktop";
@@ -367,10 +475,18 @@ namespace display_device::topology {
       if (!misplaced(platform, observed, record, *plan)) {
         return std::nullopt;
       }
-      if (!movable(platform, observed, record)) {
-        return what;
+      std::vector<os_display_id_t> off;
+      if (restore_active_set) {
+        const auto on = turned_on(platform, observed, record);
+        if (!on) {
+          return with_changes(what, platform, observed, record);
+        }
+        off = *on;
       }
-      if (const auto arranged = platform.arrange(capability, *plan); !arranged) {
+      else if (!movable(platform, observed, record)) {
+        return with_changes(what, platform, observed, record);
+      }
+      if (const auto arranged = platform.arrange(capability, *plan, off); !arranged) {
         return what + "; placing the displays failed: " + arranged.error().detail;
       }
       observed = platform.inventory();
@@ -378,7 +494,7 @@ namespace display_device::topology {
         return what + "; the virtual displays changed while the displays were placed";
       }
       if (misplaced(platform, observed, record, *plan)) {
-        return what + "; placing the displays did not restore them";
+        return with_changes(what + "; placing the displays did not restore them", platform, observed, record);
       }
       return std::nullopt;
     }
@@ -903,9 +1019,11 @@ namespace display_device::topology {
         if (*created != creation_delivery_e::accepted) {
           return roll_back_heads(capability, record, and_new(head), "The driver delivery is uncertain");
         }
-        // Only corners and the primary may move here; they are put back once the head is journaled.
-        if (!movable(platform_, after, record)) {
-          return roll_back_heads(capability, record, and_new(head), "Creating the virtual display changed other displays");
+        // Only corners and the primary may move here, and displays that were off at baseline may have been
+        // turned on (Windows' saved layout for the new display set); all of it is put back once the head is
+        // journaled.
+        if (!turned_on(platform_, after, record)) {
+          return roll_back_heads(capability, record, and_new(head), with_changes("Creating the virtual display changed other displays", platform_, after, record));
         }
         auto &step = record.steps.back();
         step.state = journal_step_state_e::observed;
@@ -934,8 +1052,8 @@ namespace display_device::topology {
           if (!on_desktop(*now)) {
             return roll_back_heads(capability, record, and_new(head), "The virtual display was not added to the desktop");
           }
-          if (!movable(platform_, active, record)) {
-            return roll_back_heads(capability, record, and_new(head), "Adding the virtual display to the desktop changed other displays");
+          if (!turned_on(platform_, active, record)) {
+            return roll_back_heads(capability, record, and_new(head), with_changes("Adding the virtual display to the desktop changed other displays", platform_, active, record));
           }
           record.steps.back().observed = active;
           if (const auto saved = store_.save(record); !saved) {
@@ -946,7 +1064,7 @@ namespace display_device::topology {
         }
         auto heads_now = ids_of(owned);
         heads_now.push_back(head.id);
-        if (const auto error = place(platform_, capability, record, heads_now, placed, and_new(head), what)) {
+        if (const auto error = place(platform_, capability, record, heads_now, placed, and_new(head), what, true)) {
           return roll_back_heads(capability, record, and_new(head), *error);
         }
         owned.push_back(*find_unique(placed, head.id));
@@ -972,7 +1090,7 @@ namespace display_device::topology {
         }
       }
       auto placed = settled_heads;
-      if (const auto error = place(platform_, capability, record, ids_of(owned), placed, exactly(owned), "Adding the virtual displays changed other displays")) {
+      if (const auto error = place(platform_, capability, record, ids_of(owned), placed, exactly(owned), "Adding the virtual displays changed other displays", true)) {
         return roll_back_heads(capability, record, exactly(owned), *error);
       }
       settled_placement = std::move(placed);
@@ -1490,7 +1608,7 @@ namespace display_device::topology {
       }
       return std::nullopt;
     }
-    return place(platform_, capability, record, {}, after, no_heads, what);
+    return place(platform_, capability, record, {}, after, no_heads, what, false);
   }
 
   native_outcome_t
