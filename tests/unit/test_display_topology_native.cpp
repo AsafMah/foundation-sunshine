@@ -1443,34 +1443,31 @@ TEST_F(NativeExecutor, UncertainCreationCannotRemoveAHeadAfterItsProofChanges) {
   EXPECT_EQ(log.host_writes(), 1u);
 }
 
-TEST_F(NativeExecutor, AnAcceptedRequestWithoutADisplayStaysUnresolvedUntilReset) {
+TEST_F(NativeExecutor, AnAcceptedRequestWithoutADisplayIsClearedFromTheDriverAndRefused) {
+  // The platform already waited its creation bound. The driver has the request and may still list it
+  // (gh-all run 20261107-232556), so its whole list is cleared now: nothing is left to arrive or to reset.
   platform.on_create = [](std::size_t) { return delivery_e::accepted; };
   const auto outcome = prepare_with(executor, virtual_profile());
-  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::refused)) << outcome.reason;
   EXPECT_TRUE(mentions(outcome.reason, "accepted the request"));
   EXPECT_EQ(platform.intents.size(), 1u);
-  EXPECT_TRUE(in_conflict(executor.health()));
-  const auto record = store.record();
-  ASSERT_TRUE(record);
-  ASSERT_EQ(record->steps.size(), 1u);
-  EXPECT_TRUE(record->steps[0].state == step_e::conflict);
-  EXPECT_TRUE(mentions(record->steps[0].detail, "accepted the request"));
-
-  // No display is listed, yet one may still appear: neither this run nor a restart may
-  // conclude that nothing was created.
-  const auto reads = platform.reads;
-  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
-  EXPECT_TRUE(in_conflict(recover_with(executor)));
-  auto restarted = make_executor();
-  EXPECT_TRUE(in_conflict(recover_with(restarted)));
-  EXPECT_TRUE(verdict_is(prepare_with(restarted, virtual_profile()), native_verdict_e::conflict));
-  EXPECT_EQ(platform.reads, reads);
-  EXPECT_EQ(log.host_writes(), 1u);
-  EXPECT_TRUE(store.bytes);
-
-  EXPECT_TRUE(healthy(reset_with(restarted)));
+  EXPECT_TRUE(log.contains("remove_all_heads"));
+  EXPECT_EQ(log.events.back(), "clear");
   EXPECT_FALSE(store.bytes);
-  EXPECT_EQ(platform.reads, reads);
+  EXPECT_TRUE(healthy(executor.health()));
+  EXPECT_TRUE(verdict_is(prepare_with(executor, virtual_profile()), native_verdict_e::refused));
+}
+
+TEST_F(NativeExecutor, AnAcceptedRequestWithoutADisplayStaysInConflictIfAForeignHeadIsListedAtRollback) {
+  platform.on_create = [](std::size_t) { return delivery_e::accepted; };
+  platform.tamper = [&](int read, dt::inventory_t &inventory) {
+    if (read >= 3) inventory.displays.push_back(virtual_display("another", 7680));
+  };
+  const auto outcome = prepare_with(executor, virtual_profile());
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict)) << outcome.reason;
+  EXPECT_TRUE(mentions(outcome.reason, "could not be proven")) << outcome.reason;
+  EXPECT_FALSE(log.contains("remove_all_heads"));
+  EXPECT_TRUE(store.bytes);
 }
 
 TEST_F(NativeExecutor, AnUnknownInventoryAfterCreatingIsUnresolved) {
@@ -2260,11 +2257,11 @@ TEST_F(NativeExecutor, ARefusalWhoseJournalCannotBeRemovedIsInConflict) {
 }
 
 TEST_F(NativeExecutor, AnUnresolvedMarkerThatCannotBeSavedIsReported) {
-  platform.on_create = [](std::size_t) { return delivery_e::accepted; };
+  platform.on_create = [](std::size_t) { return delivery_e::uncertain; };
   store.fail_save_call = 2;
   const auto outcome = prepare_with(executor, virtual_profile());
   EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
-  EXPECT_TRUE(mentions(outcome.reason, "accepted the request"));
+  EXPECT_TRUE(mentions(outcome.reason, "uncertain"));
   EXPECT_TRUE(mentions(outcome.reason, "could not record it: disk full"));
   EXPECT_TRUE(in_conflict(executor.health()));
   const auto record = store.record();
@@ -3715,10 +3712,33 @@ TEST_F(NativeExecutor, ASecondHeadTheDriverRefusesRemovesTheFirst) {
   EXPECT_TRUE(healthy(executor.health()));
 }
 
-TEST_F(NativeExecutor, ASecondCreateThatReArrivesTheFirstIsRolledBackByThisRunsIdentities) {
+TEST_F(NativeExecutor, ASecondCreateThatReArrivesTheFirstIsFollowedByItsDriverHead) {
+  // ZakoVDD re-enumerates its heads while adding another (gh-all run 20261107-232556): same ContainerId
+  // and adapter, a new arrival. The journal follows the head instead of refusing the group.
   platform.create_inactive = true;
   platform.on_create = [&](std::size_t call) -> dt::result_t<delivery_e> {
     if (call == 2) re_arrive_first(platform);
+    platform.add_head();
+    return delivery_e::accepted;
+  };
+  const auto outcome = prepare_heads(executor);
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok)) << outcome.reason;
+  const auto record = store.record();
+  ASSERT_TRUE(record);
+  ASSERT_EQ(record->owned_heads.size(), 2u);
+  EXPECT_EQ(record->owned_heads[0].identity, find(platform.host, "vdd-1").head);
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(NativeExecutor, ASecondCreateThatMovesTheFirstToAnotherAdapterIsRolledBackByThisRunsIdentities) {
+  platform.create_inactive = true;
+  platform.on_create = [&](std::size_t call) -> dt::result_t<delivery_e> {
+    if (call == 2) {
+      re_arrive_first(platform);
+      find(platform.host, "vdd-1").adapter = dt::adapter_luid_t { 77 };
+    }
     platform.add_head();
     return delivery_e::accepted;
   };
@@ -4857,4 +4877,58 @@ TEST_F(NativeExecutor, TheRefusalDiffComparesModesExactlyAndShowsRawRates) {
   EXPECT_TRUE(mentions(outcome.reason, "os-B")) << outcome.reason;
   EXPECT_TRUE(mentions(outcome.reason, "60/1")) << outcome.reason;
   EXPECT_TRUE(mentions(outcome.reason, "60000/1000")) << outcome.reason;
+}
+
+TEST_F(NativeExecutor, AFirstHeadReArrivingJustBeforeTheGroupIsPlacedIsFollowed) {
+  // Read 6 is the group's settled read: both heads are created and on the desktop.
+  platform.create_inactive = true;
+  platform.tamper = [&](int read, dt::inventory_t &snapshot) {
+    if (read != 6) return;
+    re_arrive_first(platform);
+    const auto revision = snapshot.revision;
+    snapshot = platform.host;
+    snapshot.revision = revision;
+  };
+  const auto outcome = prepare_heads(executor);
+  ASSERT_TRUE(verdict_is(outcome, native_verdict_e::ok)) << outcome.reason;
+  EXPECT_EQ(platform.reads, 6) << "the settled read is the one that saw the re-arrival";
+  const auto record = store.record();
+  ASSERT_TRUE(record);
+  EXPECT_EQ(record->owned_heads[0].identity, find(platform.host, "vdd-1").head);
+  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::ok));
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(NativeExecutor, AFollowedHeadThatCannotBeJournaledAtTheSettledReadIsStillRolledBack) {
+  // Saves 1-6 journal both heads; save 7 would record head 1's re-arrival at the settled read (read 6).
+  platform.create_inactive = true;
+  store.fail_save_call = 7;
+  platform.tamper = [&](int read, dt::inventory_t &snapshot) {
+    if (read != 6) return;
+    re_arrive_first(platform);
+    const auto revision = snapshot.revision;
+    snapshot = platform.host;
+    snapshot.revision = revision;
+  };
+  const auto outcome = prepare_heads(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::refused)) << outcome.reason;
+  EXPECT_TRUE(mentions(outcome.reason, "could not record a re-enumerated virtual display")) << outcome.reason;
+  EXPECT_TRUE(log.contains("remove_all_heads"));
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(NativeExecutor, AFollowedHeadThatCannotBeJournaledAfterTheNextCreateIsRolledBack) {
+  platform.create_inactive = true;
+  store.fail_save_call = 5;
+  platform.on_create = [&](std::size_t call) -> dt::result_t<delivery_e> {
+    if (call == 2) re_arrive_first(platform);
+    platform.add_head();
+    return delivery_e::accepted;
+  };
+  const auto outcome = prepare_heads(executor);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::refused)) << outcome.reason;
+  EXPECT_TRUE(mentions(outcome.reason, "could not record a re-enumerated virtual display")) << outcome.reason;
+  EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_FALSE(store.bytes);
 }

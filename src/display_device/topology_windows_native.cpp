@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <set>
 #include <stdexcept>
+#include <tuple>
 
 namespace display_device::topology {
 
@@ -203,11 +204,16 @@ namespace display_device::topology {
 
   bool
   windows_native_platform_t::wait_for(const std::function<bool(const inventory_t &)> &done) {
+    return wait_for(done, options_.wait);
+  }
+
+  bool
+  windows_native_platform_t::wait_for(const std::function<bool(const inventory_t &)> &done, std::chrono::milliseconds limit) {
     const auto start = edge_.now();
     while (true) {
       const auto observed = inventory();
       if (observed.available && done(observed)) return true;
-      if (edge_.now() - start >= options_.wait) return false;
+      if (edge_.now() - start >= limit) return false;
       edge_.sleep(options_.poll);
     }
   }
@@ -225,9 +231,43 @@ namespace display_device::topology {
       case edge_delivery_e::delivered:
         break;
     }
-    wait_for([&](const inventory_t &observed) {
+    const auto start = edge_.now();
+    const auto elapsed = [&] { return std::chrono::duration_cast<std::chrono::milliseconds>(edge_.now() - start); };
+    const auto note = [&](const std::string &line) {
+      if (options_.note) options_.note(line);
+    };
+    const bool listed = wait_for([&](const inventory_t &observed) {
       return std::ranges::any_of(observed.heads, [&](const observed_head_t &head) { return head.identity.guid == intent; });
-    });
+    }, options_.create_wait);
+    if (!listed) {
+      note("virtual display " + format_guid(intent.value) + " was not listed within " + std::to_string(options_.create_wait.count()) + " ms of its delivered creation");
+      return creation_delivery_e::accepted;
+    }
+    const auto arrived = elapsed();
+    // Settle: a driver may re-enumerate its heads around an arrival. Return once the virtual heads (OS identity,
+    // arrival, head identity, desktop state) stayed the same for `settle`, so the caller sees them as they stay.
+    using key_t = std::tuple<std::string, std::uint64_t, std::optional<head_identity_t>, device_state_e>;
+    const auto keys = [&](const inventory_t &observed) {
+      std::vector<key_t> listed_heads;
+      for (const auto &display : observed.displays) {
+        if (is_virtual_head(display)) listed_heads.emplace_back(display.id.value, display.incarnation.value, display.head, display.info.device_state);
+      }
+      std::sort(listed_heads.begin(), listed_heads.end());
+      return listed_heads;
+    };
+    std::optional<std::vector<key_t>> last;
+    auto stable_since = edge_.now();
+    const bool settled = options_.settle.count() <= 0 || wait_for([&](const inventory_t &observed) {
+      auto now_keys = keys(observed);
+      if (!last || *last != now_keys) {
+        last = std::move(now_keys);
+        stable_since = edge_.now();
+        return false;
+      }
+      return edge_.now() - stable_since >= options_.settle;
+    }, options_.create_wait);
+    note("virtual display " + format_guid(intent.value) + " listed " + std::to_string(arrived.count()) + " ms after its creation was delivered; " +
+         (settled ? "settled after " + std::to_string(elapsed().count()) + " ms" : "still changing after " + std::to_string(elapsed().count()) + " ms"));
     return creation_delivery_e::accepted;
   }
 

@@ -978,6 +978,47 @@ namespace display_device::topology {
       for (const auto &head : heads) ids.push_back(head.id);
       return ids;
     };
+    // ZakoVDD re-enumerates the heads it already has while it adds another (gh-all run 20261107-232556):
+    // the same driver head (ContainerId) on the same adapter comes back with a new OS identity and arrival.
+    // That head is still this run's, so the journal follows it; anything else stays a change.
+    // Set when following was proven but could not be journaled; the followed heads are still the ones to roll back.
+    std::string follow_unsaved;
+    const auto follow_owned = [&](const inventory_t &inventory) {
+      if (!inventory.available || lists_each(platform_, inventory, owned)) return true;
+      const auto listed = virtual_heads(platform_, inventory);
+      std::vector<observed_display_t> followed;
+      for (const auto &mine : owned) {
+        const observed_display_t *match = nullptr;
+        std::size_t matches = 0;
+        for (const auto *head : listed) {
+          if (head->head && mine.head && head->head->driver == mine.head->driver && head->head->guid == mine.head->guid &&
+              head->head->incarnation.value != 0 && head->adapter && head->adapter == mine.adapter) {
+            match = head;
+            ++matches;
+          }
+        }
+        if (matches != 1) return false;
+        followed.push_back(*match);
+      }
+      std::size_t seen = 0;
+      for (auto &step : record.steps) {
+        if (step.operation != journal_operation_e::create_head || step.state != journal_step_state_e::observed) continue;
+        if (seen >= followed.size()) return false;
+        step.display = followed[seen].id;
+        step.observed = inventory;
+        ++seen;
+      }
+      if (seen != followed.size() || record.owned_heads.size() != followed.size()) return false;
+      for (std::size_t index = 0; index < followed.size(); ++index) {
+        record.owned_heads[index].identity = *followed[index].head;
+      }
+      owned = std::move(followed);
+      if (const auto saved = store_.save(record); !saved) {
+        follow_unsaved = "The native journal could not record a re-enumerated virtual display: " + saved.error().detail;
+        return false;
+      }
+      return true;
+    };
 
     for (std::uint8_t slot = 0; slot < count; ++slot) {
       const auto ordinal = std::to_string(slot + 1) + " of " + std::to_string(count);
@@ -1001,28 +1042,32 @@ namespace display_device::topology {
         if (heads.size() > owned.size() + 1) {
           return conflict("More than one virtual display appeared, so none can be proven to be this host's");
         }
-        if (!lists_each(platform_, after, owned)) {
-          // A driver may re-enumerate its heads when another is added; that is a hardware
-          // unknown, so the earlier heads are no longer proven and everything is removed.
-          auto why = "Creating virtual display " + ordinal + " changed a virtual display this host created";
+        const auto this_runs_heads = [&](const inventory_t &inventory) {
+          return only_requested_heads(platform_, inventory, options_.driver, intents);
+        };
+        if (!follow_owned(after)) {
+          // An earlier head changed beyond a re-enumeration, so it is no longer proven and everything
+          // this run asked for is removed: the driver clears its whole list, including a head still on its way.
+          auto why = follow_unsaved.empty() ? "Creating virtual display " + ordinal + " changed a virtual display this host created" : follow_unsaved;
           const bool request_listed = std::any_of(heads.begin(), heads.end(), [&](const observed_display_t *head) {
             return head->head && head->head->guid == intent;
           });
           if (created && !request_listed) {
-            return unresolved(why + ", and its own display did not appear");
+            why += ", and its own display did not appear";
           }
-          return roll_back_heads(capability, record, [&](const inventory_t &inventory) {
-            return only_requested_heads(platform_, inventory, options_.driver, intents);
-          }, why);
+          return roll_back_heads(capability, record, this_runs_heads, why);
         }
         const auto fresh = std::find_if(heads.begin(), heads.end(), [&](const observed_display_t *head) {
           return std::none_of(owned.begin(), owned.end(), [&](const observed_display_t &mine) { return mine.id == head->id; });
         });
         if (fresh == heads.end()) {
+          if (created && *created == creation_delivery_e::accepted) {
+            // Not listed within the platform's creation wait, though the driver has it. It may still be
+            // listed later, so the driver's whole list is cleared now rather than waiting on a late arrival.
+            return roll_back_heads(capability, record, this_runs_heads, "The driver accepted the request but no virtual display appeared");
+          }
           if (created) {
-            return unresolved(*created == creation_delivery_e::accepted ?
-                                "The driver accepted the request but no virtual display appeared" :
-                                "The driver delivery is uncertain and no virtual display appeared");
+            return unresolved("The driver delivery is uncertain and no virtual display appeared");
           }
           // The driver refused the request, so no display of it can appear later.
           failure = created.error().detail.empty() ? std::string { "the driver reported an error" } : created.error().detail;
@@ -1107,8 +1152,8 @@ namespace display_device::topology {
     if (count > 1) {
       // Adding a head can move or deactivate the ones added before it.
       const auto settled_heads = platform_.inventory();
-      if (!exact_head_set(platform_, settled_heads, owned)) {
-        return roll_back_heads(capability, record, exactly(owned), "The virtual displays changed while they were being prepared");
+      if (!follow_owned(settled_heads) || !exact_head_set(platform_, settled_heads, owned)) {
+        return roll_back_heads(capability, record, exactly(owned), follow_unsaved.empty() ? "The virtual displays changed while they were being prepared" : follow_unsaved);
       }
       for (std::size_t index = 0; index < owned.size(); ++index) {
         if (!on_desktop(*find_unique(settled_heads, owned[index].id))) {

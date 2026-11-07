@@ -244,9 +244,10 @@ namespace {
     std::function<dt::edge_send_t(const std::vector<dt::placement_t> &)> on_arrange;
   };
 
+  /** Short waits on the fake clock; creation settles at once unless a test asks for production timing. */
   dt::windows_native_options_t
   options() {
-    return { driver(), zako, 500ms, 100ms };
+    return { driver(), zako, 500ms, 100ms, 500ms, 0ms };
   }
 
   void
@@ -1079,4 +1080,177 @@ TEST_F(WindowsNative, ArrangeIsOnlyForAPrepareOrRestore) {
   });
   EXPECT_TRUE(edge.arrangements.empty());
   EXPECT_TRUE(arrange_with(platform, swapped, dt::command_kind_e::native_restore));
+}
+
+// --- Slow head arrival (gh-all run 20261107-232556, Punktfunk-only desktop) ------------------
+
+namespace {
+  /** Production timing: the driver's defaults, as topology_runtime builds the platform. */
+  dt::windows_native_options_t
+  production_options() {
+    return { driver(), zako };
+  }
+
+  /** Delivers each create at once but lists its head only `delay` later on the edge clock. */
+  void
+  arrive_late(fake_edge_t &edge, std::vector<std::chrono::milliseconds> delays, std::function<void(std::size_t, std::chrono::milliseconds)> meanwhile = {}) {
+    struct pending_t {
+      dt::head_guid_t intent;
+      std::chrono::steady_clock::time_point due;
+      std::chrono::steady_clock::time_point sent;
+      bool listed {};
+    };
+    auto pending = std::make_shared<std::vector<pending_t>>();
+    edge.on_create = [&edge, pending, delays](const dt::head_guid_t &intent) {
+      const auto index = pending->size();
+      const auto delay = index < delays.size() ? delays[index] : delays.back();
+      pending->push_back({ intent, edge.clock + delay, edge.clock });
+      return dt::edge_send_t { edge_delivery_e::delivered, {} };
+    };
+    edge.before_snapshot = [&edge, pending, meanwhile](int) {
+      for (std::size_t index = 0; index < pending->size(); ++index) {
+        auto &head = (*pending)[index];
+        if (meanwhile) meanwhile(index, std::chrono::duration_cast<std::chrono::milliseconds>(edge.clock - head.sent));
+        if (head.listed || edge.clock < head.due) continue;
+        head.listed = true;
+        edge.displays.push_back(zako_head("vdd-" + std::to_string(index + 1), head.intent.value, 500 + index + 1));
+      }
+    };
+  }
+
+  dt::native_outcome_t
+  prepare_with(dt::native_executor_t &executor, std::uint8_t heads = 1) {
+    dt::native_outcome_t prepared;
+    with_capability(dt::command_kind_e::launch_prepare, [&](const auto &capability) {
+      prepared = executor.prepare(capability, { dt::native_profile_t::source_e::virtual_head, {}, heads });
+    }, true);
+    return prepared;
+  }
+
+  dt::native_outcome_t
+  restore_with(dt::native_executor_t &executor) {
+    dt::native_outcome_t restored;
+    with_capability(dt::command_kind_e::native_restore, [&](const auto &capability) { restored = executor.restore(capability); }, true);
+    return restored;
+  }
+}  // namespace
+
+TEST_F(WindowsNative, AHeadListedSixSecondsAfterItsCreationIsWaitedForAndOwned) {
+  dt::windows_native_platform_t slow { edge, production_options() };
+  arrive_late(edge, { 6000ms });
+  memory_store_t store;
+  dt::native_executor_t executor { store, slow, { next_uuid, 2, driver() } };
+  const auto prepared = prepare_with(executor);
+  ASSERT_EQ(prepared.verdict, native_verdict_e::ok) << prepared.reason;
+  ASSERT_TRUE(prepared.target);
+  EXPECT_EQ(prepared.target->display, dt::os_display_id_t { "vdd-1" });
+  EXPECT_EQ(restore_with(executor).verdict, native_verdict_e::ok);
+  EXPECT_EQ(edge.destroys, 1);
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(WindowsNative, AHeadThatIsNeverListedIsRemovedAndRefusedNotLeftUnresolved) {
+  dt::windows_native_platform_t slow { edge, production_options() };
+  arrive_late(edge, { std::chrono::hours { 1 } });
+  memory_store_t store;
+  dt::native_executor_t executor { store, slow, { next_uuid, 2, driver() } };
+  const auto prepared = prepare_with(executor);
+  EXPECT_EQ(prepared.verdict, native_verdict_e::refused) << prepared.reason;
+  EXPECT_TRUE(mentions(prepared.reason, "no virtual display appeared")) << prepared.reason;
+  EXPECT_EQ(edge.destroys, 1) << "the driver's own list is cleared, so the late head never lands";
+  EXPECT_FALSE(store.bytes);
+  EXPECT_FALSE(executor.health().in_conflict);
+}
+
+TEST_F(WindowsNative, AFirstHeadReEnumeratedWhileTheSecondIsLateIsFollowedNotAConflict) {
+  dt::windows_native_platform_t slow { edge, production_options() };
+  bool re_enumerated = false;
+  arrive_late(edge, { 0ms, 6000ms }, [&](std::size_t index, std::chrono::milliseconds since) {
+    if (index != 1 || re_enumerated || since < 2000ms) return;
+    for (auto &display : edge.displays) {
+      if (display.id != dt::os_display_id_t { "vdd-1" }) continue;
+      display.id = dt::os_display_id_t { "vdd-1b" };
+      display.info.display_name = "\\\\.\\DISPLAY-vdd-1b";
+      display.arrival += 100;
+      re_enumerated = true;
+    }
+  });
+  memory_store_t store;
+  dt::native_executor_t executor { store, slow, { next_uuid, 2, driver() } };
+  const auto prepared = prepare_with(executor, 2);
+  ASSERT_EQ(prepared.verdict, native_verdict_e::ok) << prepared.reason;
+  ASSERT_TRUE(re_enumerated);
+  ASSERT_EQ(prepared.targets.size(), 2u);
+  EXPECT_EQ(prepared.targets[0].display, dt::os_display_id_t { "vdd-1b" });
+  EXPECT_EQ(prepared.targets[1].display, dt::os_display_id_t { "vdd-2" });
+  EXPECT_EQ(restore_with(executor).verdict, native_verdict_e::ok);
+  EXPECT_EQ(edge.destroys, 1);
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(WindowsNative, CreationNotesWhenItsHeadWasListedAndSettled) {
+  auto timed = production_options();
+  std::vector<std::string> notes;
+  timed.note = [&](const std::string &line) { notes.push_back(line); };
+  dt::windows_native_platform_t slow { edge, timed };
+  arrive_late(edge, { 6000ms });
+  std::optional<dt::result_t<delivery_e>> created;
+  with_capability(dt::command_kind_e::launch_prepare, [&](const auto &capability) { created = slow.create_head(capability, id<dt::head_guid_t>(0x51)); });
+  ASSERT_TRUE(created && *created);
+  ASSERT_EQ(notes.size(), 1u);
+  EXPECT_TRUE(mentions(notes[0], "listed 6000 ms")) << notes[0];
+  EXPECT_TRUE(mentions(notes[0], "settled")) << notes[0];
+}
+
+TEST_F(WindowsNative, AFirstHeadThatVanishesAsTheSecondIsListedIsWaitedForUntilTheHeadsSettle) {
+  dt::windows_native_platform_t slow { edge, production_options() };
+  std::optional<dt::edge_display_t> away;
+  bool back = false;
+  arrive_late(edge, { 0ms, 6000ms }, [&](std::size_t index, std::chrono::milliseconds since) {
+    if (index != 1) return;
+    if (!away && since >= 6000ms) {
+      const auto first = std::ranges::find(edge.displays, dt::os_display_id_t { "vdd-1" }, &dt::edge_display_t::id);
+      if (first == edge.displays.end()) return;
+      away = *first;
+      edge.displays.erase(first);
+    }
+    if (away && !back && since >= 6500ms) {
+      auto returned = *away;
+      returned.id = dt::os_display_id_t { "vdd-1b" };
+      returned.info.display_name = "\\\\.\\DISPLAY-vdd-1b";
+      returned.arrival += 100;
+      edge.displays.push_back(returned);
+      back = true;
+    }
+  });
+  memory_store_t store;
+  dt::native_executor_t executor { store, slow, { next_uuid, 2, driver() } };
+  const auto prepared = prepare_with(executor, 2);
+  ASSERT_EQ(prepared.verdict, native_verdict_e::ok) << prepared.reason;
+  ASSERT_TRUE(back);
+  ASSERT_EQ(prepared.targets.size(), 2u);
+  EXPECT_EQ(prepared.targets[0].display, dt::os_display_id_t { "vdd-1b" });
+  EXPECT_EQ(restore_with(executor).verdict, native_verdict_e::ok);
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(WindowsNative, AHeadThatLandsAfterItsRollbackIsNeverAdoptedByTheNextPrepare) {
+  // Whether DESTROYALL also cancels a creation still on its way is a hardware unknown. This fake lets the
+  // head land anyway, 40 s after it was asked for: the journal is already clear and nothing adopts it.
+  dt::windows_native_platform_t slow { edge, production_options() };
+  arrive_late(edge, { 40000ms });
+  memory_store_t store;
+  dt::native_executor_t executor { store, slow, { next_uuid, 2, driver() } };
+  ASSERT_EQ(prepare_with(executor).verdict, native_verdict_e::refused);
+  edge.sleep(20000ms);
+  (void) slow.inventory();
+  ASSERT_EQ(std::ranges::count(edge.displays, head_class_e::driver_head, &dt::edge_display_t::kind), 1);
+  EXPECT_FALSE(store.bytes);
+  EXPECT_FALSE(executor.health().in_conflict);
+  EXPECT_EQ(restore_with(executor).verdict, native_verdict_e::ok);
+  EXPECT_EQ(edge.destroys, 1) << "a restore with a clear journal removes nothing";
+  const auto again = prepare_with(executor);
+  EXPECT_EQ(again.verdict, native_verdict_e::refused) << again.reason;
+  EXPECT_TRUE(mentions(again.reason, "already exists")) << again.reason;
+  EXPECT_EQ(edge.creates.size(), 1u);
 }

@@ -47,7 +47,14 @@ namespace display_device::coordinated {
       struct bundle_t {
         topology::file_journal_store_t store { platf::appdata() / "display_topology_journal.json" };
         topology::win32_edge::win32_native_edge_t edge;
-        topology::windows_native_platform_t platform { edge, { topology::zako_vdd_driver, ZAKO_NAME } };
+        topology::windows_native_platform_t platform { edge, platform_options() };
+
+        static topology::windows_native_options_t
+        platform_options() {
+          topology::windows_native_options_t options { topology::zako_vdd_driver, ZAKO_NAME };
+          options.note = [](const std::string &line) { BOOST_LOG(info) << "Display topology: " << line; };
+          return options;
+        }
         topology::native_executor_t executor {
           store,
           platform,

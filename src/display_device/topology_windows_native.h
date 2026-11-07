@@ -186,6 +186,15 @@ namespace display_device::topology {
     std::string virtual_name;
     std::chrono::milliseconds wait { 5000 };
     std::chrono::milliseconds poll { 100 };
+    /**
+     * How long a delivered creation may take to be listed. ZakoVDD heads took longer than `wait` on the
+     * Punktfunk-only desktop (gh-all run 20261107-232556), so creation has its own, generous bound.
+     */
+    std::chrono::milliseconds create_wait { 30000 };
+    /** A listed new head counts as settled once the virtual heads stay unchanged this long. */
+    std::chrono::milliseconds settle { 1000 };
+    /** Receives one line per creation: when its head was listed and settled, or that it was not. */
+    std::function<void(const std::string &)> note;
   };
 
   class windows_native_platform_t final: public native_platform_t {
@@ -232,6 +241,9 @@ namespace display_device::topology {
     /** Polls until `done` holds for an available inventory or the wait ends; returns whether it held. */
     bool
     wait_for(const std::function<bool(const inventory_t &)> &done);
+
+    bool
+    wait_for(const std::function<bool(const inventory_t &)> &done, std::chrono::milliseconds limit);
 
     native_edge_t &edge_;
     windows_native_options_t options_;

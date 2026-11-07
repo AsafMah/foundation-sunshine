@@ -31,6 +31,14 @@
 namespace dt = display_device::topology;
 
 namespace {
+  /** Production options, printing when each head was listed so a hardware run records the arrival time. */
+  dt::windows_native_options_t
+  gh_options() {
+    dt::windows_native_options_t options { dt::zako_vdd_driver, ZAKO_NAME };
+    options.note = [](const std::string &line) { std::cout << "[gh] " << line << std::endl; };
+    return options;
+  }
+
   constexpr const char *default_guid = "{6A1E5C3B-0D2F-4B8E-9C71-5F3A2E8D4B10}";
 
   bool
@@ -149,7 +157,7 @@ TEST(GhHardware, NativeCreateReadbackDestroy) {
   std::cout << "GH intent=" << dt::format_guid(intent.value) << '\n';
 
   dt::win32_edge::win32_native_edge_t edge;
-  dt::windows_native_platform_t platform { edge, { dt::zako_vdd_driver, ZAKO_NAME } };
+  dt::windows_native_platform_t platform { edge, gh_options() };
 
   const auto before = edge.snapshot();
   const auto heads_before = print("before", before);
@@ -237,7 +245,7 @@ TEST(GhHardware, NativeActivateModeRestore) {
     GTEST_SKIP() << "set SUNSHINE_GH_ACTIVATE=1 to activate and resize a real VDD head";
   }
   dt::win32_edge::win32_native_edge_t edge;
-  dt::windows_native_platform_t platform { edge, { dt::zako_vdd_driver, ZAKO_NAME } };
+  dt::windows_native_platform_t platform { edge, gh_options() };
   const auto journal = std::filesystem::temp_directory_path() / "sunshine-gh-activate-journal.json";
   std::filesystem::remove(journal);
   dt::file_journal_store_t store { journal };
@@ -467,7 +475,7 @@ TEST(GhHardware, NativeTwoHeadsDistinctCapture) {
   }
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   dt::win32_edge::win32_native_edge_t edge;
-  dt::windows_native_platform_t platform { edge, { dt::zako_vdd_driver, ZAKO_NAME } };
+  dt::windows_native_platform_t platform { edge, gh_options() };
   const auto journal = std::filesystem::temp_directory_path() / "sunshine-gh-two-heads-journal.json";
   std::filesystem::remove(journal);
   dt::file_journal_store_t store { journal };
@@ -624,7 +632,7 @@ TEST(GhHardware, CleanupRemoveAllHeads) {
     GTEST_SKIP() << "set SUNSHINE_GH_CLEANUP=1 to remove every real VDD head";
   }
   dt::win32_edge::win32_native_edge_t edge;
-  dt::windows_native_platform_t platform { edge, { dt::zako_vdd_driver, ZAKO_NAME } };
+  dt::windows_native_platform_t platform { edge, gh_options() };
   print("cleanup-before", edge.snapshot());
   bool removed = false;
   in_launch_prepare([&](const dt::mutation_capability_t &capability) {
