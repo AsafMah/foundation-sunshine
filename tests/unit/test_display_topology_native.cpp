@@ -4794,3 +4794,67 @@ TEST_F(NativeExecutor, EveryOtherDisplaysRefusalNamesEachChangedField) {
     EXPECT_FALSE(mentions(outcome.reason, "os-A")) << "unchanged displays are not listed: " << outcome.reason;
   }
 }
+
+// --- Review of 7205c888: an active display without a readable layout is never "off" ---------------------------
+
+TEST_F(NativeExecutor, AnActiveDisplayWithoutAReadableLayoutIsAConflictNotOff) {
+  struct case_t {
+    std::string name;
+    bool at_baseline;
+  };
+  for (const auto &[name, at_baseline] : std::vector<case_t> { { "unreadable at baseline", true }, { "unreadable after arrival", false } }) {
+    SCOPED_TRACE(name);
+    ASSERT_TRUE(healthy(reset_with(executor)));
+    platform.host = sole_virtual_primary();
+    platform.take_origin = true;
+    platform.create_inactive = true;
+    platform.arrangements.clear();
+    platform.deactivations.clear();
+    if (at_baseline) {
+      // Active, but its geometry could not be read: neither "off" nor comparable.
+      auto &a = find(platform.host, "os-A");
+      a.info.device_state = state_e::active;
+      a.info.display_name = "\\\\.\\DISPLAY-os-A";
+      platform.on_activate = nullptr;
+    }
+    else {
+      platform.on_activate = [&](const dt::observed_display_t &head) -> dt::result_t<void> {
+        auto &target = find(platform.host, head.id.value);
+        target.info.device_state = state_e::active;
+        target.info.display_name = "\\\\.\\DISPLAY-" + head.id.value;
+        target.layout = display_topology_test::layout(platform.right_edge());
+        platform.take_origin_for(head.id.value);
+        auto &a = find(platform.host, "os-A");
+        a.info.device_state = state_e::active;
+        a.info.display_name = "\\\\.\\DISPLAY-os-A";
+        return {};
+      };
+    }
+    const auto outcome = managed_prepare_with(executor);
+    EXPECT_FALSE(verdict_is(outcome, native_verdict_e::ok)) << outcome.reason;
+    // At baseline the journal already refuses it (its geometry cannot be journaled); after arrival the diff names it.
+    EXPECT_TRUE(mentions(outcome.reason, at_baseline ? "geometry is unknown" : "layout unreadable")) << outcome.reason;
+    EXPECT_TRUE(std::all_of(platform.deactivations.begin(), platform.deactivations.end(), [](const auto &off) { return off.empty(); }))
+      << "a display whose state is on is never turned off as if it were off";
+    EXPECT_EQ(platform.head_count(), 0u);
+  }
+}
+
+TEST_F(NativeExecutor, TheRefusalDiffComparesModesExactlyAndShowsRawRates) {
+  platform.host = host_inventory();
+  platform.create_inactive = true;
+  platform.on_activate = [&](const dt::observed_display_t &head) -> dt::result_t<void> {
+    auto &target = find(platform.host, head.id.value);
+    target.info.device_state = state_e::active;
+    target.info.display_name = "\\\\.\\DISPLAY-" + head.id.value;
+    target.layout = display_topology_test::layout(3840);
+    // The same 60 Hz to a reader, a different rate to the OS.
+    find(platform.host, "os-B").layout->mode.refresh_rate = { 60000, 1000 };
+    return {};
+  };
+  const auto outcome = managed_prepare_with(executor);
+  EXPECT_FALSE(verdict_is(outcome, native_verdict_e::ok));
+  EXPECT_TRUE(mentions(outcome.reason, "os-B")) << outcome.reason;
+  EXPECT_TRUE(mentions(outcome.reason, "60/1")) << outcome.reason;
+  EXPECT_TRUE(mentions(outcome.reason, "60000/1000")) << outcome.reason;
+}

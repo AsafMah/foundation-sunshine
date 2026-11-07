@@ -285,6 +285,18 @@ namespace display_device::topology {
       });
     }
 
+    /** Off the desktop: listed but inactive. A display that is on but whose layout cannot be read is not "off". */
+    bool
+    is_off_desktop(const observed_display_t *display) {
+      return !display || display->info.device_state == device_state_e::inactive;
+    }
+
+    /** On the desktop without a readable layout: nothing about it can be compared or put back. */
+    bool
+    unreadable(const observed_display_t *display) {
+      return display && display->info.device_state != device_state_e::inactive && !display->layout;
+    }
+
     /**
      * Only corners and the primary moved: the same unmanaged displays, the same ones off the
      * desktop, and every mode, rotation and HDR state as in the baseline. Only this drift is
@@ -308,8 +320,9 @@ namespace display_device::topology {
       return std::all_of(record.baseline.displays.begin(), record.baseline.displays.end(), [&](const observed_display_t &before) {
         if (!unmanaged(platform, record, before)) return true;
         const auto *now = find_unique(current, before.id);
-        const bool was_off = before.info.device_state == device_state_e::inactive || !before.layout;
-        const bool is_off = !now || now->info.device_state == device_state_e::inactive || !now->layout;
+        if (unreadable(&before) || unreadable(now)) return false;
+        const bool was_off = is_off_desktop(&before);
+        const bool is_off = is_off_desktop(now);
         if (was_off || is_off) return was_off == is_off;
         return same_shape(*before.layout, *now->layout);
       });
@@ -339,8 +352,10 @@ namespace display_device::topology {
       for (const auto &before : record.baseline.displays) {
         if (!unmanaged(platform, record, before)) continue;
         const auto *now = find_unique(current, before.id);
-        const bool was_off = before.info.device_state == device_state_e::inactive || !before.layout;
-        const bool is_off = !now || now->info.device_state == device_state_e::inactive || !now->layout;
+        // An active display whose layout cannot be read is never "off": a conflict, not something to turn off.
+        if (unreadable(&before) || unreadable(now)) return std::nullopt;
+        const bool was_off = is_off_desktop(&before);
+        const bool is_off = is_off_desktop(now);
         if (was_off) {
           if (!is_off) on.push_back(before.id);
           continue;
@@ -419,7 +434,17 @@ namespace display_device::topology {
             fields.push_back("corner " + std::to_string(a.position.x) + "," + std::to_string(a.position.y) + " -> " +
                              std::to_string(b.position.x) + "," + std::to_string(b.position.y));
           }
-          if (mode_text(a.mode) != mode_text(b.mode)) fields.push_back("mode " + mode_text(a.mode) + " -> " + mode_text(b.mode));
+          const bool same_mode = a.mode.resolution.width == b.mode.resolution.width && a.mode.resolution.height == b.mode.resolution.height &&
+                                 a.mode.refresh_rate.numerator == b.mode.refresh_rate.numerator &&
+                                 a.mode.refresh_rate.denominator == b.mode.refresh_rate.denominator;
+          if (!same_mode) {
+            // The rounded text can hide a different rate: then the raw numerator/denominator are shown too.
+            const bool same_text = mode_text(a.mode) == mode_text(b.mode);
+            const auto raw = [&](const display_device::display_mode_t &m) {
+              return same_text ? " (" + std::to_string(m.refresh_rate.numerator) + "/" + std::to_string(m.refresh_rate.denominator) + ")" : std::string {};
+            };
+            fields.push_back("mode " + mode_text(a.mode) + raw(a.mode) + " -> " + mode_text(b.mode) + raw(b.mode));
+          }
           if (a.rotation != b.rotation) {
             fields.push_back("rotation " + std::to_string(static_cast<int>(a.rotation)) + " -> " + std::to_string(static_cast<int>(b.rotation)));
           }
@@ -429,7 +454,9 @@ namespace display_device::topology {
           }
           if (a.hdr != b.hdr) fields.push_back("HDR " + hdr_text(a.hdr) + " -> " + hdr_text(b.hdr));
         }
-        else if (now->layout && !before.layout) {
+        if (unreadable(&before)) fields.push_back("on, layout unreadable at baseline");
+        if (unreadable(now)) fields.push_back("on, layout unreadable");
+        if (now->layout && !before.layout) {
           fields.push_back("now at " + std::to_string(now->layout->position.x) + "," + std::to_string(now->layout->position.y) + " " + mode_text(now->layout->mode));
         }
         if (!fields.empty()) {
