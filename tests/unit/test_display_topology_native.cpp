@@ -4495,6 +4495,23 @@ TEST_F(NativeExecutor, AnOffDisplayThatStaysOnAfterPuttingTheBaselineBackIsAConf
   EXPECT_TRUE(store.bytes);
 }
 
+TEST_F(NativeExecutor, AnOffDisplayTurnedOnBesideAForeignVirtualHeadIsNotTouched) {
+  // Nothing of this journal was written (os-A is still at its baseline), so restore only checks the
+  // other displays: os-B, off at baseline, is on, and a virtual head this run does not own is listed.
+  auto record = field_journal({ managed("os-A", { .mode = mode(2560, 1440) }) }, { { "os-A", step_e::attempted } });
+  take_off_desktop(record.baseline, "os-B");
+  store.put(record);
+  platform.host.displays.push_back(virtual_display("vdd-foreign", 3840));
+  platform.arrangements.clear();
+  dt::native_outcome_t outcome;
+  with_capability(dt::command_kind_e::native_restore, [&](const auto &capability) { outcome = executor.restore(capability); }, true);
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict)) << outcome.reason;
+  EXPECT_TRUE(std::all_of(platform.deactivations.begin(), platform.deactivations.end(), [](const auto &off) { return off.empty(); }))
+    << "nothing is turned off beside a virtual head";
+  EXPECT_EQ(state_of(platform.host, "os-B"), state_e::active);
+  EXPECT_TRUE(store.bytes);
+}
+
 TEST_F(NativeExecutor, AnOffDisplayTurnedOnWhileAVirtualHeadRemainsIsNotTouched) {
   take_off_desktop(platform.host, "os-B");
   ASSERT_TRUE(verdict_is(managed_prepare_with(executor), native_verdict_e::ok));
