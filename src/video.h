@@ -264,6 +264,8 @@ namespace video {
 
     // Managed topology: capture exactly display_name or nothing (no default-display fallback).
     bool display_exact = false;
+    /** GW-H5: this stream is a display-group member (no keyboard, text or gamepad input, no audio). */
+    bool display_group_member = false;
     // Optional per-display initialization capture backend override.
     // This is intentionally scoped to a single platf::display() call so encoder
     // probing can avoid mutating the global config::video.capture string.

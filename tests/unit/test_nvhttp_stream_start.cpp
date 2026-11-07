@@ -968,6 +968,7 @@ namespace {
     ASSERT_TRUE(nvhttp::stream_start::join_managed_display(join_tree, joiner, *coordinator, *joined.token));
     EXPECT_EQ(joiner.env["SUNSHINE_CLIENT_DISPLAY_NAME"].to_string(), "{zako-head}");
     EXPECT_TRUE(joiner.display_exact);
+    EXPECT_FALSE(joiner.display_group_member) << "an ordinary joiner keeps its keyboard, gamepads and audio";
     EXPECT_EQ(fake.probed.size(), probes_before) << "a joiner never reprobes: that would stale the owner's admission";
     ASSERT_EQ(fake.joiners_admitted.size(), 1u);
     EXPECT_EQ(fake.joiners_admitted[0].output_name, "{zako-head}");
@@ -1242,12 +1243,26 @@ namespace {
     fake.joiner_admissions = { probed(probe_error_e::none) };
     ASSERT_TRUE(nvhttp::stream_start::join_managed_display(join_tree, joiner, *coordinator, *joined.token));
     EXPECT_TRUE(joiner.display_exact);
+    EXPECT_TRUE(joiner.display_group_member) << "GW-H5: no keyboard, text, gamepads or audio";
     EXPECT_EQ(joiner.env["SUNSHINE_CLIENT_DISPLAY_NAME"].to_string(), "{zako-head-2}");
     ASSERT_EQ(fake.joiners_admitted.size(), 1u);
     EXPECT_EQ(fake.joiners_admitted[0].output_name, "{zako-head-2}");
     EXPECT_TRUE(coordinator->bind_launch(*joined.token));
     EXPECT_EQ(prepares, 1) << "only the leader prepared";
     EXPECT_EQ(restores->load(), 0);
+  }
+
+  TEST_F(DisplayGroupJoin, AHeadZeroJoinerOfAGroupLeaseIsNoMember) {
+    lead();
+    rtsp_stream::launch_session_t joiner {};
+    joiner.id = 78;
+    const auto joined = coordinator->admit_managed_join({ joiner.id, "fixture" });
+    ASSERT_TRUE(joined);
+    boost::property_tree::ptree join_tree;
+    fake.joiner_admissions = { probed(probe_error_e::none) };
+    ASSERT_TRUE(nvhttp::stream_start::join_managed_display(join_tree, joiner, *coordinator, *joined.token));
+    EXPECT_EQ(joiner.env["SUNSHINE_CLIENT_DISPLAY_NAME"].to_string(), "{zako-head}");
+    EXPECT_FALSE(joiner.display_group_member) << "it shares the leader's head and negotiated no group";
   }
 
   TEST_F(DisplayGroupJoin, RefusalsCarryTheStatusTheWireContractNames) {

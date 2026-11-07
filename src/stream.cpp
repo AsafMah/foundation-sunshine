@@ -47,6 +47,7 @@ extern "C" {
 #include "display_device/display_device.h"
 #include "display_device/session.h"
 #include "display_device/topology_group_layout.h"
+#include "display_group_member.h"
 #include "display_device/topology_runtime.h"
 #include "globals.h"
 #include "haptics/authored_ir.h"
@@ -2462,6 +2463,9 @@ namespace stream {
         std::copy(payload.end() - 16, payload.end(), std::begin(iv));
       }
 
+      if (display_group::drop_member_input(session->config.monitor.display_group_member, plaintext)) {
+        return;
+      }
       input::passthrough(session->input, std::move(plaintext));
     });
 
@@ -2526,6 +2530,10 @@ namespace stream {
       // IDX_INPUT_DATA callback will attempt to decrypt unencrypted data, therefore we need pass it directly
       if (type == packetTypes[IDX_INPUT_DATA]) {
         plaintext.erase(std::begin(plaintext), std::begin(plaintext) + 4);
+        // GW-H5: keyboard, text and gamepads belong to the leader; a member's own are dropped.
+        if (display_group::drop_member_input(session->config.monitor.display_group_member, plaintext)) {
+          return;
+        }
         input::passthrough(session->input, std::move(plaintext));
       }
       else {
@@ -4358,6 +4366,13 @@ namespace stream {
         if (!cancelled()) spatial_audio::mat_live_status.failed(e.what());
         BOOST_LOG(::error) << "Live MAT stopped: " << e.what();
       }
+      return;
+    }
+    if (session->config.monitor.display_group_member) {
+      // GW-H5: the group's audio is the leader's. The member answered the audio ping (its client is
+      // unchanged) and holds the stream open until it ends, without capturing audio a second time.
+      BOOST_LOG(info) << "Display group member: no audio capture for launch session "sv << session->launch_session_id;
+      session->mail->event<bool>(mail::shutdown)->view();
       return;
     }
     BOOST_LOG(debug) << "Start capturing Audio"sv;

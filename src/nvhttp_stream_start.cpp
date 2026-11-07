@@ -1341,6 +1341,8 @@ namespace nvhttp::stream_start {
     }
     adopt_managed_display(launch_session, *target);
     carry_admission(launch_session, outcome);
+    // GW-H5: a member streams its own head of a group (not the owner, not a head-0 joiner).
+    launch_session.display_group_member = token.attachment_serial != 0 && coordinator.display_group(token).has_value();
     return true;
   }
 

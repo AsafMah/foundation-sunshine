@@ -86,6 +86,8 @@ namespace rtsp_stream {
     std::shared_ptr<video::admission_ticket_t> video_admission;
     // Managed display-group leader only: the group id as 32 lowercase hex digits.
     std::string display_group;
+    // GW-H5: a display-group member (heads 1..N-1): no keyboard, text or gamepad input and no audio.
+    bool display_group_member {};
     bool host_audio;
     std::string unique_id;
     std::string client_name;
