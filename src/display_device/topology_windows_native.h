@@ -51,6 +51,19 @@ namespace display_device::topology {
   std::optional<uuid_bytes_t>
   parse_guid(std::string_view text);
 
+  /** ZakoVDD supports at most this many monitors (its InitAdapter bound). */
+  inline constexpr std::uint32_t zako_max_display_count = 16;
+
+  /**
+   * The number of monitors ZakoVDD v0.18 creates per CREATEMONITOR, from its vdd_settings.xml, read as the
+   * driver reads it: `<monitors><count>N</count>`; text that is not a number, 0, or more than
+   * `zako_max_display_count` count as 1. nullopt when the file has no `<count>` element.
+   * The driver puts the request's GUIDs on monitor slots 0..N-1 and treats a create for an existing slot
+   * as a silent success, so it never shows more than N monitors.
+   */
+  std::optional<std::uint32_t>
+  parse_vdd_display_count(std::string_view xml);
+
   enum class edge_delivery_e : std::uint8_t {
     /** The driver completed the command. */
     delivered,
@@ -104,6 +117,14 @@ namespace display_device::topology {
     operator==(const edge_mode_t &) const = default;
   };
 
+  /** Why a delivered creation was not listed: what the device and display databases show for it. */
+  struct missing_head_report_t {
+    /** Whether a present monitor devnode carries the request GUID as its ContainerId; nullopt when unknown. */
+    std::optional<bool> monitor_present;
+    /** The monitor devnodes and display paths of the driver, as one line for the log. */
+    std::string detail;
+  };
+
   /** The driver-wide mode list keeps at most this many modes (`vdd_mode_list::kMaxTotalModes`). */
   inline constexpr std::size_t max_driver_modes = 96;
 
@@ -154,6 +175,12 @@ namespace display_device::topology {
     arrange(const mutation_capability_t &capability, const std::vector<placement_t> &placements,
       const std::vector<os_display_id_t> &off) = 0;
 
+    /** Read-only: the monitor devnodes with `intent` as ContainerId and the driver's raw display paths. */
+    virtual missing_head_report_t
+    describe_missing_head(const head_guid_t &) {
+      return {};
+    }
+
     virtual std::chrono::steady_clock::time_point
     now() = 0;
 
@@ -195,6 +222,8 @@ namespace display_device::topology {
     std::chrono::milliseconds settle { 1000 };
     /** Receives one line per creation: when its head was listed and settled, or that it was not. */
     std::function<void(const std::string &)> note;
+    /** How many heads the driver can show at once (`parse_vdd_display_count` of its settings); empty or nullopt when unknown. */
+    std::function<std::optional<std::uint32_t>()> head_capacity;
   };
 
   class windows_native_platform_t final: public native_platform_t {
@@ -207,6 +236,9 @@ namespace display_device::topology {
     /** By friendly name only, so a journaled inventory classifies the same way it did live. */
     bool
     is_virtual_head(const observed_display_t &display) const override;
+
+    std::optional<std::uint32_t>
+    head_capacity() const override;
 
   private:
     result_t<creation_delivery_e>

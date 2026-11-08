@@ -36,6 +36,7 @@ namespace {
   gh_options() {
     dt::windows_native_options_t options { dt::zako_vdd_driver, ZAKO_NAME };
     options.note = [](const std::string &line) { std::cout << "[gh] " << line << std::endl; };
+    options.head_capacity = [] { return dt::win32_edge::read_zako_display_count(); };
     return options;
   }
 
@@ -525,6 +526,12 @@ TEST(GhHardware, NativeTwoHeadsDistinctCapture) {
   in_launch_prepare([&](const auto &capability) { prepared = executor.prepare(capability, profile); });
   std::cout << "GH two_prepare verdict=" << dt::to_string(prepared.verdict) << " reason=" << prepared.reason
             << " targets=" << prepared.targets.size() << '\n';
+  if (prepared.verdict == dt::native_verdict_e::refused && prepared.reason.starts_with("ZakoVDD is configured for ")) {
+    // The driver cannot show two heads (ZakoVDD v0.18 with <count>1</count>); nothing was created, nothing to restore.
+    std::cout << "GH two_prepare_skipped=" << prepared.reason << '\n';
+    EXPECT_EQ(print("after-two-refusal", edge.snapshot()), 0u);
+    GTEST_SKIP() << prepared.reason;
+  }
   const auto prepared_snapshot = edge.snapshot();
   const auto heads_prepared = print("after-two-prepare", prepared_snapshot);
   const bool others_kept_on_prepare = others(prepared_snapshot) == others(before);
@@ -622,7 +629,21 @@ TEST(GhHardware, ProbeDriverHeads) {
   const auto snapshot = edge.snapshot();
   const auto heads = print("probe", snapshot);
   std::cout << "GH driver_heads=" << (snapshot.available ? std::to_string(heads) : std::string { "unavailable" }) << '\n';
+  const auto count = dt::win32_edge::read_zako_display_count();
+  std::cout << "GH driver_display_count=" << (count ? std::to_string(*count) : std::string { "unreadable" }) << '\n';
+  // Read-only: the diagnosis a missing head gets, for a GUID no monitor carries.
+  const auto report = edge.describe_missing_head(dt::head_guid_t { dt::uuid_bytes_t { 0x6B, 0x1D, 0x7E } });
+  std::cout << "GH missing_head_probe present=" << (report.monitor_present ? std::to_string(*report.monitor_present) : std::string { "unknown" })
+            << " detail=" << report.detail << '\n';
   EXPECT_TRUE(snapshot.available);
+  EXPECT_EQ(report.monitor_present, std::optional { false });
+  if (const char *guid = std::getenv("SUNSHINE_GH_PROBE_GUID")) {
+    if (const auto bytes = dt::parse_guid(guid)) {
+      const auto named = edge.describe_missing_head(dt::head_guid_t { *bytes });
+      std::cout << "GH missing_head_named present=" << (named.monitor_present ? std::to_string(*named.monitor_present) : std::string { "unknown" })
+                << " detail=" << named.detail << '\n';
+    }
+  }
 }
 
 /** Recovery only: remove every driver head, for when the run above could not. */

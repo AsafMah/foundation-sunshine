@@ -924,6 +924,14 @@ namespace display_device::topology {
     if (count == 0 || count > max_virtual_heads) {
       return refused("This version prepares 1 to " + std::to_string(max_virtual_heads) + " virtual displays, not " + std::to_string(count));
     }
+    // ZakoVDD v0.18 shows at most its configured count of monitors; another create for an occupied slot is
+    // dropped as a silent success (gh-all runs 20261108-165856/-170253), so asking would only wait and roll back.
+    if (const auto capacity = platform_.head_capacity(); capacity && count > *capacity) {
+      static constexpr const char *names[] = { "", "one", "two", "three", "four" };
+      const auto group = count < std::size(names) ? std::string { names[count] } : std::to_string(count);
+      return refused("ZakoVDD is configured for " + std::to_string(*capacity) + " display(s); " + group +
+                     "-display groups need the ZakoVDD multi-monitor change");
+    }
     const auto baseline = platform_.inventory();
     if (!baseline.available) {
       return refused("The display inventory is unavailable");

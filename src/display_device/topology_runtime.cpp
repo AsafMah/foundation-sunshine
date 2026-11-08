@@ -53,6 +53,7 @@ namespace display_device::coordinated {
         platform_options() {
           topology::windows_native_options_t options { topology::zako_vdd_driver, ZAKO_NAME };
           options.note = [](const std::string &line) { BOOST_LOG(info) << "Display topology: " << line; };
+          options.head_capacity = [] { return topology::win32_edge::read_zako_display_count(); };
           return options;
         }
         topology::native_executor_t executor {

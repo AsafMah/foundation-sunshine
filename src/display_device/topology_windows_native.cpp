@@ -5,6 +5,7 @@
 #include "topology_windows_native.h"
 
 #include <algorithm>
+#include <cctype>
 #include <set>
 #include <stdexcept>
 #include <tuple>
@@ -197,6 +198,36 @@ namespace display_device::topology {
     return inventory;
   }
 
+  std::optional<std::uint32_t>
+  parse_vdd_display_count(std::string_view xml) {
+    // Like the driver's XmlLite reader: the text of the last <count> element, read with stoi.
+    std::optional<std::string_view> text;
+    for (std::size_t at = xml.find("<count>"); at != std::string_view::npos; at = xml.find("<count>", at + 1)) {
+      const auto begin = at + 7;
+      const auto end = xml.find('<', begin);
+      if (end == std::string_view::npos) break;
+      text = xml.substr(begin, end - begin);
+    }
+    if (!text) return std::nullopt;
+    std::size_t i = 0;
+    while (i < text->size() && std::isspace(static_cast<unsigned char>((*text)[i]))) ++i;
+    bool negative = false;
+    if (i < text->size() && ((*text)[i] == '+' || (*text)[i] == '-')) negative = (*text)[i++] == '-';
+    std::uint64_t value = 0;
+    bool digits = false;
+    for (; i < text->size() && std::isdigit(static_cast<unsigned char>((*text)[i])) && value <= zako_max_display_count; ++i) {
+      value = value * 10 + static_cast<std::uint64_t>((*text)[i] - '0');
+      digits = true;
+    }
+    if (!digits || negative || value == 0 || value > zako_max_display_count) return 1;
+    return static_cast<std::uint32_t>(value);
+  }
+
+  std::optional<std::uint32_t>
+  windows_native_platform_t::head_capacity() const {
+    return options_.head_capacity ? options_.head_capacity() : std::nullopt;
+  }
+
   bool
   windows_native_platform_t::is_virtual_head(const observed_display_t &display) const {
     return display.info.friendly_name == options_.virtual_name;
@@ -240,7 +271,14 @@ namespace display_device::topology {
       return std::ranges::any_of(observed.heads, [&](const observed_head_t &head) { return head.identity.guid == intent; });
     }, options_.create_wait);
     if (!listed) {
-      note("virtual display " + format_guid(intent.value) + " was not listed within " + std::to_string(options_.create_wait.count()) + " ms of its delivered creation");
+      if (options_.note) {
+        const auto report = edge_.describe_missing_head(intent);
+        const auto why = !report.monitor_present ? std::string { "whether the driver created its monitor could not be determined" } :
+                         *report.monitor_present ? std::string { "the driver created its monitor, but Windows shows no display path for it" } :
+                                                   std::string { "the driver did not create a monitor for it (no present monitor device carries its ContainerId)" };
+        note("virtual display " + format_guid(intent.value) + " was not listed within " + std::to_string(options_.create_wait.count()) +
+             " ms of its delivered creation; " + why + (report.detail.empty() ? std::string {} : " [" + report.detail + "]"));
+      }
       return creation_delivery_e::accepted;
     }
     const auto arrived = elapsed();

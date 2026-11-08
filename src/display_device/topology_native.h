@@ -96,6 +96,12 @@ namespace display_device::topology {
     virtual bool
     is_virtual_head(const observed_display_t &display) const = 0;
 
+    /** How many heads the driver can show at once, or nullopt when unknown (then nothing is refused for it). */
+    virtual std::optional<std::uint32_t>
+    head_capacity() const {
+      return std::nullopt;
+    }
+
     /**
      * Ask the virtual display driver for one more head, then wait (bounded) for it to be
      * listed. An error means the driver refused, so no head of this request can appear;

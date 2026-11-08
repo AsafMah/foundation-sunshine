@@ -5,6 +5,11 @@
 #include "native_edge.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <thread>
 #include <vector>
@@ -25,6 +30,11 @@ namespace display_device::topology::win32_edge {
     constexpr DEVPROPKEY last_arrival_key { { 0x83da6326, 0x97a6, 0x4088, { 0x94, 0x53, 0xa1, 0x92, 0x3f, 0x57, 0x3b, 0x29 } }, 102 };
     constexpr DEVPROPKEY parent_key { { 0x4340a6c5, 0x93fa, 0x4706, { 0x97, 0x2c, 0x7b, 0x64, 0x80, 0x08, 0xa5, 0xa7 } }, 8 };
     constexpr DEVPROPKEY hardware_ids_key { { 0xa45c254e, 0xdf1c, 0x4efd, { 0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0 } }, 3 };
+    constexpr DEVPROPKEY devnode_status_key { { 0x4340a6c5, 0x93fa, 0x4706, { 0x97, 0x2c, 0x7b, 0x64, 0x80, 0x08, 0xa5, 0xa7 } }, 2 };
+    constexpr DEVPROPKEY problem_code_key { { 0x4340a6c5, 0x93fa, 0x4706, { 0x97, 0x2c, 0x7b, 0x64, 0x80, 0x08, 0xa5, 0xa7 } }, 3 };
+    constexpr DEVPROPKEY is_present_key { { 0x540b947e, 0x8b40, 0x45bc, { 0xa8, 0xa2, 0x6a, 0x0b, 0x89, 0x4c, 0xbd, 0xa2 } }, 5 };
+    // GUID_DEVCLASS_MONITOR (devguid.h).
+    constexpr GUID monitor_class { 0x4d36e96e, 0xe325, 0x11ce, { 0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18 } };
 
     class device_list_t {
     public:
@@ -123,6 +133,31 @@ namespace display_device::topology::win32_edge {
         text_property(list, parent_device, hardware_ids_key, DEVPROP_TYPE_STRING_LIST, true));
     }
 
+    std::string
+    narrow(const std::wstring &text) {
+      if (text.empty()) return {};
+      const int size = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+      if (size <= 0) return {};
+      std::string out(static_cast<std::size_t>(size), '\0');
+      WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), size, nullptr, nullptr);
+      return out;
+    }
+
+    std::string
+    hex32(std::uint32_t value) {
+      char text[11];
+      std::snprintf(text, sizeof(text), "0x%08X", value);
+      return text;
+    }
+
+    bool
+    contains_ignoring_case(std::string text, std::string needle) {
+      const auto lower = [](std::string &s) { std::ranges::transform(s, s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); }); };
+      lower(text);
+      lower(needle);
+      return text.find(needle) != std::string::npos;
+    }
+
     edge_send_t
     to_edge(const vdd_ioctl::gated_send_t &sent) {
       switch (sent.delivery) {
@@ -185,6 +220,77 @@ namespace display_device::topology::win32_edge {
       snapshot.displays.push_back(std::move(display));
     }
     return snapshot;
+  }
+
+  std::optional<std::uint32_t>
+  read_zako_display_count() {
+    DWORD size = 0;
+    constexpr auto key = L"SOFTWARE\\ZakoTech\\ZakoDisplayAdapter";
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, key, L"VDDPATH", RRF_RT_REG_SZ, nullptr, nullptr, &size) != ERROR_SUCCESS || size < sizeof(wchar_t)) {
+      return std::nullopt;
+    }
+    std::wstring folder(size / sizeof(wchar_t), L'\0');
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, key, L"VDDPATH", RRF_RT_REG_SZ, nullptr, folder.data(), &size) != ERROR_SUCCESS) return std::nullopt;
+    folder.resize(wcsnlen(folder.c_str(), folder.size()));
+    std::ifstream file { std::filesystem::path { folder } / L"vdd_settings.xml", std::ios::binary };
+    if (!file) return std::nullopt;
+    const std::string xml { std::istreambuf_iterator<char> { file }, std::istreambuf_iterator<char> {} };
+    return parse_vdd_display_count(xml);
+  }
+
+  missing_head_report_t
+  win32_native_edge_t::describe_missing_head(const head_guid_t &intent) {
+    missing_head_report_t report;
+    std::string detail;
+    // Every monitor devnode, present or not, whose ContainerId is the request GUID (ZakoVDD sets it from the GUID).
+    const HDEVINFO monitors = SetupDiGetClassDevsW(&monitor_class, nullptr, nullptr, 0);
+    if (monitors == INVALID_HANDLE_VALUE) {
+      detail += "monitor devices unreadable (err=" + std::to_string(GetLastError()) + "); ";
+    }
+    else {
+      bool present = false;
+      int matches = 0;
+      SP_DEVINFO_DATA device {};
+      device.cbSize = sizeof(device);
+      for (DWORD index = 0; SetupDiEnumDeviceInfo(monitors, index, &device); ++index) {
+        const auto container = fixed_property<GUID>(monitors, device, container_id_key, DEVPROP_TYPE_GUID);
+        if (!container || container_bytes(*container) != intent.value) continue;
+        ++matches;
+        wchar_t instance[512] {};
+        SetupDiGetDeviceInstanceIdW(monitors, &device, instance, static_cast<DWORD>(std::size(instance)), nullptr);
+        const auto here = fixed_property<DEVPROP_BOOLEAN>(monitors, device, is_present_key, DEVPROP_TYPE_BOOLEAN);
+        const bool is_here = here && *here == DEVPROP_TRUE;
+        present = present || is_here;
+        detail += "monitor " + narrow(instance) + (is_here ? " present" : here ? " not present" : " presence unknown");
+        if (const auto status = fixed_property<std::uint32_t>(monitors, device, devnode_status_key, DEVPROP_TYPE_UINT32)) detail += " status=" + hex32(*status);
+        if (const auto problem = fixed_property<std::uint32_t>(monitors, device, problem_code_key, DEVPROP_TYPE_UINT32)) detail += " problem=" + std::to_string(*problem);
+        detail += "; ";
+      }
+      SetupDiDestroyDeviceInfoList(monitors);
+      if (matches == 0) detail += "no monitor device carries its ContainerId; ";
+      report.monitor_present = present;
+    }
+    // The driver's raw CCD paths, available or not, which the snapshot filters out when they are not valid.
+    if (const auto data = w_utils::query_display_config(w_utils::ALL_DEVICES)) {
+      std::size_t named = 0;
+      for (const auto &path : data->paths) {
+        const auto friendly = w_utils::get_friendly_name(path);
+        const auto monitor = w_utils::get_monitor_device_path(path);
+        if (!contains_ignoring_case(monitor, "zak") && !contains_ignoring_case(friendly, "zako")) continue;
+        if (++named > 8) continue;
+        const auto &adapter = path.targetInfo.adapterId;
+        detail += "path target=" + std::to_string(path.targetInfo.id) + " adapter=" + hex32(static_cast<std::uint32_t>(adapter.HighPart)) + ":" +
+                  hex32(adapter.LowPart) + " available=" + std::to_string(path.targetInfo.targetAvailable ? 1 : 0) +
+                  " active=" + std::to_string(w_utils::is_active(path) ? 1 : 0) + " name='" + w_utils::get_display_name(path) + "' friendly='" +
+                  friendly + "' monitor='" + monitor + "'; ";
+      }
+      detail += std::to_string(named) + " of " + std::to_string(data->paths.size()) + " display paths name a ZakoVDD target";
+    }
+    else {
+      detail += "display paths unreadable";
+    }
+    report.detail = std::move(detail);
+    return report;
   }
 
   edge_send_t

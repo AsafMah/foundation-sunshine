@@ -7,10 +7,13 @@
 #include <chrono>
 #include <exception>
 #include <functional>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <map>
 
 #include <gtest/gtest.h>
 
@@ -197,6 +200,15 @@ namespace {
       return { edge_delivery_e::delivered, {} };
     }
 
+    dt::missing_head_report_t
+    describe_missing_head(const dt::head_guid_t &intent) override {
+      described.push_back(intent);
+      if (!describes) return {};
+      const bool listed = std::ranges::any_of(displays, [&](const auto &display) { return display.container == std::optional { intent.value }; });
+      const bool hidden = std::ranges::find(hidden_monitors, intent) != hidden_monitors.end();
+      return { listed || hidden, "fake monitors=" + std::to_string(hidden_monitors.size()) };
+    }
+
     std::chrono::steady_clock::time_point
     now() override {
       return clock;
@@ -242,6 +254,11 @@ namespace {
     std::vector<std::vector<dt::placement_t>> arrangements;
     std::vector<std::vector<dt::os_display_id_t>> offs;
     std::function<dt::edge_send_t(const std::vector<dt::placement_t> &)> on_arrange;
+    /** Whether describe_missing_head can tell (the Win32 edge reads SetupAPI and CCD). */
+    bool describes { true };
+    /** Monitors the driver created that Windows lists in no display path. */
+    std::vector<dt::head_guid_t> hidden_monitors;
+    std::vector<dt::head_guid_t> described;
   };
 
   /** Short waits on the fake clock; creation settles at once unless a test asks for production timing. */
@@ -1253,4 +1270,166 @@ TEST_F(WindowsNative, AHeadThatLandsAfterItsRollbackIsNeverAdoptedByTheNextPrepa
   EXPECT_EQ(again.verdict, native_verdict_e::refused) << again.reason;
   EXPECT_TRUE(mentions(again.reason, "already exists")) << again.reason;
   EXPECT_EQ(edge.creates.size(), 1u);
+}
+
+// --- ZakoVDD v0.18 slots (driver source CommandHandlers.cpp / MonitorLifecycle.cpp; gh-all runs 20261108-165856/-170253) ---
+
+namespace {
+  /**
+   * ZakoVDD v0.18.2 as its source behaves: CREATEMONITOR puts the request's GUIDs on slots 0..count-1 (a slot without one
+   * gets a random ContainerId), a create for an occupied slot is a silent success, and DESTROYMONITOR frees a slot only
+   * when its departure succeeds.
+   */
+  struct zako_v018_t {
+    fake_edge_t &edge;
+    std::uint32_t count { 1 };
+    bool departure_fails {};
+    std::map<std::uint32_t, dt::head_guid_t> slots;
+    std::uint8_t random {};
+
+    void
+    install() {
+      edge.on_create = [this](const dt::head_guid_t &intent) {
+        for (std::uint32_t slot = 0; slot < count; ++slot) {
+          if (slots.contains(slot)) continue;
+          const auto guid = slot == 0 ? intent : id<dt::head_guid_t>(static_cast<std::uint8_t>(0xA0 + ++random));
+          slots.emplace(slot, guid);
+          edge.displays.push_back(zako_head("vdd-slot" + std::to_string(slot) + "-" + std::to_string(edge.creates.size()), guid.value, 700 + edge.creates.size() * 10 + slot));
+        }
+        return dt::edge_send_t { edge_delivery_e::delivered, {} };
+      };
+      edge.on_destroy = [this] {
+        if (!departure_fails) {
+          slots.clear();
+          edge.drop_heads();
+        }
+        return dt::edge_send_t { edge_delivery_e::delivered, {} };
+      };
+    }
+  };
+
+  dt::windows_native_options_t
+  with_capacity(std::optional<std::uint32_t> capacity) {
+    auto options = production_options();
+    options.head_capacity = [capacity] { return capacity; };
+    return options;
+  }
+}  // namespace
+
+TEST(VddDisplayCount, IsReadAsTheDriverReadsIt) {
+  const std::string installed =
+    "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n<vdd_settings>\r\n  <monitors>\r\n    <count>1</count>\r\n  </monitors>\r\n"
+    "  <gpu>\r\n    <friendlyname>default</friendlyname>\r\n  </gpu>\r\n</vdd_settings>\r\n";
+  EXPECT_EQ(dt::parse_vdd_display_count(installed), 1u);
+  EXPECT_EQ(dt::parse_vdd_display_count("<monitors><count>2</count></monitors>"), 2u);
+  EXPECT_EQ(dt::parse_vdd_display_count("<count> 3 </count>"), 3u);
+  EXPECT_EQ(dt::parse_vdd_display_count("<count>2x</count>"), 2u) << "stoi stops at the first non-digit";
+  EXPECT_EQ(dt::parse_vdd_display_count("<count>16</count>"), 16u);
+  for (const auto *text : { "<count>abc</count>", "<count>0</count>", "<count>17</count>", "<count>-2</count>", "<count></count>", "<count>99999999999999999999</count>" }) {
+    EXPECT_EQ(dt::parse_vdd_display_count(text), 1u) << text;
+  }
+  EXPECT_EQ(dt::parse_vdd_display_count("<count>1</count><count>4</count>"), 4u) << "the last element wins";
+  EXPECT_EQ(dt::parse_vdd_display_count("<vdd_settings><gpu/></vdd_settings>"), std::nullopt);
+  EXPECT_EQ(dt::parse_vdd_display_count(""), std::nullopt);
+}
+
+TEST_F(WindowsNative, AV018DriverWithOneSlotDropsTheSecondCreateSilently) {
+  // Run 20261108-165856 with the count unknown: head 1 listed at once, head 2 never, a 30 s wait, then a rollback.
+  zako_v018_t zako { edge };
+  zako.install();
+  dt::windows_native_platform_t slow { edge, with_capacity(std::nullopt) };
+  memory_store_t store;
+  dt::native_executor_t executor { store, slow, { next_uuid, 2, driver() } };
+  const auto start = edge.clock;
+  const auto prepared = prepare_with(executor, 2);
+  EXPECT_EQ(prepared.verdict, native_verdict_e::refused) << prepared.reason;
+  EXPECT_TRUE(mentions(prepared.reason, "no virtual display appeared")) << prepared.reason;
+  EXPECT_EQ(edge.creates.size(), 2u);
+  EXPECT_GE(edge.clock - start, 30000ms);
+  EXPECT_EQ(edge.destroys, 1);
+  EXPECT_TRUE(zako.slots.empty());
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(WindowsNative, AGroupLargerThanTheDriversCountIsRefusedBeforeAnyCreate) {
+  zako_v018_t zako { edge };
+  zako.install();
+  dt::windows_native_platform_t counted { edge, with_capacity(1) };
+  memory_store_t store;
+  dt::native_executor_t executor { store, counted, { next_uuid, 2, driver() } };
+  const auto start = edge.clock;
+  const auto prepared = prepare_with(executor, 2);
+  EXPECT_EQ(prepared.verdict, native_verdict_e::refused);
+  EXPECT_EQ(prepared.reason, "ZakoVDD is configured for 1 display(s); two-display groups need the ZakoVDD multi-monitor change");
+  EXPECT_TRUE(edge.creates.empty());
+  EXPECT_EQ(edge.destroys, 0);
+  EXPECT_EQ(edge.clock, start);
+  EXPECT_FALSE(store.bytes);
+  EXPECT_FALSE(executor.health().in_conflict);
+}
+
+TEST_F(WindowsNative, ASingleHeadWithinTheDriversCountIsCreatedAsBefore) {
+  zako_v018_t zako { edge };
+  zako.install();
+  dt::windows_native_platform_t counted { edge, with_capacity(1) };
+  memory_store_t store;
+  dt::native_executor_t executor { store, counted, { next_uuid, 2, driver() } };
+  const auto prepared = prepare_with(executor);
+  ASSERT_EQ(prepared.verdict, native_verdict_e::ok) << prepared.reason;
+  EXPECT_EQ(restore_with(executor).verdict, native_verdict_e::ok);
+  EXPECT_TRUE(zako.slots.empty());
+}
+
+TEST_F(WindowsNative, AGroupWithinTheDriversCountIsNotRefusedForIt) {
+  // count 2 with v0.18: the first create already fills both slots, one with a random ContainerId, so the executor
+  // still refuses the group - but on what it saw, not on the count.
+  zako_v018_t zako { edge, 2 };
+  zako.install();
+  dt::windows_native_platform_t counted { edge, with_capacity(2) };
+  memory_store_t store;
+  dt::native_executor_t executor { store, counted, { next_uuid, 2, driver() } };
+  const auto prepared = prepare_with(executor, 2);
+  EXPECT_FALSE(mentions(prepared.reason, "is configured for")) << prepared.reason;
+  EXPECT_EQ(edge.creates.size(), 1u);
+}
+
+TEST_F(WindowsNative, AFailedDepartureKeepsTheSlotAndIsNeverReportedAsRemoved) {
+  zako_v018_t zako { edge };
+  zako.install();
+  dt::windows_native_platform_t counted { edge, with_capacity(1) };
+  memory_store_t store;
+  dt::native_executor_t executor { store, counted, { next_uuid, 2, driver() } };
+  ASSERT_EQ(prepare_with(executor).verdict, native_verdict_e::ok);
+  zako.departure_fails = true;
+  const auto restored = restore_with(executor);
+  EXPECT_EQ(restored.verdict, native_verdict_e::conflict) << restored.reason;
+  EXPECT_EQ(zako.slots.size(), 1u);
+  EXPECT_TRUE(store.bytes);
+  const auto again = prepare_with(executor);
+  EXPECT_NE(again.verdict, native_verdict_e::ok) << again.reason;
+  EXPECT_EQ(edge.creates.size(), 1u) << "no create is sent into an occupied slot";
+}
+
+TEST_F(WindowsNative, ANotListedNoteSaysWhetherTheDriverCreatedTheMonitorOrWindowsHidIt) {
+  const auto run = [&](std::function<void(fake_edge_t &, const dt::head_guid_t &)> created) {
+    fake_edge_t local;
+    local.on_create = [&](const dt::head_guid_t &intent) {
+      created(local, intent);
+      return dt::edge_send_t { edge_delivery_e::delivered, {} };
+    };
+    auto timed = production_options();
+    std::vector<std::string> notes;
+    timed.note = [&](const std::string &line) { notes.push_back(line); };
+    dt::windows_native_platform_t local_platform { local, timed };
+    with_capability(dt::command_kind_e::launch_prepare, [&](const auto &capability) { (void) local_platform.create_head(capability, id<dt::head_guid_t>(0x61)); });
+    EXPECT_EQ(local.described.size(), 1u);
+    return notes.size() == 1 ? notes[0] : std::string {};
+  };
+  const auto hidden = run([](fake_edge_t &e, const dt::head_guid_t &intent) { e.hidden_monitors.push_back(intent); });
+  EXPECT_TRUE(mentions(hidden, "the driver created its monitor, but Windows shows no display path for it")) << hidden;
+  EXPECT_TRUE(mentions(hidden, "[fake monitors=1]")) << hidden;
+  const auto dropped = run([](fake_edge_t &, const dt::head_guid_t &) {});
+  EXPECT_TRUE(mentions(dropped, "the driver did not create a monitor for it")) << dropped;
+  const auto unknown = run([](fake_edge_t &e, const dt::head_guid_t &) { e.describes = false; });
+  EXPECT_TRUE(mentions(unknown, "could not be determined")) << unknown;
 }

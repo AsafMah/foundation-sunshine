@@ -43,6 +43,13 @@ namespace display_device::topology::win32_edge {
   head_class_e
   classify_parent_hardware_ids(const std::optional<std::wstring> &multi_sz);
 
+  /**
+   * The display count ZakoVDD reads: `parse_vdd_display_count` of `<VDDPATH>\vdd_settings.xml`, where VDDPATH is the
+   * driver's own registry value (HKLM\SOFTWARE\ZakoTech\ZakoDisplayAdapter). nullopt when either cannot be read.
+   */
+  std::optional<std::uint32_t>
+  read_zako_display_count();
+
   class win32_native_edge_t final: public native_edge_t {
   public:
     edge_snapshot_t
@@ -76,6 +83,10 @@ namespace display_device::topology::win32_edge {
 
     std::chrono::steady_clock::time_point
     now() override;
+
+    /** SetupAPI over every monitor devnode (present or not) and the raw CCD paths; reads only. */
+    missing_head_report_t
+    describe_missing_head(const head_guid_t &intent) override;
 
     void
     sleep(std::chrono::milliseconds duration) override;
