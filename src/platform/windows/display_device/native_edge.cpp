@@ -270,21 +270,56 @@ namespace display_device::topology::win32_edge {
       if (matches == 0) detail += "no monitor device carries its ContainerId; ";
       report.monitor_present = present;
     }
-    // The driver's raw CCD paths, available or not, which the snapshot filters out when they are not valid.
+    // The ZakoVDD adapter's devnodes (hardware ID ROOT\ZakoVDD), as CCD adapter device paths name them ("ROOT#DISPLAY#0001").
+    std::vector<std::string> zako_adapters;
+    if (const HDEVINFO roots = SetupDiGetClassDevsW(nullptr, L"ROOT", nullptr, DIGCF_ALLCLASSES | DIGCF_PRESENT); roots != INVALID_HANDLE_VALUE) {
+      SP_DEVINFO_DATA device {};
+      device.cbSize = sizeof(device);
+      for (DWORD index = 0; SetupDiEnumDeviceInfo(roots, index, &device); ++index) {
+        if (classify_parent_hardware_ids(text_property(roots, device, hardware_ids_key, DEVPROP_TYPE_STRING_LIST, true)) != head_class_e::driver_head) continue;
+        wchar_t instance[512] {};
+        if (!SetupDiGetDeviceInstanceIdW(roots, &device, instance, static_cast<DWORD>(std::size(instance)), nullptr)) continue;
+        auto name = narrow(instance);
+        std::ranges::replace(name, '\\', '#');
+        zako_adapters.push_back(std::move(name));
+      }
+      SetupDiDestroyDeviceInfoList(roots);
+    }
+    detail += "ZakoVDD adapters=" + std::to_string(zako_adapters.size()) + "; ";
+    std::map<std::pair<LONG, DWORD>, bool> on_zako_adapter;
+    const auto zako_adapter = [&](const LUID &luid) {
+      const auto key = std::make_pair(luid.HighPart, luid.LowPart);
+      if (const auto known = on_zako_adapter.find(key); known != on_zako_adapter.end()) return known->second;
+      DISPLAYCONFIG_ADAPTER_NAME name {};
+      name.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME;
+      name.header.size = sizeof(name);
+      name.header.adapterId = luid;
+      bool zako = false;
+      if (DisplayConfigGetDeviceInfo(&name.header) == ERROR_SUCCESS) {
+        const auto path = narrow(name.adapterDevicePath);
+        zako = std::ranges::any_of(zako_adapters, [&](const std::string &instance) { return contains_ignoring_case(path, instance); });
+      }
+      return on_zako_adapter[key] = zako;
+    };
+    // The raw CCD paths on the driver's adapter or naming its monitors, available or not, which the snapshot drops
+    // when they are not valid (a hidden target may have no monitor path or name at all).
     if (const auto data = w_utils::query_display_config(w_utils::ALL_DEVICES)) {
       std::size_t named = 0;
       for (const auto &path : data->paths) {
         const auto friendly = w_utils::get_friendly_name(path);
         const auto monitor = w_utils::get_monitor_device_path(path);
-        if (!contains_ignoring_case(monitor, "zak") && !contains_ignoring_case(friendly, "zako")) continue;
-        if (++named > 8) continue;
+        if (!zako_adapter(path.targetInfo.adapterId) && !contains_ignoring_case(monitor, "zak") && !contains_ignoring_case(friendly, "zako")) continue;
+        if (++named > 12) continue;
         const auto &adapter = path.targetInfo.adapterId;
         detail += "path target=" + std::to_string(path.targetInfo.id) + " adapter=" + hex32(static_cast<std::uint32_t>(adapter.HighPart)) + ":" +
-                  hex32(adapter.LowPart) + " available=" + std::to_string(path.targetInfo.targetAvailable ? 1 : 0) +
+                  hex32(adapter.LowPart) + " source=" + std::to_string(path.sourceInfo.id) + " status=" + hex32(path.targetInfo.statusFlags) +
+                  " tech=" + std::to_string(static_cast<long>(path.targetInfo.outputTechnology)) +
+                  " available=" + std::to_string(path.targetInfo.targetAvailable ? 1 : 0) +
                   " active=" + std::to_string(w_utils::is_active(path) ? 1 : 0) + " name='" + w_utils::get_display_name(path) + "' friendly='" +
                   friendly + "' monitor='" + monitor + "'; ";
       }
-      detail += std::to_string(named) + " of " + std::to_string(data->paths.size()) + " display paths name a ZakoVDD target";
+      detail += std::to_string(named) + " of " + std::to_string(data->paths.size()) + " display paths are on the ZakoVDD adapter or name its monitor" +
+                (named > 12 ? " (first 12 shown)" : "");
     }
     else {
       detail += "display paths unreadable";
