@@ -140,33 +140,24 @@ runs only before the first output, so a pass never supersedes its own outputs.
 A WARNING `Video packet queue age exceeded: dropped N superseded encoded
 frame(s)...` reports accumulated drops at most once per second.
 
-Inter-frame encoders arm a separate per-encoder queue-recovery state after
-superseding output (including a lost keyframe). It does not raise `mail::idr`:
-client IDR requests may immediately re-encode the old image, which would add
-work during the very stall being recovered from. Both async and synchronous
-encoders consume queue recovery only on the next captured, non-replay frame.
-Resetting the current submission to a normal frame cannot clear the request.
-Intra-only PyroWave does not need recovery.
-
-Only one request is outstanding until broadcast dequeues output submitted at
-or after the recovery submission. Dropping that recovery output does not
-re-arm it while broadcast is stalled; delayed pre-request AMF output cannot
-acknowledge it. Packets share the recovery state without owning an encoder or
-stream-session pointer. Bitrate rebuilds preserve it; full encoder reinitialization
-gets a fresh state, so old packets cannot acknowledge a new encoder's recovery.
-Pruning while enqueuing an already-IDR output marks that output as outstanding
-without requesting an additional IDR.
-
-This bounded policy uses IDR rather than RFI. The existing client RFI interface
-takes a fixed range of submitted frame numbers; it does not track the last
-broadcast-sent reference or extend an in-flight recovery as later queue pruning
-expands the missing range. Passing only the first superseded range would
-under-invalidate references. Adding that reference tracking is outside this fix.
+Age pruning does not request host-originated IDR or reference invalidation.
+Dropping inter-frame output can break the reference chain; recovery deliberately
+remains client-driven through the existing RFI/IDR path, including its round-trip
+cost. Queue pressure must not generate extra keyframes: a large IDR's paced send
+can itself age queued frames and create a self-sustaining host-recovery storm.
+Client `mail::idr` handling and encoder-rebuild IDR behavior are unchanged.
 Drops occur before RTP sequence assignment, so they create frame-number gaps
 without transport sequence gaps. Host ABR still acts on the client's
 `packetLoss` value, not `droppedFrames`. Excluding positively identified unsent
 frame gaps from that loss proxy is a separate client change, with no wire or
 host-controller arithmetic change here.
+
+`pyrowave_unit_tests` exercises production enqueue and the broadcast dequeue
+helper with a virtual sender: 20/50 ms stalls, size-proportional 800 Mbps sends
+with 20% FEC, and one externally supplied IDR 3--5 times the P-frame size.
+The 120/180/240 fps fixtures assert exact stale-only pruning, FIFO delivery,
+and no further pruning after a bounded settling period. This is a deterministic
+queue/send-time model, not a live encoder, FEC benchmark, or decoder-recovery test.
 
 Selection, token validation, lifecycle projection, controller mutation and
 budget updates execute inside the streaming session-list lock. Bound requests

@@ -14,6 +14,11 @@
 #include <limits>
 
 namespace video {
+  inline auto
+  pop_packet(safe::mail_raw_t::queue_t<packet_t> &packets) {
+    return packets->pop();
+  }
+
   inline std::chrono::nanoseconds
   packet_queue_age(double framerate) {
     return std::max(std::chrono::nanoseconds(std::chrono::milliseconds(3)),
@@ -23,29 +28,20 @@ namespace video {
 
   /**
    * @brief Prune only this channel's stale output under the queue lock.
-   * Recovery is independent of client mail::idr, which may immediately replay
-   * the old image. Queue recovery waits for capture and broadcast progress.
+   * Reference recovery remains client-driven; enqueue has no encoder effects.
    */
   inline std::size_t
   raise_packet(safe::mail_raw_t::queue_t<packet_t> &packets, packet_t &&packet,
     std::chrono::nanoseconds max_age = std::chrono::milliseconds(25),
-    const std::shared_ptr<packet_queue_recovery_t> &recovery = {},
     std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now(),
     bool prune = true) {
     static std::atomic<std::uint64_t> pending_drops { 0 };
     static std::atomic<std::int64_t> last_report_ms { std::numeric_limits<std::int64_t>::min() };
 
     const auto channel = packet->channel_data;
-    const bool already_recovering = packet->is_idr();
-    const auto frame_index = packet->frame_index();
     packet->queued_at = now;
-    packet->queue_recovery = recovery;
     const auto dropped = packets->raise_pruning([&](const packet_t &queued) {
-      const bool expired = prune && queued->channel_data == channel && now - queued->queued_at > max_age;
-      // Arm before enqueue unlocks, otherwise broadcast could dequeue the
-      // already-IDR replacement before its outstanding request is recorded.
-      if (expired && recovery) recovery->request(already_recovering, frame_index);
-      return expired;
+      return prune && queued->channel_data == channel && now - queued->queued_at > max_age;
     }, std::move(packet));
     if (dropped == 0) {
       return 0;
@@ -64,23 +60,22 @@ namespace video {
     }
     BOOST_LOG(warning) << "Video packet queue age exceeded: dropped " << pending_drops.exchange(0)
                        << " superseded encoded frame(s) since last report; broadcast is behind the encoder"
-                       << "; inter-frame streams request local IDR recovery";
+                       << "; reference recovery remains client-driven";
     return dropped;
   }
 
   /**
    * @brief Outputs drained from the encoder in one pass (e.g. an AMF
    * pre-analysis/multi-HW batch). Prune once before the first output, so a pass
-   * never supersedes its own outputs or repeatedly requests recovery.
+   * never supersedes its own outputs.
    */
   class packet_batch_t {
   public:
     void
     raise(safe::mail_raw_t::queue_t<packet_t> &packets, packet_t &&packet,
       std::chrono::nanoseconds max_age = std::chrono::milliseconds(25),
-      const std::shared_ptr<packet_queue_recovery_t> &recovery = {},
       std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) {
-      raise_packet(packets, std::move(packet), max_age, recovery, now, !emitted_);
+      raise_packet(packets, std::move(packet), max_age, now, !emitted_);
       emitted_ = true;
     }
 

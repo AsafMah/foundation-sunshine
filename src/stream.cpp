@@ -71,6 +71,7 @@ extern "C" {
 #include "tray/system_tray.h"
 #include "tray/tray_state.h"
 #include "utility.h"
+#include "video_packet_queue.h"
 #include "uuid.h"
 #include "webhook/webhook.h"
 
@@ -3631,12 +3632,11 @@ namespace stream {
 
     auto ratecontrol_next_frame_start = std::chrono::steady_clock::now();
 
-    while (auto packet = packets->pop()) {
+    while (auto packet = video::pop_packet(packets)) {
       if (shutdown_event->peek()) {
         break;
       }
 
-      if (packet->queue_recovery) packet->queue_recovery->on_dequeue(packet->frame_index());
       frame_network_latency_logger.first_point_now();
 
       auto session = (session_t *) packet->channel_data;

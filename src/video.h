@@ -503,51 +503,11 @@ namespace video {
     uint32_t flags;
   };
 
-  // Encoder and queued packets share progress without extending session/device
-  // lifetime. Only broadcast dequeue acknowledges an outstanding submission.
-  class packet_queue_recovery_t {
-  public:
-    void request(bool already_idr, int64_t frame_index) {
-      std::lock_guard lock(mutex_);
-      if (outstanding_) return;
-      outstanding_ = true;
-      pending_ = !already_idr;
-      submitted_ = already_idr ? std::optional<int64_t>(frame_index) : std::nullopt;
-    }
-
-    bool on_capture(int64_t frame_index) {
-      std::lock_guard lock(mutex_);
-      if (!pending_) return false;
-      pending_ = false;
-      submitted_ = frame_index;
-      return true;
-    }
-
-    void on_dequeue(int64_t frame_index) {
-      std::lock_guard lock(mutex_);
-      if (submitted_ && frame_index >= *submitted_) {
-        outstanding_ = false;
-        submitted_.reset();
-      }
-    }
-
-  private:
-    std::mutex mutex_;
-    bool outstanding_ = false;
-    bool pending_ = false;
-    std::optional<int64_t> submitted_;
-  };
-
   struct encode_session_t {
     virtual ~encode_session_t() = default;
 
     std::uint32_t perf_session_id = 0;
     std::chrono::nanoseconds packet_queue_max_age { std::chrono::milliseconds(25) };
-    std::shared_ptr<packet_queue_recovery_t> packet_queue_recovery = std::make_shared<packet_queue_recovery_t>();
-
-    void prepare_queue_recovery(bool captured, int64_t frame_index) {
-      if (captured && packet_queue_recovery->on_capture(frame_index)) request_idr_frame();
-    }
 
     virtual int
     convert(platf::img_t &img) = 0;
@@ -624,7 +584,6 @@ namespace video {
     std::vector<replace_t> *replacements = nullptr;
     void *channel_data = nullptr;
     std::chrono::steady_clock::time_point queued_at;
-    std::shared_ptr<packet_queue_recovery_t> queue_recovery;
     bool after_ref_frame_invalidation = false;
     unsigned fec_percentage = 0;  // Protection budget when this frame was submitted.
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
