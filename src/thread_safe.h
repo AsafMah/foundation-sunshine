@@ -296,6 +296,20 @@ namespace safe {
       return dropped;
     }
 
+    // Video owns an age-based policy instead of the legacy element-count cap.
+    template <class Predicate, class... Args>
+    std::size_t
+    raise_pruning(Predicate &&expired, Args &&...args) {
+      std::lock_guard ul { _lock };
+      if (!_continue) return 0;
+      const auto before = _queue.size();
+      std::erase_if(_queue, std::forward<Predicate>(expired));
+      const auto dropped = before - _queue.size();
+      _queue.emplace_back(std::forward<Args>(args)...);
+      _cv.notify_all();
+      return dropped;
+    }
+
     template <class... Args>
     void
     raise(Args &&...args) {

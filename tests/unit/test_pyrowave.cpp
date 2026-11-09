@@ -19,6 +19,7 @@
 #include "src/platform/windows/pyrowave/rate_control.h"
 #include "src/platform/windows/pyrowave/transport.h"
 #include "src/video_packet_queue.h"
+#include "src/globals.h"
 #endif
 
 extern "C" {
@@ -1020,7 +1021,23 @@ TEST(PyrowaveTransportTest, PublishesReplayWithoutMetadataFlags) {
   EXPECT_EQ(header.flags & LI_PYROWAVE_FLAG_METADATA_PRESENT, 0u);
 }
 
-TEST(PyrowaveTransportTest, QueueOverflowKeepsOnlyNewestFramesAndWarns) {
+TEST(PyrowaveTransportTest, ImmediateEncoderBurstDoesNotSupersedeFreshFrames) {
+  auto mail = std::make_shared<safe::mail_raw_t>();
+  auto packets = mail->queue<video::packet_t>("pyrowave-test-burst");
+  const auto now = std::chrono::steady_clock::time_point(std::chrono::seconds(10));
+  for (std::int64_t index = 1; index <= 3; ++index) {
+    video::raise_packet(packets, std::make_unique<video::packet_raw_generic>(
+      std::vector<std::uint8_t>(69'444, 0x11), index, false),
+      video::packet_queue_age(180), {}, now);
+  }
+  std::vector<std::int64_t> queued;
+  while (packets->peek()) {
+    queued.push_back(packets->pop(std::chrono::milliseconds(0))->frame_index());
+  }
+  EXPECT_EQ(queued, (std::vector<std::int64_t> { 1, 2, 3 }));
+}
+
+TEST(PyrowaveTransportTest, QueueAgePrunesStaleFramesAndWarns) {
   using sink_t = boost::log::sinks::synchronous_sink<boost::log::sinks::text_ostream_backend>;
   auto buffer = boost::make_shared<std::stringstream>();
   auto sink = boost::make_shared<sink_t>();
@@ -1029,11 +1046,13 @@ TEST(PyrowaveTransportTest, QueueOverflowKeepsOnlyNewestFramesAndWarns) {
 
   auto mail = std::make_shared<safe::mail_raw_t>();
   auto packets = mail->queue<video::packet_t>("pyrowave-test-video");
-  auto source = std::make_shared<const std::vector<std::uint8_t>>(2000, 0x6e);
-  // The broadcast consumer is stalled for longer than the old 32-frame queue.
+  const auto start = std::chrono::steady_clock::time_point(std::chrono::seconds(10));
+  const auto interval = std::chrono::nanoseconds(5'555'556);
+  const auto max_age = video::packet_queue_age(180);
   for (std::int64_t frame = 1; frame <= 40; ++frame) {
-    ASSERT_TRUE(platf::pyrowave_windows::publish_transport_frame(
-      frame, source, 1312, 0, packets, nullptr, std::nullopt, std::nullopt).success);
+    video::raise_packet(packets, std::make_unique<video::packet_raw_generic>(
+      std::vector<std::uint8_t>(69'444, 0x6e), frame, false),
+      max_age, {}, start + frame * interval);
   }
 
   boost::log::core::get()->remove_sink(sink);
@@ -1044,12 +1063,11 @@ TEST(PyrowaveTransportTest, QueueOverflowKeepsOnlyNewestFramesAndWarns) {
     ASSERT_TRUE(packet);
     queued.push_back(packet->frame_index());
   }
-  // No standing backlog: the hand-off never holds more than the video cap.
-  ASSERT_FALSE(queued.empty());
-  EXPECT_LE(queued.size(), video::max_queued_packets);
-  EXPECT_EQ(queued.back(), 40);
+  EXPECT_EQ(queued, (std::vector<std::int64_t> { 39, 40 }));
   const auto text = buffer->str();
-  EXPECT_NE(text.find("Video packet queue full: dropped "), std::string::npos) << text;
+  EXPECT_NE(text.find("Video packet queue age exceeded: dropped "), std::string::npos) << text;
+  EXPECT_EQ(text.find("Video packet queue age exceeded: dropped "),
+    text.rfind("Video packet queue age exceeded: dropped ")) << text;
 }
 
 TEST(PyrowaveTransportTest, PacketBatchSupersedesOnlyFramesQueuedBeforeIt) {
@@ -1058,20 +1076,199 @@ TEST(PyrowaveTransportTest, PacketBatchSupersedesOnlyFramesQueuedBeforeIt) {
   auto frame = [](std::int64_t index) {
     return std::make_unique<video::packet_raw_generic>(std::vector<std::uint8_t>(16, 0x11), index, false);
   };
-  // The broadcast thread is behind with a full backlog before the batch.
-  for (std::int64_t index = 1; index <= static_cast<std::int64_t>(video::max_queued_packets); ++index) {
-    video::raise_packet(packets, frame(index));
+  const auto start = std::chrono::steady_clock::time_point(std::chrono::seconds(10));
+  const auto age = video::packet_queue_age(180);
+  auto idr = mail->event<bool>(mail::idr);
+  for (std::int64_t index = 1; index <= 2; ++index) {
+    video::raise_packet(packets, frame(index), age, idr, start);
   }
   // One AMF collection pass emits a pre-analysis/multi-HW batch of outputs.
   video::packet_batch_t batch;
   for (std::int64_t index = 10; index < 16; ++index) {
-    batch.raise(packets, frame(index));
+    // Even a long collection pass cannot prune its own outputs.
+    batch.raise(packets, frame(index), age, idr, start + std::chrono::milliseconds(20 * index));
+    if (index == 10) {
+      ASSERT_TRUE(idr->peek());
+      idr->pop();
+    }
+    else {
+      EXPECT_FALSE(idr->peek());
+    }
   }
   std::vector<std::int64_t> queued;
   while (packets->peek()) {
     queued.push_back(packets->pop(std::chrono::milliseconds(0))->frame_index());
   }
   EXPECT_EQ(queued, (std::vector<std::int64_t> { 10, 11, 12, 13, 14, 15 }));
+}
+
+class VideoPacketQueueTest: public ::testing::Test {
+protected:
+  using clock = std::chrono::steady_clock;
+  const clock::time_point start { std::chrono::seconds(10) };
+  const std::chrono::nanoseconds interval { 5'555'556 };
+  const std::chrono::nanoseconds age = video::packet_queue_age(180);
+  safe::mail_t mail = std::make_shared<safe::mail_raw_t>();
+  safe::mail_raw_t::queue_t<video::packet_t> packets = mail->queue<video::packet_t>("age-test");
+  safe::mail_raw_t::event_t<bool> idr = mail->event<bool>(mail::idr);
+
+  std::size_t push(std::int64_t index, clock::time_point now, void *channel = nullptr,
+    bool inter_frame_codec = true) {
+    auto packet = std::make_unique<video::packet_raw_generic>(
+      std::vector<std::uint8_t>(69'444, 0x11), index, false);
+    packet->channel_data = channel;
+    return video::raise_packet(packets, std::move(packet), age,
+      inter_frame_codec ? idr : safe::mail_raw_t::event_t<bool> {}, now);
+  }
+};
+
+TEST_F(VideoPacketQueueTest, UsesFractionalRateAndThreeMillisecondFloor) {
+  EXPECT_EQ(age, std::chrono::nanoseconds(8'333'333));
+  EXPECT_EQ(video::packet_queue_age(60'000.0 / 1001), std::chrono::nanoseconds(25'025'000));
+  EXPECT_EQ(video::packet_queue_age(1000), std::chrono::milliseconds(3));
+}
+
+TEST_F(VideoPacketQueueTest, KeepsExactBoundaryAndExpiresOnlyBeyondIt) {
+  EXPECT_EQ(push(1, start), 0u);
+  EXPECT_EQ(push(2, start + age), 0u);
+  EXPECT_EQ(push(3, start + age + std::chrono::nanoseconds(1)), 1u);
+  EXPECT_EQ(packets->pop(std::chrono::milliseconds(0))->frame_index(), 2);
+  EXPECT_EQ(packets->pop(std::chrono::milliseconds(0))->frame_index(), 3);
+}
+
+TEST_F(VideoPacketQueueTest, FreshBurstBypassesLegacyThirtyTwoElementClear) {
+  for (int i = 1; i <= 40; ++i) EXPECT_EQ(push(i, start), 0u);
+  for (int i = 1; i <= 40; ++i) {
+    ASSERT_TRUE(packets->peek());
+    EXPECT_EQ(packets->pop(std::chrono::milliseconds(0))->frame_index(), i);
+  }
+  EXPECT_FALSE(idr->peek());
+}
+
+TEST_F(VideoPacketQueueTest, PrunesOnlyTheProducingChannel) {
+  int first = 0, second = 0;
+  push(1, start, &first);
+  push(2, start, &second);
+  EXPECT_EQ(push(3, start + std::chrono::milliseconds(30), &first), 1u);
+  EXPECT_EQ(packets->pop(std::chrono::milliseconds(0))->channel_data, &second);
+  EXPECT_EQ(packets->pop(std::chrono::milliseconds(0))->frame_index(), 3);
+}
+
+TEST_F(VideoPacketQueueTest, RecoveryEventSurvivesCurrentSubmissionNormalReset) {
+  struct fake_encoder_t {
+    bool force_idr = false;
+    std::vector<bool> submissions;
+    void request_idr_frame() { force_idr = true; }
+    void request_normal_frame() { force_idr = false; }
+    void encode() { submissions.push_back(force_idr); }
+  } encoder;
+  push(1, start);
+  encoder.encode();
+  EXPECT_EQ(push(2, start + std::chrono::milliseconds(20)), 1u);
+  // The real encode loops reset the current frame flag after enqueue, then
+  // consume mail::idr before the next submission. The event must survive.
+  encoder.request_normal_frame();
+  ASSERT_TRUE(idr->peek());
+  ASSERT_TRUE(idr->pop());
+  encoder.request_idr_frame();
+  encoder.encode();
+  EXPECT_EQ(encoder.submissions, (std::vector<bool> { false, true }));
+  EXPECT_FALSE(idr->peek());
+}
+
+TEST_F(VideoPacketQueueTest, IntraOnlyTransportNeedsNoRecoveryEvent) {
+  push(1, start, nullptr, false);
+  EXPECT_EQ(push(2, start + std::chrono::milliseconds(20), nullptr, false), 1u);
+  EXPECT_FALSE(idr->peek());
+}
+
+TEST_F(VideoPacketQueueTest, NewIdrAlreadyRepairsTheSupersededReference) {
+  push(1, start);
+  auto packet = std::make_unique<video::packet_raw_generic>(
+    std::vector<std::uint8_t>(69'444, 0x11), 2, true);
+  EXPECT_EQ(video::raise_packet(packets, std::move(packet), age, idr,
+    start + std::chrono::milliseconds(20)), 1u);
+  EXPECT_FALSE(idr->peek());
+}
+
+TEST_F(VideoPacketQueueTest, LegacyCountPolicyIsUnchangedForOtherProducers) {
+  safe::queue_t<int> legacy(2);
+  legacy.raise(1);
+  legacy.raise(2);
+  legacy.raise(3);
+  EXPECT_EQ(*legacy.pop(std::chrono::milliseconds(0)), 3);
+  EXPECT_FALSE(legacy.peek());
+}
+
+TEST_F(VideoPacketQueueTest, TwentyAndFiftyMillisecondStallsKeepOnlyFreshTail) {
+  for (const int stall_ms : { 20, 50 }) {
+    int produced = 0;
+    std::size_t dropped = 0;
+    for (auto elapsed = interval; elapsed <= std::chrono::milliseconds(stall_ms); elapsed += interval) {
+      dropped += push(++produced, start + elapsed);
+    }
+    const auto now = start + std::chrono::milliseconds(stall_ms);
+    int sent = 0;
+    while (packets->peek()) {
+      auto packet = packets->pop(std::chrono::milliseconds(0));
+      EXPECT_LE(now - packet->queued_at, age + interval);
+      ++sent;
+    }
+    EXPECT_EQ(sent, 2);
+    EXPECT_EQ(dropped, produced - 2);
+    EXPECT_TRUE(idr->peek());
+    idr->pop();
+  }
+}
+
+TEST_F(VideoPacketQueueTest, CpuStarvedBroadcastWithIrregularFiveToThirtyMillisecondGaps) {
+  const int gaps_ms[] = { 5, 30, 7, 11, 5, 23, 9, 17, 6, 30 };
+  auto next_broadcast = start + std::chrono::milliseconds(gaps_ms[0]);
+  std::size_t dropped = 0;
+  int produced = 0, sent = 0, broadcasts = 0, recoveries = 0;
+  std::vector<clock::time_point> expected_tail;
+  while (produced < 180) {
+    const auto next_frame = start + produced * interval;
+    if (produced < 180 && next_frame <= next_broadcast) {
+      const auto expired = std::erase_if(expected_tail, [&](const auto &queued_at) {
+        return next_frame - queued_at > age;
+      });
+      const auto actual_drops = push(++produced, next_frame);
+      EXPECT_EQ(actual_drops, expired) << "frame=" << produced;
+      dropped += actual_drops;
+      expected_tail.push_back(next_frame);
+      if (idr->peek()) {
+        ++recoveries;
+        idr->pop();
+      }
+      continue;
+    }
+    std::size_t bytes_sent = 0;
+    std::size_t burst_sent = 0;
+    while (packets->peek()) {
+      auto packet = packets->pop(std::chrono::milliseconds(0));
+      // Pruning occurs on enqueue. An independently scheduled consumer can
+      // resume up to one producer interval after the last age check.
+      EXPECT_LE(next_broadcast - packet->queued_at, age + interval);
+      bytes_sent += packet->data_size();
+      ++sent;
+      ++burst_sent;
+    }
+    EXPECT_EQ(burst_sent, expected_tail.size());
+    expected_tail.clear();
+    // 100Mbps/180fps payload plus20%FEC at the sender's800Mbps budget.
+    const auto send_budget = std::chrono::duration<double>(bytes_sent * 1.2 * 8 / 800'000'000);
+    EXPECT_LT(send_budget, interval);
+    next_broadcast += std::chrono::duration_cast<clock::duration>(send_budget) +
+      std::chrono::milliseconds(gaps_ms[++broadcasts % 10]);
+  }
+  EXPECT_EQ(sent + dropped + expected_tail.size(), 180u);
+  EXPECT_GT(sent, 0);
+  EXPECT_GT(dropped, 0u);
+  EXPECT_GT(recoveries, 0);
+  RecordProperty("superseded_frames", static_cast<int>(dropped));
+  RecordProperty("sent_frames", sent);
+  RecordProperty("retained_frames", static_cast<int>(expected_tail.size()));
 }
 
 TEST(PyrowaveTransportTest, DoesNotQueueFailedPacketization) {

@@ -14,27 +14,37 @@
 #include <limits>
 
 namespace video {
-  /// Maximum encoded frames waiting for the broadcast thread. Older frames are
-  /// superseded rather than allowed to build a standing latency backlog.
-  inline constexpr std::size_t max_queued_packets = 2;
+  inline std::chrono::nanoseconds
+  packet_queue_age(double framerate) {
+    return std::max(std::chrono::nanoseconds(std::chrono::milliseconds(3)),
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::duration<double>(1.5 / std::max(framerate, 1.0))));
+  }
 
   /**
-   * @brief Queue an encoded packet for broadcast. If max_queued_packets are
-   * already waiting, the broadcast thread is behind: every waiting packet is
-   * dropped and only the newest one is queued.
-   *
-   * Drops look like network loss to the client, so they are always reported,
-   * at most once per second with the count accumulated since the last report.
+   * @brief Prune only this channel's stale output under the queue lock.
+   * Recovery is an event for the next submission, not an encoder flag that
+   * request_normal_frame() would overwrite after the current encode call.
    */
-  inline void
-  raise_packet(safe::mail_raw_t::queue_t<packet_t> &packets, packet_t &&packet, std::size_t max_depth = max_queued_packets) {
+  inline std::size_t
+  raise_packet(safe::mail_raw_t::queue_t<packet_t> &packets, packet_t &&packet,
+    std::chrono::nanoseconds max_age = std::chrono::milliseconds(25),
+    const safe::mail_raw_t::event_t<bool> &idr = {},
+    std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now(),
+    bool prune = true) {
     static std::atomic<std::uint64_t> pending_drops { 0 };
     static std::atomic<std::int64_t> last_report_ms { std::numeric_limits<std::int64_t>::min() };
 
-    const auto dropped = packets->raise_superseding(max_depth, std::move(packet));
+    const auto channel = packet->channel_data;
+    const bool already_recovering = packet->is_idr();
+    packet->queued_at = now;
+    const auto dropped = packets->raise_pruning([&](const packet_t &queued) {
+      return prune && queued->channel_data == channel && now - queued->queued_at > max_age;
+    }, std::move(packet));
     if (dropped == 0) {
-      return;
+      return 0;
     }
+    if (idr && !already_recovering) idr->raise(true);
     pending_drops += dropped;
 
     const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -42,29 +52,34 @@ namespace video {
                           .count();
     auto last = last_report_ms.load();
     if (last != std::numeric_limits<std::int64_t>::min() && now_ms - last < 1000) {
-      return;
+      return dropped;
     }
     if (!last_report_ms.compare_exchange_strong(last, now_ms)) {
-      return;
+      return dropped;
     }
-    BOOST_LOG(warning) << "Video packet queue full: dropped " << pending_drops.exchange(0)
+    BOOST_LOG(warning) << "Video packet queue age exceeded: dropped " << pending_drops.exchange(0)
                        << " superseded encoded frame(s) since last report; broadcast is behind the encoder"
-                       << " and the client will see the gap as frame loss";
+                       << "; inter-frame streams request local IDR recovery";
+    return dropped;
   }
 
   /**
    * @brief Outputs drained from the encoder in one pass (e.g. an AMF
-   * pre-analysis/multi-HW batch). The cap applies only to frames queued before
-   * the batch, so a batch never supersedes its own outputs.
+   * pre-analysis/multi-HW batch). Prune once before the first output, so a pass
+   * never supersedes its own outputs or repeatedly requests recovery.
    */
   class packet_batch_t {
   public:
     void
-    raise(safe::mail_raw_t::queue_t<packet_t> &packets, packet_t &&packet) {
-      raise_packet(packets, std::move(packet), max_queued_packets + emitted_++);
+    raise(safe::mail_raw_t::queue_t<packet_t> &packets, packet_t &&packet,
+      std::chrono::nanoseconds max_age = std::chrono::milliseconds(25),
+      const safe::mail_raw_t::event_t<bool> &idr = {},
+      std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) {
+      raise_packet(packets, std::move(packet), max_age, idr, now, !emitted_);
+      emitted_ = true;
     }
 
   private:
-    std::size_t emitted_ = 0;
+    bool emitted_ = false;
   };
 }  // namespace video

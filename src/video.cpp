@@ -2531,7 +2531,7 @@ namespace video {
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
       perf::record_encoded_frame(session.perf_session_id);
-      raise_packet(packets, std::move(packet));
+      raise_packet(packets, std::move(packet), session.packet_queue_max_age, session.packet_queue_idr);
     }
 
     return 0;
@@ -2583,7 +2583,7 @@ namespace video {
       packet->pipeline_trace = std::move(encoded_trace);
     }
     perf::record_encoded_frame(session.perf_session_id);
-    raise_packet(packets, std::move(packet));
+    raise_packet(packets, std::move(packet), session.packet_queue_max_age, session.packet_queue_idr);
 
     return 0;
   }
@@ -2623,7 +2623,7 @@ namespace video {
       packet->pipeline_trace = std::move(encoded_trace);
     }
     perf::record_encoded_frame(session.perf_session_id);
-    batch.raise(packets, std::move(packet));
+    batch.raise(packets, std::move(packet), session.packet_queue_max_age, session.packet_queue_idr);
 
     return 0;
   }
@@ -3478,6 +3478,7 @@ namespace video {
     if (session) {
       session->bitrate_budget = config.bitrate_budget;
       session->perf_session_id = config.perf_session_id;
+      session->packet_queue_max_age = packet_queue_age(config.get_effective_framerate());
     }
     return session;
   }
@@ -3611,6 +3612,8 @@ namespace video {
       session->bitrate_budget = config.bitrate_budget;
     }
     session->perf_session_id = config.perf_session_id;
+    session->packet_queue_max_age = packet_queue_age(config.get_effective_framerate());
+    session->packet_queue_idr = mail->event<bool>(mail::idr);
 
     // As a workaround for NVENC hangs and to generally speed up encoder reinit,
     // we will complete the encoder teardown in a separate thread if supported.
@@ -4014,6 +4017,7 @@ namespace video {
     // Prepare the current image before replacing the working encoder. A failed
     // rebuild leaves both the old encoder and its FEC allowance intact.
     if (!replacement || replacement->convert(context.image)) return false;
+    replacement->packet_queue_idr = session->packet_queue_idr;
     replacement->request_idr_frame();
     session = std::move(replacement);
     return true;
@@ -4039,6 +4043,7 @@ namespace video {
     if (!session) {
       return std::nullopt;
     }
+    session->packet_queue_idr = ctx.idr_events;
 
     // The encode colorspace is fully determined by the client config and the
     // display's HDR state — building a throwaway encode device here used to

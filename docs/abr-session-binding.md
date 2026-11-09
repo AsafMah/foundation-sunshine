@@ -128,15 +128,29 @@ first feedback window after `enable`, which covers only stream-startup
 transients; the skip is logged at INFO and sustained loss is cut on the next
 window.
 
-Encoded video frames are handed to the broadcast thread with at most 2 frames
-waiting. If the broadcast thread is behind when a new frame arrives, every
-waiting frame is dropped and only the newest is queued, so no standing latency
-backlog can form (previously up to 32 frames could queue, then were cleared
-silently). Outputs drained from AMF in one encode/collection pass (pre-analysis
-or multi-HW batches) are a batch: the cap applies only to frames queued before
-the batch, so a batch never supersedes its own outputs. A WARNING `Video packet queue full: dropped N superseded encoded
-frame(s)...` is logged at most once per second. The client sees dropped frames
-as frame loss, which can feed ABR loss reports.
+Encoded video uses a queue-dwell age limit of 1.5 negotiated frame intervals,
+with a 3 ms floor (8.333 ms at 180 fps, preserving fractional frame rates).
+Each enqueue removes only its own channel's packets older than that limit;
+fresh bursts are retained without a count cap or the legacy 32-element clear.
+This bounds the retained tail at enqueue, not wall-clock delivery while the
+broadcast thread itself is unscheduled. A 20--50 ms CPU stall necessarily loses
+stale frames rather than preserving an old latency backlog.
+Outputs drained from AMF in one encode/collection pass are a batch: pruning
+runs only before the first output, so a pass never supersedes its own outputs.
+A WARNING `Video packet queue age exceeded: dropped N superseded encoded
+frame(s)...` reports accumulated drops at most once per second.
+
+Inter-frame encoders raise the existing per-session `mail::idr` event after
+superseding output (including a lost keyframe). The next submission requests
+IDR without waiting for client RFI/IDR; resetting the current submission to a
+normal frame cannot clear that event. Intra-only PyroWave does not need IDR.
+Drops while enqueuing a new IDR do not request another one: that output already
+repairs the lost reference chain.
+Drops occur before RTP sequence assignment, so they create frame-number gaps
+without transport sequence gaps. Host ABR still acts on the client's
+`packetLoss` value, not `droppedFrames`. Excluding positively identified unsent
+frame gaps from that loss proxy is a separate client change, with no wire or
+host-controller arithmetic change here.
 
 Selection, token validation, lifecycle projection, controller mutation and
 budget updates execute inside the streaming session-list lock. Bound requests

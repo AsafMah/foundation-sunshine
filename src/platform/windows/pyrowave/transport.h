@@ -32,6 +32,7 @@ namespace platf::pyrowave_windows {
     void *channel_data,
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp,
     std::optional<platf::frame_pipeline_trace_t> pipeline_trace,
-    const pyrowave::hdr_frame_metadata_t *dynamic_metadata = nullptr) noexcept;
+    const pyrowave::hdr_frame_metadata_t *dynamic_metadata = nullptr,
+    std::chrono::nanoseconds max_queue_age = std::chrono::milliseconds(25)) noexcept;
 
 }  // namespace platf::pyrowave_windows

@@ -485,7 +485,7 @@ namespace platf::pyrowave_windows {
           channel_data,
           frame_timestamp,
           std::move(pipeline_trace),
-          dynamic_metadata);
+          dynamic_metadata, packet_queue_max_age);
         if (!publish_result.success) {
           return encode_failure(
             frame_number,

@@ -64,7 +64,8 @@ namespace platf::pyrowave_windows {
     void *channel_data,
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp,
     std::optional<platf::frame_pipeline_trace_t> pipeline_trace,
-    const pyrowave::hdr_frame_metadata_t *dynamic_metadata) noexcept {
+    const pyrowave::hdr_frame_metadata_t *dynamic_metadata,
+    std::chrono::nanoseconds max_queue_age) noexcept {
     transport_publish_result_t result;
     const auto input_bytes = bitstream ? bitstream->size() : 0u;
     const auto boundary_overflow = packet_boundary >
@@ -164,7 +165,7 @@ namespace platf::pyrowave_windows {
         pipeline_trace->packet_ready = std::chrono::steady_clock::now();
       }
       output->pipeline_trace = std::move(pipeline_trace);
-      video::raise_packet(packets, std::move(output));
+      video::raise_packet(packets, std::move(output), max_queue_age);
       result.success = true;
       return result;
     }

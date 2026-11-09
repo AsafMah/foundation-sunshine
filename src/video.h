@@ -507,6 +507,8 @@ namespace video {
     virtual ~encode_session_t() = default;
 
     std::uint32_t perf_session_id = 0;
+    std::chrono::nanoseconds packet_queue_max_age { std::chrono::milliseconds(25) };
+    safe::mail_raw_t::event_t<bool> packet_queue_idr;
 
     virtual int
     convert(platf::img_t &img) = 0;
@@ -582,6 +584,7 @@ namespace video {
 
     std::vector<replace_t> *replacements = nullptr;
     void *channel_data = nullptr;
+    std::chrono::steady_clock::time_point queued_at;
     bool after_ref_frame_invalidation = false;
     unsigned fec_percentage = 0;  // Protection budget when this frame was submitted.
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
