@@ -1072,7 +1072,9 @@ namespace display_device::topology {
           if (created && *created == creation_delivery_e::accepted) {
             // Not listed within the platform's creation wait, though the driver has it. It may still be
             // listed later, so the driver's whole list is cleared now rather than waiting on a late arrival.
-            return roll_back_heads(capability, record, this_runs_heads, "The driver accepted the request but no virtual display appeared");
+            const auto explained = platform_.explain_missing_head(intent);
+            return roll_back_heads(capability, record, this_runs_heads,
+              "The driver accepted the request but no virtual display appeared" + (explained.empty() ? std::string {} : ": " + explained));
           }
           if (created) {
             return unresolved("The driver delivery is uncertain and no virtual display appeared");
@@ -1203,8 +1205,25 @@ namespace display_device::topology {
     if (!after.available || !virtual_heads(platform_, after).empty()) {
       return conflict(why + "; its removal could not be confirmed");
     }
-    if (const auto error = put_back(capability, record, after, why + "; other displays still differ from the baseline after removing it", false)) {
-      return conflict(*error);
+    // The driver's list is empty now, so no request of this run can still appear: its creations are settled. If the
+    // layout cannot be put back below, a later restore retries just that (gh-all run 20261109-174516).
+    auto settled = record;
+    bool resolved = false;
+    for (auto &step : settled.steps) {
+      if (step.operation == journal_operation_e::create_head && step.state == journal_step_state_e::attempted) {
+        step.state = journal_step_state_e::failed;
+        step.detail = "removed by the rollback: " + why;
+        resolved = true;
+      }
+    }
+    if (const auto error = put_back(capability, settled, after, why + "; other displays still differ from the baseline after removing it", false)) {
+      std::string unsaved;
+      if (resolved) {
+        if (const auto saved = store_.save(settled); !saved) {
+          unsaved = "; the native journal could not record the removal: " + saved.error().detail;
+        }
+      }
+      return conflict(*error + unsaved);
     }
     return clear_journal(refusal(why));
   }

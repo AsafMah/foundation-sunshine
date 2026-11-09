@@ -15,8 +15,10 @@
  */
 #pragma once
 
+#include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <windows.h>
 
@@ -42,6 +44,29 @@ namespace display_device::topology::win32_edge {
    */
   head_class_e
   classify_parent_hardware_ids(const std::optional<std::wstring> &multi_sz);
+
+  /**
+   * What SetDisplayConfig(SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_VIRTUAL_MODE_AWARE) needs of the arrays, or nullopt:
+   * each active path's source and target mode indices (the virtual-mode-aware 16-bit fields) in range and of the
+   * right type, and no two different active sources overlapping on the desktop.
+   */
+  std::optional<std::string>
+  ccd_problem(const std::vector<DISPLAYCONFIG_PATH_INFO> &paths, const std::vector<DISPLAYCONFIG_MODE_INFO> &modes);
+
+  /** One line per path: target, adapter, source, active, corner and size, and the id `identify` gives it. */
+  std::string
+  describe_ccd(const std::vector<DISPLAYCONFIG_PATH_INFO> &paths, const std::vector<DISPLAYCONFIG_MODE_INFO> &modes,
+    const std::function<std::string(const DISPLAYCONFIG_PATH_INFO &)> &identify);
+
+  /**
+   * Plans `arrange` on the active paths and modes of the desktop, in place: drops the `off` displays' paths and moves
+   * each placed display's source corner. `identify` gives the id the inventory knows a path by, or "" when it cannot
+   * identify it. Returns why nothing may be sent, or nullopt when the arrays are ready for SetDisplayConfig.
+   */
+  std::optional<std::string>
+  plan_arrange(std::vector<DISPLAYCONFIG_PATH_INFO> &paths, std::vector<DISPLAYCONFIG_MODE_INFO> &modes,
+    const std::function<std::string(const DISPLAYCONFIG_PATH_INFO &)> &identify, const std::vector<placement_t> &placements,
+    const std::vector<os_display_id_t> &off);
 
   /**
    * The display count ZakoVDD reads: `parse_vdd_display_count` of `<VDDPATH>\vdd_settings.xml`, where VDDPATH is the
@@ -83,6 +108,10 @@ namespace display_device::topology::win32_edge {
 
     std::chrono::steady_clock::time_point
     now() override;
+
+    /** Plans `arrange` on the live desktop and asks Windows to validate it (SDC_VALIDATE): "valid", or why not. Writes nothing. */
+    std::string
+    validate_arrange(const std::vector<placement_t> &placements);
 
     /** SetupAPI over every monitor devnode (present or not) and the raw CCD paths; reads only. */
     missing_head_report_t

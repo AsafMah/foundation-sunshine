@@ -158,6 +158,12 @@ namespace display_device::topology::win32_edge {
       return text.find(needle) != std::string::npos;
     }
 
+    std::string
+    identify_active(const DISPLAYCONFIG_PATH_INFO &path) {
+      const auto info = w_utils::get_device_info_for_valid_path(path, w_utils::ACTIVE_ONLY_DEVICES);
+      return info ? info->device_id : std::string {};
+    }
+
     edge_send_t
     to_edge(const vdd_ioctl::gated_send_t &sent) {
       switch (sent.delivery) {
@@ -263,7 +269,10 @@ namespace display_device::topology::win32_edge {
         present = present || is_here;
         detail += "monitor " + narrow(instance) + (is_here ? " present" : here ? " not present" : " presence unknown");
         if (const auto status = fixed_property<std::uint32_t>(monitors, device, devnode_status_key, DEVPROP_TYPE_UINT32)) detail += " status=" + hex32(*status);
-        if (const auto problem = fixed_property<std::uint32_t>(monitors, device, problem_code_key, DEVPROP_TYPE_UINT32)) detail += " problem=" + std::to_string(*problem);
+        if (const auto problem = fixed_property<std::uint32_t>(monitors, device, problem_code_key, DEVPROP_TYPE_UINT32)) {
+          detail += " problem=" + std::to_string(*problem);
+          if (is_here) report.problem = *problem;
+        }
         detail += "; ";
       }
       SetupDiDestroyDeviceInfoList(monitors);
@@ -384,45 +393,33 @@ namespace display_device::topology::win32_edge {
     capability.require(arrange_operation(capability.kind()));
     auto data = w_utils::query_display_config(w_utils::ACTIVE_ONLY_DEVICES);
     if (!data) return { edge_delivery_e::not_sent, "the desktop could not be read" };
-
-    // A display taken off the desktop is left out of the supplied active paths, in the same write.
-    // One already off the desktop is not listed here, which is what was asked.
-    std::erase_if(data->paths, [&](const DISPLAYCONFIG_PATH_INFO &path) {
-      const auto info = w_utils::get_device_info_for_valid_path(path, w_utils::ACTIVE_ONLY_DEVICES);
-      return info && std::ranges::any_of(off, [&](const os_display_id_t &id) { return id.value == info->device_id; });
-    });
-    if (data->paths.empty()) return { edge_delivery_e::not_sent, "no display would be left on the desktop" };
-
-    std::vector<bool> placed(placements.size(), false);
-    std::vector<UINT32> moved;
-    for (auto &path : data->paths) {
-      const auto info = w_utils::get_device_info_for_valid_path(path, w_utils::ACTIVE_ONLY_DEVICES);
-      if (!info) continue;
-      const auto it = std::ranges::find_if(placements, [&](const placement_t &placement) { return placement.display.value == info->device_id; });
-      if (it == placements.end()) continue;
-      const auto index = w_utils::get_source_index(path, data->modes);
-      auto *mode = w_utils::get_source_mode(index, data->modes);
-      if (!index || !mode) return { edge_delivery_e::not_sent, "display " + info->device_id + " has no source mode" };
-      // A duplicated display shares its source; moving it would move its clone too.
-      if (std::ranges::find(moved, *index) != moved.end()) {
-        return { edge_delivery_e::not_sent, "display " + info->device_id + " shares its source with another display" };
-      }
-      moved.push_back(*index);
-      mode->position = POINTL { it->position.x, it->position.y };
-      placed[static_cast<std::size_t>(it - placements.begin())] = true;
+    if (const auto refusal = plan_arrange(data->paths, data->modes, identify_active, placements, off)) {
+      return { edge_delivery_e::not_sent, *refusal };
     }
-    for (std::size_t i = 0; i < placements.size(); ++i) {
-      if (!placed[i]) return { edge_delivery_e::not_sent, "display " + placements[i].display.value + " is not on the desktop" };
+    // Not SDC_SAVE_TO_DATABASE: the user's saved layout for this display set stays as it was. Windows checks the
+    // arrays first without applying anything, so a layout it rejects is definite: nothing was written.
+    const UINT32 supplied { SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_VIRTUAL_MODE_AWARE };
+    const auto paths = static_cast<UINT32>(data->paths.size());
+    const auto modes = static_cast<UINT32>(data->modes.size());
+    if (const LONG checked { SetDisplayConfig(paths, data->paths.data(), modes, data->modes.data(), supplied | SDC_VALIDATE) }; checked != ERROR_SUCCESS) {
+      return { edge_delivery_e::not_sent, w_utils::get_error_string(checked) + " validating the layout, so nothing was written: " +
+                                            describe_ccd(data->paths, data->modes, identify_active) };
     }
-
-    // Not SDC_SAVE_TO_DATABASE: the user's saved layout for this display set stays as it was.
-    const UINT32 flags { SDC_APPLY | SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_VIRTUAL_MODE_AWARE };
-    const LONG result { SetDisplayConfig(static_cast<UINT32>(data->paths.size()), data->paths.data(),
-      static_cast<UINT32>(data->modes.size()), data->modes.data(), flags) };
+    const LONG result { SetDisplayConfig(paths, data->paths.data(), modes, data->modes.data(), supplied | SDC_APPLY) };
     if (result != ERROR_SUCCESS) {
       return { edge_delivery_e::uncertain, w_utils::get_error_string(result) + " while placing the displays" };
     }
     return { edge_delivery_e::delivered, {} };
+  }
+
+  std::string
+  win32_native_edge_t::validate_arrange(const std::vector<placement_t> &placements) {
+    auto data = w_utils::query_display_config(w_utils::ACTIVE_ONLY_DEVICES);
+    if (!data) return "the desktop could not be read";
+    if (const auto refusal = plan_arrange(data->paths, data->modes, identify_active, placements, {})) return *refusal;
+    const LONG checked { SetDisplayConfig(static_cast<UINT32>(data->paths.size()), data->paths.data(), static_cast<UINT32>(data->modes.size()),
+      data->modes.data(), SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_VIRTUAL_MODE_AWARE | SDC_VALIDATE) };
+    return checked == ERROR_SUCCESS ? std::string { "valid" } : w_utils::get_error_string(checked) + ": " + describe_ccd(data->paths, data->modes, identify_active);
   }
 
   std::chrono::steady_clock::time_point

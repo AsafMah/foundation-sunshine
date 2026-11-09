@@ -121,9 +121,19 @@ namespace display_device::topology {
   struct missing_head_report_t {
     /** Whether a present monitor devnode carries the request GUID as its ContainerId; nullopt when unknown. */
     std::optional<bool> monitor_present;
+    /** The device problem code of that present monitor (22 = CM_PROB_DISABLED), when it has one. */
+    std::optional<std::uint32_t> problem;
     /** The monitor devnodes and display paths of the driver, as one line for the log. */
     std::string detail;
   };
+
+  /**
+   * Why a created head is not listed, from what the device database shows: its monitor disabled (a program on the
+   * host disables monitor devnodes: gh-all run 20261109-174516), present but without a display path, or not created.
+   * Empty when it could not be told.
+   */
+  std::string
+  missing_head_explanation(const missing_head_report_t &report);
 
   /** The driver-wide mode list keeps at most this many modes (`vdd_mode_list::kMaxTotalModes`). */
   inline constexpr std::size_t max_driver_modes = 96;
@@ -239,6 +249,10 @@ namespace display_device::topology {
 
     std::optional<std::uint32_t>
     head_capacity() const override;
+
+    /** Reads the device database now (`native_edge_t::describe_missing_head`). */
+    std::string
+    explain_missing_head(const head_guid_t &intent) override;
 
   private:
     result_t<creation_delivery_e>

@@ -637,6 +637,14 @@ TEST(GhHardware, ProbeDriverHeads) {
             << " detail=" << report.detail << '\n';
   EXPECT_TRUE(snapshot.available);
   EXPECT_EQ(report.monitor_present, std::optional { false });
+  // Read-only: Windows validates (SDC_VALIDATE) the arrange the executor would send to keep every display where it is.
+  std::vector<dt::placement_t> stay;
+  for (const auto &display : snapshot.displays) {
+    if (display.layout) stay.push_back({ display.id, display.layout->position });
+  }
+  const auto validated = edge.validate_arrange(stay);
+  std::cout << "GH arrange_validate=" << validated << '\n';
+  EXPECT_EQ(validated, "valid");
   if (const char *guid = std::getenv("SUNSHINE_GH_PROBE_GUID")) {
     if (const auto bytes = dt::parse_guid(guid)) {
       const auto named = edge.describe_missing_head(dt::head_guid_t { *bytes });

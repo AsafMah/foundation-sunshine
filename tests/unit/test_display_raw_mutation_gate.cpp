@@ -656,6 +656,8 @@ namespace {
 
   // Each entry is a non-mutating use or an inert plan; required/forbidden tokens keep the justification true.
   const std::vector<allowance_t> production_allowances {
+    { "platform/windows/display_device/native_edge.cpp", "validate_arrange", "SetDisplayConfig", { "SDC_VALIDATE" }, { "SDC_APPLY" },
+      "Validate-only: the read-only probe asks Windows whether the planned arrange is valid and writes nothing." },
     { "platform/windows/display_device/windows_utils.cpp", "test_no_access_to_ccd_api", "SetDisplayConfig", { "SDC_VALIDATE" }, { "SDC_APPLY" },
       "Validate-only probe of CCD access; it never applies a configuration." },
     { "platform/windows/display_device/windows_utils.cpp", "set_hdr_state", "DisplayConfigSetDeviceInfo", { "hdr_state_api::set(" }, {},

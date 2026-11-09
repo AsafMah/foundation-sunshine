@@ -206,7 +206,10 @@ namespace {
       if (!describes) return {};
       const bool listed = std::ranges::any_of(displays, [&](const auto &display) { return display.container == std::optional { intent.value }; });
       const bool hidden = std::ranges::find(hidden_monitors, intent) != hidden_monitors.end();
-      return { listed || hidden, "fake monitors=" + std::to_string(hidden_monitors.size()) };
+      const bool disabled = std::ranges::find(disabled_monitors, intent) != disabled_monitors.end();
+      dt::missing_head_report_t report { listed || hidden || disabled, std::nullopt, "fake monitors=" + std::to_string(hidden_monitors.size()) };
+      if (disabled) report.problem = 22;
+      return report;
     }
 
     std::chrono::steady_clock::time_point
@@ -258,6 +261,8 @@ namespace {
     bool describes { true };
     /** Monitors the driver created that Windows lists in no display path. */
     std::vector<dt::head_guid_t> hidden_monitors;
+    /** Monitors the driver created whose device another program disabled (CM_PROB_DISABLED). */
+    std::vector<dt::head_guid_t> disabled_monitors;
     std::vector<dt::head_guid_t> described;
   };
 
@@ -1432,4 +1437,29 @@ TEST_F(WindowsNative, ANotListedNoteSaysWhetherTheDriverCreatedTheMonitorOrWindo
   EXPECT_TRUE(mentions(dropped, "the driver did not create a monitor for it")) << dropped;
   const auto unknown = run([](fake_edge_t &e, const dt::head_guid_t &) { e.describes = false; });
   EXPECT_TRUE(mentions(unknown, "could not be determined")) << unknown;
+}
+
+TEST(MissingHeadExplanation, NamesADisabledMonitorAndTheProgramThatDoesIt) {
+  EXPECT_EQ(dt::missing_head_explanation({}), "");
+  EXPECT_NE(dt::missing_head_explanation({ false, std::nullopt, "" }).find("did not create a monitor"), std::string::npos);
+  EXPECT_NE(dt::missing_head_explanation({ true, std::nullopt, "" }).find("no display path"), std::string::npos);
+  EXPECT_NE(dt::missing_head_explanation({ true, 28u, "" }).find("device problem 28"), std::string::npos);
+  const auto disabled = dt::missing_head_explanation({ true, 22u, "" });
+  EXPECT_NE(disabled.find("CM_PROB_DISABLED"), std::string::npos) << disabled;
+  EXPECT_NE(disabled.find("pnp_disable_monitors"), std::string::npos) << disabled;
+}
+
+TEST_F(WindowsNative, AHeadWhoseMonitorIsDisabledIsRefusedNamingTheDisabledDevice) {
+  // gh-all run 20261109-174516, stream stage: the monitor instance arrived already disabled (problem 22).
+  edge.on_create = [&](const dt::head_guid_t &intent) {
+    edge.disabled_monitors.push_back(intent);
+    return dt::edge_send_t { edge_delivery_e::delivered, {} };
+  };
+  memory_store_t store;
+  dt::native_executor_t executor { store, platform, { next_uuid, 2, driver() } };
+  const auto prepared = prepare_with(executor);
+  EXPECT_EQ(prepared.verdict, native_verdict_e::refused) << prepared.reason;
+  EXPECT_TRUE(mentions(prepared.reason, "no virtual display appeared: its monitor device is disabled (CM_PROB_DISABLED)")) << prepared.reason;
+  EXPECT_EQ(edge.destroys, 1);
+  EXPECT_FALSE(store.bytes);
 }

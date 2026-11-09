@@ -1537,7 +1537,7 @@ TEST_F(NativeExecutor, ADisplayThatDisturbedOtherDisplaysIsRolledBack) {
   EXPECT_FALSE(store.bytes);
 }
 
-TEST_F(NativeExecutor, UnpersistedRollbackDoesNotProveAnAttemptIsSettled) {
+TEST_F(NativeExecutor, AConfirmedRollbackIsPersistedSoRestoreRetriesOnlyTheLayout) {
   platform.on_create = [&](std::size_t) {
     platform.add_head();
     find(platform.host, "os-B").info.device_state = state_e::inactive;
@@ -1547,18 +1547,19 @@ TEST_F(NativeExecutor, UnpersistedRollbackDoesNotProveAnAttemptIsSettled) {
   EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict));
   EXPECT_TRUE(mentions(outcome.reason, "still differ"));
   EXPECT_EQ(platform.head_count(), 0u);
-  EXPECT_TRUE(store.bytes);
+  ASSERT_TRUE(store.bytes);
+  const auto record = store.record();
+  ASSERT_TRUE(record);
+  EXPECT_EQ(record->steps.front().state, step_e::failed) << "the removal was confirmed, so the creation is settled";
 
-  // The durable image still says attempted; it cannot prove that rollback completed.
+  // Restore keeps the journal while the layout still differs, and finishes once it no longer does.
   EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
   EXPECT_TRUE(store.bytes);
   find(platform.host, "os-B").info.device_state = state_e::active;
-  EXPECT_TRUE(verdict_is(restore_with(executor), native_verdict_e::conflict));
-  EXPECT_TRUE(store.bytes);
-  EXPECT_TRUE(healthy(reset_with(executor)));
+  const auto restored = restore_with(executor);
+  EXPECT_TRUE(verdict_is(restored, native_verdict_e::ok)) << restored.reason;
   EXPECT_FALSE(store.bytes);
   EXPECT_TRUE(healthy(executor.health()));
-  EXPECT_EQ(log.host_writes(), 2u);
 }
 
 TEST_F(NativeExecutor, AFailedOrUnconfirmedRollbackIsInConflict) {
@@ -4930,5 +4931,32 @@ TEST_F(NativeExecutor, AFollowedHeadThatCannotBeJournaledAfterTheNextCreateIsRol
   EXPECT_TRUE(verdict_is(outcome, native_verdict_e::refused)) << outcome.reason;
   EXPECT_TRUE(mentions(outcome.reason, "could not record a re-enumerated virtual display")) << outcome.reason;
   EXPECT_EQ(platform.head_count(), 0u);
+  EXPECT_FALSE(store.bytes);
+}
+
+TEST_F(NativeExecutor, AConfirmedRemovalResolvesTheCreateEvenWhenTheLayoutCannotBePutBack) {
+  // gh-all run 20261109-174516: the head went (its monitor was disabled), Windows had moved another display, the
+  // rollback removed every head but placing the others back failed. A later restore must retry the layout, not
+  // report "unconfirmed virtual display creation" forever.
+  platform.on_create = [&](std::size_t) -> dt::result_t<delivery_e> {
+    find(platform.host, "os-B").layout->position = { 2000, 0 };
+    return delivery_e::accepted;
+  };
+  platform.on_arrange = [&](std::size_t call, const std::vector<dt::placement_t> &placements) -> dt::result_t<void> {
+    if (call == 1) return failure("[code: ERROR_INVALID_PARAMETER, message: The parameter is incorrect] while placing the displays");
+    platform.place(placements);
+    return {};
+  };
+  const auto outcome = prepare_with(executor, virtual_profile());
+  EXPECT_TRUE(verdict_is(outcome, native_verdict_e::conflict)) << outcome.reason;
+  EXPECT_TRUE(log.contains("remove_all_heads"));
+  const auto record = store.record();
+  ASSERT_TRUE(record);
+  for (const auto &step : record->steps) {
+    EXPECT_FALSE(step.operation == dt::journal_operation_e::create_head && step.state == step_e::attempted) << "the removal was confirmed";
+  }
+  const auto restored = restore_with(executor);
+  EXPECT_TRUE(verdict_is(restored, native_verdict_e::ok)) << restored.reason;
+  EXPECT_FALSE(mentions(restored.reason, "unconfirmed")) << restored.reason;
   EXPECT_FALSE(store.bytes);
 }

@@ -96,6 +96,12 @@ namespace display_device::topology {
     virtual bool
     is_virtual_head(const observed_display_t &display) const = 0;
 
+    /** Why the head of `intent` is not listed, for the refusal; empty when the platform cannot tell. Reads only. */
+    virtual std::string
+    explain_missing_head(const head_guid_t &) {
+      return {};
+    }
+
     /** How many heads the driver can show at once, or nullopt when unknown (then nothing is refused for it). */
     virtual std::optional<std::uint32_t>
     head_capacity() const {

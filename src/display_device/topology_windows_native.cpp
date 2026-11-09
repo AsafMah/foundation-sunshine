@@ -223,6 +223,23 @@ namespace display_device::topology {
     return static_cast<std::uint32_t>(value);
   }
 
+  std::string
+  missing_head_explanation(const missing_head_report_t &report) {
+    if (!report.monitor_present) return {};
+    if (!*report.monitor_present) return "the driver did not create a monitor for it (no present monitor device carries its ContainerId)";
+    if (report.problem && *report.problem == 22) {
+      return "its monitor device is disabled (CM_PROB_DISABLED), so Windows shows no display for it: a program on this host disables "
+             "monitor devices (Punktfunk's pnp_disable_monitors policy does); this host never enables or disables them";
+    }
+    return "the driver created its monitor, but Windows shows no display path for it" +
+           (report.problem && *report.problem != 0 ? " (device problem " + std::to_string(*report.problem) + ")" : std::string {});
+  }
+
+  std::string
+  windows_native_platform_t::explain_missing_head(const head_guid_t &intent) {
+    return missing_head_explanation(edge_.describe_missing_head(intent));
+  }
+
   std::optional<std::uint32_t>
   windows_native_platform_t::head_capacity() const {
     return options_.head_capacity ? options_.head_capacity() : std::nullopt;
@@ -273,9 +290,8 @@ namespace display_device::topology {
     if (!listed) {
       if (options_.note) {
         const auto report = edge_.describe_missing_head(intent);
-        const auto why = !report.monitor_present ? std::string { "whether the driver created its monitor could not be determined" } :
-                         *report.monitor_present ? std::string { "the driver created its monitor, but Windows shows no display path for it" } :
-                                                   std::string { "the driver did not create a monitor for it (no present monitor device carries its ContainerId)" };
+        const auto explained = missing_head_explanation(report);
+        const auto why = explained.empty() ? std::string { "whether the driver created its monitor could not be determined" } : explained;
         note("virtual display " + format_guid(intent.value) + " was not listed within " + std::to_string(options_.create_wait.count()) +
              " ms of its delivered creation; " + why + (report.detail.empty() ? std::string {} : " [" + report.detail + "]"));
       }
