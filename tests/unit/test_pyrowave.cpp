@@ -1078,21 +1078,20 @@ TEST(PyrowaveTransportTest, PacketBatchSupersedesOnlyFramesQueuedBeforeIt) {
   };
   const auto start = std::chrono::steady_clock::time_point(std::chrono::seconds(10));
   const auto age = video::packet_queue_age(180);
-  auto idr = mail->event<bool>(mail::idr);
+  auto recovery = std::make_shared<video::packet_queue_recovery_t>();
   for (std::int64_t index = 1; index <= 2; ++index) {
-    video::raise_packet(packets, frame(index), age, idr, start);
+    video::raise_packet(packets, frame(index), age, recovery, start);
   }
   // One AMF collection pass emits a pre-analysis/multi-HW batch of outputs.
   video::packet_batch_t batch;
   for (std::int64_t index = 10; index < 16; ++index) {
     // Even a long collection pass cannot prune its own outputs.
-    batch.raise(packets, frame(index), age, idr, start + std::chrono::milliseconds(20 * index));
+    batch.raise(packets, frame(index), age, recovery, start + std::chrono::milliseconds(20 * index));
     if (index == 10) {
-      ASSERT_TRUE(idr->peek());
-      idr->pop();
+      ASSERT_TRUE(recovery->on_capture(16));
     }
     else {
-      EXPECT_FALSE(idr->peek());
+      EXPECT_FALSE(recovery->on_capture(16));
     }
   }
   std::vector<std::int64_t> queued;
@@ -1111,6 +1110,19 @@ protected:
   safe::mail_t mail = std::make_shared<safe::mail_raw_t>();
   safe::mail_raw_t::queue_t<video::packet_t> packets = mail->queue<video::packet_t>("age-test");
   safe::mail_raw_t::event_t<bool> idr = mail->event<bool>(mail::idr);
+  std::shared_ptr<video::packet_queue_recovery_t> recovery = std::make_shared<video::packet_queue_recovery_t>();
+
+  struct fake_encoder_t: video::encode_session_t {
+    bool force_idr = false;
+    std::vector<bool> submissions;
+    int convert(platf::img_t &) override { return 0; }
+    void request_idr_frame() override { force_idr = true; }
+    void request_normal_frame() override { force_idr = false; }
+    void invalidate_ref_frames(int64_t, int64_t) override { request_idr_frame(); }
+    bool set_bitrate(int) override { return true; }
+    void set_dynamic_param(const video::dynamic_param_t &) override {}
+    void encode() { submissions.push_back(force_idr); }
+  };
 
   std::size_t push(std::int64_t index, clock::time_point now, void *channel = nullptr,
     bool inter_frame_codec = true) {
@@ -1118,7 +1130,7 @@ protected:
       std::vector<std::uint8_t>(69'444, 0x11), index, false);
     packet->channel_data = channel;
     return video::raise_packet(packets, std::move(packet), age,
-      inter_frame_codec ? idr : safe::mail_raw_t::event_t<bool> {}, now);
+      inter_frame_codec ? recovery : nullptr, now);
   }
 };
 
@@ -1142,7 +1154,7 @@ TEST_F(VideoPacketQueueTest, FreshBurstBypassesLegacyThirtyTwoElementClear) {
     ASSERT_TRUE(packets->peek());
     EXPECT_EQ(packets->pop(std::chrono::milliseconds(0))->frame_index(), i);
   }
-  EXPECT_FALSE(idr->peek());
+  EXPECT_FALSE(recovery->on_capture(41));
 }
 
 TEST_F(VideoPacketQueueTest, PrunesOnlyTheProducingChannel) {
@@ -1154,41 +1166,86 @@ TEST_F(VideoPacketQueueTest, PrunesOnlyTheProducingChannel) {
   EXPECT_EQ(packets->pop(std::chrono::milliseconds(0))->frame_index(), 3);
 }
 
-TEST_F(VideoPacketQueueTest, RecoveryEventSurvivesCurrentSubmissionNormalReset) {
-  struct fake_encoder_t {
-    bool force_idr = false;
-    std::vector<bool> submissions;
-    void request_idr_frame() { force_idr = true; }
-    void request_normal_frame() { force_idr = false; }
-    void encode() { submissions.push_back(force_idr); }
-  } encoder;
+TEST_F(VideoPacketQueueTest, RecoveryWaitsForCaptureAndSurvivesNormalReset) {
+  fake_encoder_t encoder;
+  encoder.packet_queue_recovery = recovery;
   push(1, start);
   encoder.encode();
   EXPECT_EQ(push(2, start + std::chrono::milliseconds(20)), 1u);
-  // The real encode loops reset the current frame flag after enqueue, then
-  // consume mail::idr before the next submission. The event must survive.
   encoder.request_normal_frame();
-  ASSERT_TRUE(idr->peek());
-  ASSERT_TRUE(idr->pop());
-  encoder.request_idr_frame();
+  encoder.prepare_queue_recovery(false, 3);
+  EXPECT_FALSE(encoder.force_idr);
+  EXPECT_FALSE(idr->peek());
+  encoder.prepare_queue_recovery(true, 3);
   encoder.encode();
   EXPECT_EQ(encoder.submissions, (std::vector<bool> { false, true }));
-  EXPECT_FALSE(idr->peek());
+  EXPECT_FALSE(recovery->on_capture(4));
 }
 
 TEST_F(VideoPacketQueueTest, IntraOnlyTransportNeedsNoRecoveryEvent) {
   push(1, start, nullptr, false);
   EXPECT_EQ(push(2, start + std::chrono::milliseconds(20), nullptr, false), 1u);
-  EXPECT_FALSE(idr->peek());
+  EXPECT_FALSE(recovery->on_capture(3));
 }
 
 TEST_F(VideoPacketQueueTest, NewIdrAlreadyRepairsTheSupersededReference) {
   push(1, start);
   auto packet = std::make_unique<video::packet_raw_generic>(
     std::vector<std::uint8_t>(69'444, 0x11), 2, true);
-  EXPECT_EQ(video::raise_packet(packets, std::move(packet), age, idr,
+  EXPECT_EQ(video::raise_packet(packets, std::move(packet), age, recovery,
     start + std::chrono::milliseconds(20)), 1u);
-  EXPECT_FALSE(idr->peek());
+  EXPECT_FALSE(recovery->on_capture(3));
+}
+
+TEST_F(VideoPacketQueueTest, PruningRecoveryCannotRearmBeforePostRequestDequeue) {
+  using namespace std::chrono_literals;
+  push(1, start);
+  push(2, start + 20ms);
+  ASSERT_TRUE(recovery->on_capture(3));
+  auto packet = std::make_unique<video::packet_raw_generic>(
+    std::vector<std::uint8_t>(69'444, 0x11), 3, true);
+  video::raise_packet(packets, std::move(packet), age, recovery, start + 21ms);
+  // The actual recovery output and all its predecessors have now aged out.
+  EXPECT_EQ(push(4, start + 40ms), 2u);
+  EXPECT_FALSE(recovery->on_capture(5));
+  recovery->on_dequeue(2);  // Delayed AMF output submitted before the request.
+  push(5, start + 60ms);
+  EXPECT_FALSE(recovery->on_capture(6));
+  auto sent = packets->pop(0ms);
+  ASSERT_TRUE(sent);
+  sent->queue_recovery->on_dequeue(sent->frame_index());
+  push(6, start + 61ms);
+  push(7, start + 80ms);
+  EXPECT_TRUE(recovery->on_capture(8));
+}
+
+TEST_F(VideoPacketQueueTest, SiblingRecoveryAndOldSessionDequeueCannotAcknowledgeThisSession) {
+  auto sibling = std::make_shared<video::packet_queue_recovery_t>();
+  recovery->request(false, 1);
+  ASSERT_TRUE(recovery->on_capture(3));
+  sibling->request(false, 1);
+  ASSERT_TRUE(sibling->on_capture(3));
+  sibling->on_dequeue(3);
+  recovery->request(false, 4);
+  EXPECT_FALSE(recovery->on_capture(4));
+  recovery->on_dequeue(3);
+  recovery->request(false, 4);
+  EXPECT_TRUE(recovery->on_capture(5));
+}
+
+TEST_F(VideoPacketQueueTest, RecoveryOwnershipSurvivesEncoderReplacementWithoutRetainingTheEncoder) {
+  fake_encoder_t encoder;
+  encoder.packet_queue_recovery = recovery;
+  recovery->request(false, 1);
+  encoder.prepare_queue_recovery(true, 3);
+  fake_encoder_t replacement;
+  replacement.packet_queue_recovery = encoder.packet_queue_recovery;
+  replacement.prepare_queue_recovery(true, 4);
+  EXPECT_FALSE(replacement.force_idr);
+  recovery->on_dequeue(3);
+  recovery->request(false, 5);
+  replacement.prepare_queue_recovery(true, 6);
+  EXPECT_TRUE(replacement.force_idr);
 }
 
 TEST_F(VideoPacketQueueTest, LegacyCountPolicyIsUnchangedForOtherProducers) {
@@ -1216,8 +1273,8 @@ TEST_F(VideoPacketQueueTest, TwentyAndFiftyMillisecondStallsKeepOnlyFreshTail) {
     }
     EXPECT_EQ(sent, 2);
     EXPECT_EQ(dropped, produced - 2);
-    EXPECT_TRUE(idr->peek());
-    idr->pop();
+    EXPECT_TRUE(recovery->on_capture(produced + 1));
+    recovery->on_dequeue(produced + 1);
   }
 }
 
@@ -1237,9 +1294,8 @@ TEST_F(VideoPacketQueueTest, CpuStarvedBroadcastWithIrregularFiveToThirtyMillise
       EXPECT_EQ(actual_drops, expired) << "frame=" << produced;
       dropped += actual_drops;
       expected_tail.push_back(next_frame);
-      if (idr->peek()) {
+      if (recovery->on_capture(produced + 1)) {
         ++recoveries;
-        idr->pop();
       }
       continue;
     }
@@ -1247,6 +1303,7 @@ TEST_F(VideoPacketQueueTest, CpuStarvedBroadcastWithIrregularFiveToThirtyMillise
     std::size_t burst_sent = 0;
     while (packets->peek()) {
       auto packet = packets->pop(std::chrono::milliseconds(0));
+      if (packet->queue_recovery) packet->queue_recovery->on_dequeue(packet->frame_index());
       // Pruning occurs on enqueue. An independently scheduled consumer can
       // resume up to one producer interval after the last age check.
       EXPECT_LE(next_broadcast - packet->queued_at, age + interval);
@@ -1269,6 +1326,70 @@ TEST_F(VideoPacketQueueTest, CpuStarvedBroadcastWithIrregularFiveToThirtyMillise
   RecordProperty("superseded_frames", static_cast<int>(dropped));
   RecordProperty("sent_frames", sent);
   RecordProperty("retained_frames", static_cast<int>(expected_tail.size()));
+}
+
+TEST_F(VideoPacketQueueTest, RecoveryFeedbackDoesNotCreateImmediateDuplicateEncodes) {
+  using namespace std::chrono_literals;
+  for (const int idr_cost_ms : { 3, 4, 5 }) {
+    for (const int stall_ms : { 20, 50 }) {
+      SCOPED_TRACE(::testing::Message() << "IDR cost=" << idr_cost_ms << "ms stall=" << stall_ms << "ms");
+      recovery = std::make_shared<video::packet_queue_recovery_t>();
+      auto now = start;
+      auto next_capture = start;
+      int encoded = 0, captured = 0, recovery_frames = 0, duplicate_frames = 0;
+      int recovery_frames_dequeued = 0;
+      clock::time_point recovery_dequeued_at {};
+      fake_encoder_t encoder;
+      encoder.packet_queue_recovery = recovery;
+      constexpr auto p_cost = 1ms;
+      const auto idr_cost = std::chrono::milliseconds(idr_cost_ms);
+      const auto stalled_until = start + std::chrono::milliseconds(stall_ms);
+      while (now < start + 100ms && encoded < 100) {
+        // Model encode_run: mail::idr bypasses capture wait when no image is ready.
+        bool requested_idr = false;
+        if (idr->peek()) {
+          idr->pop();
+          requested_idr = true;
+        }
+        if (now < next_capture && !requested_idr) now = next_capture;
+        const bool new_capture = now >= next_capture;
+        if (new_capture) {
+          ++captured;
+          next_capture += interval;
+        }
+        else {
+          ++duplicate_frames;
+        }
+        encoder.prepare_queue_recovery(new_capture, encoded + 1);
+        requested_idr |= encoder.force_idr;
+        now += requested_idr ? idr_cost : p_cost;
+        auto packet = std::make_unique<video::packet_raw_generic>(
+          std::vector<std::uint8_t>(69'444, 0x11), ++encoded, requested_idr);
+        video::raise_packet(packets, std::move(packet), age, recovery, now);
+        encoder.request_normal_frame();
+        if (requested_idr) ++recovery_frames;
+        if (now >= stalled_until) {
+          while (packets->peek()) {
+            auto sent = packets->pop(0ms);
+            if (sent->is_idr()) {
+              ++recovery_frames_dequeued;
+              recovery_dequeued_at = now;
+            }
+            if (sent->queue_recovery) sent->queue_recovery->on_dequeue(sent->frame_index());
+          }
+        }
+      }
+      EXPECT_EQ(duplicate_frames, 0);
+      EXPECT_EQ(recovery_frames, 1);
+      EXPECT_EQ(encoded, captured);
+      EXPECT_LT(encoded, 22);
+      EXPECT_LT(now, start + 107ms);
+      if (stall_ms == 20) {
+        EXPECT_EQ(recovery_frames_dequeued, 1);
+        EXPECT_LE(recovery_dequeued_at, stalled_until + 2 * interval);
+      }
+    }
+  }
 }
 
 TEST(PyrowaveTransportTest, DoesNotQueueFailedPacketization) {

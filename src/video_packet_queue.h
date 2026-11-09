@@ -23,13 +23,13 @@ namespace video {
 
   /**
    * @brief Prune only this channel's stale output under the queue lock.
-   * Recovery is an event for the next submission, not an encoder flag that
-   * request_normal_frame() would overwrite after the current encode call.
+   * Recovery is independent of client mail::idr, which may immediately replay
+   * the old image. Queue recovery waits for capture and broadcast progress.
    */
   inline std::size_t
   raise_packet(safe::mail_raw_t::queue_t<packet_t> &packets, packet_t &&packet,
     std::chrono::nanoseconds max_age = std::chrono::milliseconds(25),
-    const safe::mail_raw_t::event_t<bool> &idr = {},
+    const std::shared_ptr<packet_queue_recovery_t> &recovery = {},
     std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now(),
     bool prune = true) {
     static std::atomic<std::uint64_t> pending_drops { 0 };
@@ -37,14 +37,19 @@ namespace video {
 
     const auto channel = packet->channel_data;
     const bool already_recovering = packet->is_idr();
+    const auto frame_index = packet->frame_index();
     packet->queued_at = now;
+    packet->queue_recovery = recovery;
     const auto dropped = packets->raise_pruning([&](const packet_t &queued) {
-      return prune && queued->channel_data == channel && now - queued->queued_at > max_age;
+      const bool expired = prune && queued->channel_data == channel && now - queued->queued_at > max_age;
+      // Arm before enqueue unlocks, otherwise broadcast could dequeue the
+      // already-IDR replacement before its outstanding request is recorded.
+      if (expired && recovery) recovery->request(already_recovering, frame_index);
+      return expired;
     }, std::move(packet));
     if (dropped == 0) {
       return 0;
     }
-    if (idr && !already_recovering) idr->raise(true);
     pending_drops += dropped;
 
     const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -73,9 +78,9 @@ namespace video {
     void
     raise(safe::mail_raw_t::queue_t<packet_t> &packets, packet_t &&packet,
       std::chrono::nanoseconds max_age = std::chrono::milliseconds(25),
-      const safe::mail_raw_t::event_t<bool> &idr = {},
+      const std::shared_ptr<packet_queue_recovery_t> &recovery = {},
       std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) {
-      raise_packet(packets, std::move(packet), max_age, idr, now, !emitted_);
+      raise_packet(packets, std::move(packet), max_age, recovery, now, !emitted_);
       emitted_ = true;
     }
 

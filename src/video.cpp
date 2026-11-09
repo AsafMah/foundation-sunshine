@@ -2531,7 +2531,7 @@ namespace video {
       packet->replacements = &session.replacements;
       packet->channel_data = channel_data;
       perf::record_encoded_frame(session.perf_session_id);
-      raise_packet(packets, std::move(packet), session.packet_queue_max_age, session.packet_queue_idr);
+      raise_packet(packets, std::move(packet), session.packet_queue_max_age, session.packet_queue_recovery);
     }
 
     return 0;
@@ -2583,7 +2583,7 @@ namespace video {
       packet->pipeline_trace = std::move(encoded_trace);
     }
     perf::record_encoded_frame(session.perf_session_id);
-    raise_packet(packets, std::move(packet), session.packet_queue_max_age, session.packet_queue_idr);
+    raise_packet(packets, std::move(packet), session.packet_queue_max_age, session.packet_queue_recovery);
 
     return 0;
   }
@@ -2623,7 +2623,7 @@ namespace video {
       packet->pipeline_trace = std::move(encoded_trace);
     }
     perf::record_encoded_frame(session.perf_session_id);
-    batch.raise(packets, std::move(packet), session.packet_queue_max_age, session.packet_queue_idr);
+    batch.raise(packets, std::move(packet), session.packet_queue_max_age, session.packet_queue_recovery);
 
     return 0;
   }
@@ -3613,7 +3613,6 @@ namespace video {
     }
     session->perf_session_id = config.perf_session_id;
     session->packet_queue_max_age = packet_queue_age(config.get_effective_framerate());
-    session->packet_queue_idr = mail->event<bool>(mail::idr);
 
     // As a workaround for NVENC hangs and to generally speed up encoder reinit,
     // we will complete the encoder teardown in a separate thread if supported.
@@ -3878,6 +3877,7 @@ namespace video {
 
       std::optional<encoder_rebuild_context_t> rebuild_context;
       if (current_img) rebuild_context.emplace(*disp, encoder, config, *current_img);
+      session->prepare_queue_recovery(has_new_frame && !replayed_frame, frame_nr);
       if (encode(frame_nr++, session, packets, channel_data, frame_timestamp, std::move(pipeline_trace), rebuild_context ? &*rebuild_context : nullptr)) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         if (backend_failure_handler) {
@@ -4017,7 +4017,7 @@ namespace video {
     // Prepare the current image before replacing the working encoder. A failed
     // rebuild leaves both the old encoder and its FEC allowance intact.
     if (!replacement || replacement->convert(context.image)) return false;
-    replacement->packet_queue_idr = session->packet_queue_idr;
+    replacement->packet_queue_recovery = session->packet_queue_recovery;
     replacement->request_idr_frame();
     session = std::move(replacement);
     return true;
@@ -4043,7 +4043,6 @@ namespace video {
     if (!session) {
       return std::nullopt;
     }
-    session->packet_queue_idr = ctx.idr_events;
 
     // The encode colorspace is fully determined by the client config and the
     // display's HDR state — building a throwaway encode device here used to
@@ -4248,6 +4247,7 @@ namespace video {
 
           std::optional<encoder_rebuild_context_t> rebuild_context;
           if (img) rebuild_context.emplace(*disp, encoder, ctx->config, *img);
+          pos->session->prepare_queue_recovery(frame_captured, ctx->frame_nr);
           if (encode(ctx->frame_nr++, pos->session, ctx->packets, ctx->channel_data, frame_timestamp, std::move(pipeline_trace), rebuild_context ? &*rebuild_context : nullptr)) {
             BOOST_LOG(error) << "Could not encode video packet"sv;
             ctx->shutdown_event->raise(true);

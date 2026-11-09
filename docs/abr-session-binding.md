@@ -140,12 +140,28 @@ runs only before the first output, so a pass never supersedes its own outputs.
 A WARNING `Video packet queue age exceeded: dropped N superseded encoded
 frame(s)...` reports accumulated drops at most once per second.
 
-Inter-frame encoders raise the existing per-session `mail::idr` event after
-superseding output (including a lost keyframe). The next submission requests
-IDR without waiting for client RFI/IDR; resetting the current submission to a
-normal frame cannot clear that event. Intra-only PyroWave does not need IDR.
-Drops while enqueuing a new IDR do not request another one: that output already
-repairs the lost reference chain.
+Inter-frame encoders arm a separate per-encoder queue-recovery state after
+superseding output (including a lost keyframe). It does not raise `mail::idr`:
+client IDR requests may immediately re-encode the old image, which would add
+work during the very stall being recovered from. Both async and synchronous
+encoders consume queue recovery only on the next captured, non-replay frame.
+Resetting the current submission to a normal frame cannot clear the request.
+Intra-only PyroWave does not need recovery.
+
+Only one request is outstanding until broadcast dequeues output submitted at
+or after the recovery submission. Dropping that recovery output does not
+re-arm it while broadcast is stalled; delayed pre-request AMF output cannot
+acknowledge it. Packets share the recovery state without owning an encoder or
+stream-session pointer. Bitrate rebuilds preserve it; full encoder reinitialization
+gets a fresh state, so old packets cannot acknowledge a new encoder's recovery.
+Pruning while enqueuing an already-IDR output marks that output as outstanding
+without requesting an additional IDR.
+
+This bounded policy uses IDR rather than RFI. The existing client RFI interface
+takes a fixed range of submitted frame numbers; it does not track the last
+broadcast-sent reference or extend an in-flight recovery as later queue pruning
+expands the missing range. Passing only the first superseded range would
+under-invalidate references. Adding that reference tracking is outside this fix.
 Drops occur before RTP sequence assignment, so they create frame-number gaps
 without transport sequence gaps. Host ABR still acts on the client's
 `packetLoss` value, not `droppedFrames`. Excluding positively identified unsent
