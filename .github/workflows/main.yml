@@ -63,6 +63,9 @@ jobs:
           # Fork releases locate their upstream base release by ancestry.
           fetch-depth: ${{ github.repository == 'AlkaidLab/foundation-sunshine' && 1 || 0 }}
 
+      - name: Test fork release version gates
+        run: python3 -m unittest discover -s tests/tools -p test_fork_release_version.py
+
       - name: Setup Release (Auto)
         id: setup_release_auto
         if: github.event_name != 'workflow_dispatch'
@@ -84,10 +87,8 @@ jobs:
 
       - name: Setup Release (Fork)
         id: setup_release_fork
-        # A fork release is versioned as the newest upstream release contained
-        # in this commit plus the run number: v<base>.<run>. The updater's
-        # numeric comparison then orders it after its upstream base and fork
-        # releases on that base, and before the next upstream release.
+        # Preserve stable fork ancestry even when upstream removes a release.
+        # Numeric ordering is gated here and again immediately before publish.
         if: >-
           github.event_name == 'workflow_dispatch' &&
           github.repository != 'AlkaidLab/foundation-sunshine' &&
@@ -96,24 +97,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          base=""
-          while read -r tag sha; do
-            [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
-            if git merge-base --is-ancestor "$sha" HEAD 2>/dev/null; then
-              base="$tag"
-              break
-            fi
-          done < <(gh api "repos/AlkaidLab/foundation-sunshine/releases?per_page=100" \
-            --jq '.[] | select(.draft | not) | select(.tag_name | test("^v[0-9]+[.][0-9]+[.][0-9]+")) | "\(.tag_name) \(.target_commitish)"')
-          if [[ ! "$base" =~ ^v([0-9]+[.][0-9]+[.][0-9]+) ]]; then
-            echo "No upstream release is an ancestor of ${GITHUB_SHA}"
-            exit 1
-          fi
-          tag="v${BASH_REMATCH[1]}.${GITHUB_RUN_NUMBER}"
-          echo "Fork release ${tag} on upstream ${base}"
+          gh api --paginate --slurp "repos/AlkaidLab/foundation-sunshine/releases?per_page=100" > "$RUNNER_TEMP/upstream-releases.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RUNNER_TEMP/fork-releases.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" > "$RUNNER_TEMP/latest-release.json"
+          tag=$(python3 scripts/fork-release-version.py \
+            --upstream "$RUNNER_TEMP/upstream-releases.json" \
+            --fork "$RUNNER_TEMP/fork-releases.json" \
+            --latest "$RUNNER_TEMP/latest-release.json" \
+            --run-number "$GITHUB_RUN_NUMBER")
+          echo "Fork release ${tag}, preserving reachable release lineage"
           echo "fork_release=true" >> $GITHUB_OUTPUT
           echo "publish_release=false" >> $GITHUB_OUTPUT
-          echo "release_body=Fork build of ${GITHUB_REF_NAME} (${GITHUB_SHA}) on upstream ${base}" >> $GITHUB_OUTPUT
+          echo "release_body=Fork build of ${GITHUB_REF_NAME} (${GITHUB_SHA}), preserving reachable release lineage" >> $GITHUB_OUTPUT
           echo "release_commit=${GITHUB_SHA}" >> $GITHUB_OUTPUT
           echo "release_generate_release_notes=false" >> $GITHUB_OUTPUT
           echo "release_tag=${tag}" >> $GITHUB_OUTPUT
@@ -660,6 +655,9 @@ jobs:
       actions: read
       contents: write
     steps:
+      - name: Checkout release version gate
+        uses: actions/checkout@v7
+
       - name: Publish GitHub Release
         # Same tag as the version stamped into Sunshine and the DualSense
         # sidecar manifest. Published as the latest stable release so the
@@ -675,6 +673,9 @@ jobs:
           gh run download "${{ github.run_id }}" --repo "$GITHUB_REPOSITORY" \
             --name "sunshine-windows-r${{ github.run_number }}" --dir artifacts
           ls -l artifacts
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" > "$RUNNER_TEMP/latest-release.json"
+          python3 scripts/fork-release-version.py --candidate "$TAG" \
+            --latest "$RUNNER_TEMP/latest-release.json"
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
           else
