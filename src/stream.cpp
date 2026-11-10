@@ -3986,8 +3986,11 @@ namespace stream {
 
               frame_send_batch_latency_logger.first_point_now();
               const auto send_begin = std::chrono::steady_clock::now();
+              // The batch is one WSASendMsg call; the fallback loop is timed per packet below.
               // Use a batched send if it's supported on this platform
-              if (!platf::send_batch(batch_info)) {
+              const bool batch_ok = platf::send_batch(batch_info);
+              stall_telemetry.note_send(std::chrono::steady_clock::now() - send_begin);
+              if (!batch_ok) {
                 // Batched send is not available, so send each packet individually
                 BOOST_LOG(verbose) << "Falling back to unbatched send"sv;
                 for (auto y = 0; y < current_batch_size; y++) {
@@ -4003,7 +4006,10 @@ namespace stream {
                   };
 
                   // A failed batch alone is expected where USO is unavailable; only count failed single sends.
-                  if (!platf::send(send_info)) {
+                  const auto single_begin = std::chrono::steady_clock::now();
+                  const bool single_ok = platf::send(send_info);
+                  stall_telemetry.note_send(std::chrono::steady_clock::now() - single_begin);
+                  if (!single_ok) {
 #ifdef _WIN32
                     stall_telemetry.note_send_failure(WSAGetLastError());
 #else
@@ -4012,7 +4018,6 @@ namespace stream {
                   }
                 }
               }
-              stall_telemetry.note_send(std::chrono::steady_clock::now() - send_begin);
               frame_send_batch_latency_logger.second_point_now_and_log();
 
               ratecontrol_group_packets_sent += current_batch_size;

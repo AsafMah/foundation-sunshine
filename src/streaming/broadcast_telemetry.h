@@ -32,6 +32,7 @@ namespace stream::telemetry {
     nanoseconds cpu {};
     std::uint64_t iterations = 0;
     std::uint64_t send_failures = 0;
+    std::uint64_t send_would_block = 0;
     int last_send_error = 0;
   };
 
@@ -48,9 +49,9 @@ namespace stream::telemetry {
     const auto wall_ms = to_ms(r.window);
     out << "Broadcast stall telemetry: window=" << wall_ms << "ms iterations=" << r.iterations
         << " max_iteration=" << to_ms(r.max_iteration) << "ms max_send=" << to_ms(r.max_send)
-        << "ms max_queue_age_at_pop=" << to_ms(r.max_queue_age) << "ms max_lock_wait=" << to_ms(r.max_lock_wait)
+        << "ms max_queue_age_at_pop=" << to_ms(r.max_queue_age) << "ms max_shared_call=" << to_ms(r.max_lock_wait)
         << "ms thread_cpu=" << to_ms(r.cpu) << "ms cpu_wall_ratio=" << (wall_ms > 0 ? to_ms(r.cpu) / wall_ms : 0.0)
-        << " send_failures=" << r.send_failures << " last_send_error=" << r.last_send_error;
+        << " send_failures=" << r.send_failures << " send_would_block=" << r.send_would_block << " last_send_error=" << r.last_send_error;
     return out.str();
   }
 
@@ -83,6 +84,9 @@ namespace stream::telemetry {
     void
     note_send_failure(int error) {
       ++current.send_failures;
+      if (error == 10035 || error == 11) {  // WSAEWOULDBLOCK / EAGAIN
+        ++current.send_would_block;
+      }
       current.last_send_error = error;
     }
 
