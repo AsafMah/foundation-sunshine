@@ -29,9 +29,10 @@ def select(upstream, fork, latest, run_number, is_ancestor):
     if not isinstance(run_number, int) or run_number <= 0:
         raise ValueError("Run number must be positive")
     bases = []
-    for releases, components in ((upstream, 3), (fork, 4)):
+    for releases, components, allow_prerelease in ((upstream, 3, True), (fork, 4, False)):
         for release in releases:
-            if release.get("draft") or release.get("prerelease"):
+            # Upstream publishes its builds as prereleases; fork prereleases are retracted labels.
+            if release.get("draft") or (release.get("prerelease") and not allow_prerelease):
                 continue
             tag = release.get("tag_name", "")
             if not VERSION.fullmatch(tag):

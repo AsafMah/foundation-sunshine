@@ -28,6 +28,22 @@ class ForkReleaseVersionTests(unittest.TestCase):
             upstream, fork, fork[0]["tag_name"], 17, ancestors.__contains__),
             "v2026.1103.100831.17")
 
+    def test_merged_upstream_prerelease_supplies_the_base(self):
+        # Actual API metadata on 2026-11-10: every upstream release after 1031 is a prerelease.
+        upstream = [
+            release("v2026.1107.122135.杂鱼", "79423092eda6ccd011e58d04236c8f16e02765c5", prerelease=True),
+            release("v2026.1031.121458.杂鱼", "204a96826606b3a34cf2cd813aed0f0a9bba7db0"),
+        ]
+        fork = [
+            release("v2026.1103.100831.17.杂鱼", "747441039073628df3336cbf6b4bded6b0d0472e"),
+            release("v2026.1031.121458.16.杂鱼", "09a35eb5" + "0" * 32, prerelease=True),
+        ]
+        ancestors = {upstream[0]["target_commitish"], upstream[1]["target_commitish"],
+                     fork[0]["target_commitish"], fork[1]["target_commitish"]}
+        self.assertEqual(release_version.select(
+            upstream, fork, fork[0]["tag_name"], 19, ancestors.__contains__),
+            "v2026.1107.122135.19")
+
     def test_selection_uses_maximum_not_api_order(self):
         items = [release("v2026.1031.121458", "a" * 40), release("v2026.1103.100831.杂鱼", "b" * 40)]
         self.assertEqual(release_version.select(items, [], "v2026.1031.121458.14", 17, lambda _: True),
