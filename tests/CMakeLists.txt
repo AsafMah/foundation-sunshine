@@ -647,6 +647,10 @@ if(Python3_Interpreter_FOUND)
                 --source "${CMAKE_SOURCE_DIR}" --cmake "${CMAKE_COMMAND}"
                 --compiler "${CMAKE_CXX_COMPILER}")
     set_tests_properties(cmake_configuration_tests PROPERTIES TIMEOUT 180)
+    add_test(NAME protocol_flag_registry_tests
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tests/tools/test_protocol_flag_registry.py"
+                --source "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(protocol_flag_registry_tests PROPERTIES TIMEOUT 60)
 endif()
 find_program(REVERSE_TUNNEL_OPENSSL_EXECUTABLE openssl)
 if (Python3_Interpreter_FOUND AND REVERSE_TUNNEL_OPENSSL_EXECUTABLE)

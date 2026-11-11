@@ -8,8 +8,8 @@ namespace ri = streaming::restart_intent;
 
 TEST(RestartIntent, ConstantsMatchTheAgreedCommonCContract) {
   EXPECT_EQ(ri::SS_TERMINATION_HOST_RESTART_V1, 0x53535201u);
-  EXPECT_EQ(ri::LI_FF_HOST_RESTART, 0x00008000u);
-  EXPECT_EQ(ri::ML_FF_HOST_RESTART, 0x00008000u);
+  EXPECT_EQ(ri::LI_FF_HOST_RESTART, 0x00004000u);
+  EXPECT_EQ(ri::ML_FF_HOST_RESTART, 0x00004000u);
   EXPECT_EQ(ri::LI_HOST_RESTART_PROTOCOL_VERSION, 1u);
   EXPECT_EQ(ri::HOST_VERSION_ATTRIBUTE, "x-ss-restart.protocolVersion");
   EXPECT_EQ(ri::CLIENT_VERSION_ATTRIBUTE, "x-ml-restart.protocolVersion");
@@ -30,7 +30,8 @@ TEST(RestartIntent, LockStateAndRestartNegotiateIndependently) {
 }
 
 TEST(RestartIntent, LegacyClientCannotNegotiateRestartOnTheNewHost) {
-  for (const auto legacy_client_restart : { 0x100u, 0x200u }) {
+  // 0x8000 is now upstream ML_FF_ENDPOINT_AUTO_REFRESH and must not negotiate restart.
+  for (const auto legacy_client_restart : { 0x100u, 0x200u, 0x8000u }) {
     const bool accepted = ri::accepts_restart(true, true, legacy_client_restart, "1", true);
     EXPECT_FALSE(accepted);
     EXPECT_EQ(ri::termination_reason(true, accepted, false), ri::GRACEFUL_TERMINATION);

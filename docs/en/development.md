@@ -46,16 +46,21 @@ a migration.
 
 The fork-reserved v1 capability allocations are:
 `SS_TERMINATION_HOST_RESTART_V1=0x53535201`,
-`LI_FF_HOST_RESTART=0x8000`, `ML_FF_HOST_RESTART=0x8000`, and
+`LI_FF_HOST_RESTART=0x4000`, `ML_FF_HOST_RESTART=0x4000`, and
 `LI_HOST_RESTART_PROTOCOL_VERSION=1`. Host and client must both negotiate their
 feature bit and `x-ss-restart.protocolVersion:1` /
 `x-ml-restart.protocolVersion:1`, with encrypted control. Only an accepted
 session receives restart reason bytes `53 53 52 01`; genuine stops and legacy
 sessions retain `80 03 00 23`. No packet layout or existing encryption changes.
 
-Upstream's protocol extension registry reserves `0x8000` downward for fork
-extensions; host-session lock state retains host bit `0x800` / client bit `0x100`.
-Earlier fork releases used `0x800`/`0x100` and then `0x1000`/`0x200`; there is
+Upstream's protocol extension registry
+(`third-party/moonlight-common-c/docs/protocol-extension-registry.md`) allocates
+fork extensions from `0x8000` downward and assigns `0x8000` to endpoint auto
+refresh, so restart uses the next free bit, `0x4000`. Host-session lock state
+retains host bit `0x800` / client bit `0x100`. `protocol_flag_registry_tests`
+fails if a host flag reuses a registry value under another name or two host
+capabilities share a bit. Earlier fork releases used `0x800`/`0x100`,
+`0x1000`/`0x200` and then `0x8000`/`0x8000`; there is
 deliberately no legacy-bit alias. Ship the matching Moonlight/common-c update
 first. Clients with either earlier allocation lose restart-intent negotiation
 and receive ordinary termination; older receivers ignore the unknown `0x550E`

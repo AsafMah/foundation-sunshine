@@ -44,15 +44,18 @@ RTSP 重启能力之前验证 SYSTEM 身份和事件句柄；便携启动不提�
 
 fork 保留的 v1 能力位为：
 `SS_TERMINATION_HOST_RESTART_V1=0x53535201`、
-`LI_FF_HOST_RESTART=0x8000`、`ML_FF_HOST_RESTART=0x8000`、
+`LI_FF_HOST_RESTART=0x4000`、`ML_FF_HOST_RESTART=0x4000`、
 `LI_HOST_RESTART_PROTOCOL_VERSION=1`。双方必须协商各自的能力位、
 `x-ss-restart.protocolVersion:1` / `x-ml-restart.protocolVersion:1`
 及加密控制通道。只有接受协议的会话收到 `53 53 52 01`；
 真正停止及旧客户端保持 `80 03 00 23`，不改变现有包布局或加密方式。
 
-上游协议扩展注册表为 fork 扩展从 `0x8000` 向下分配；上游会话锁定状态
-保留主机位 `0x800` / 客户端位 `0x100`。早期 fork 版本使用过
-`0x800`/`0x100` 和 `0x1000`/`0x200`；此处不提供旧位别名，避免错误协商。
+上游协议扩展注册表（`third-party/moonlight-common-c/docs/protocol-extension-registry.md`）
+为 fork 扩展从 `0x8000` 向下分配，并已将 `0x8000` 分配给端点自动刷新，
+因此重启协议使用下一个空闲位 `0x4000`。上游会话锁定状态保留主机位 `0x800` /
+客户端位 `0x100`。若主机标志以其他名称复用注册表中的值，或两个主机能力共享同一位，
+`protocol_flag_registry_tests` 会失败。早期 fork 版本使用过 `0x800`/`0x100`、
+`0x1000`/`0x200` 及 `0x8000`/`0x8000`；此处不提供旧位别名，避免错误协商。
 先发布配套 Moonlight/common-c 更新。使用早期分配的客户端无法协商重启协议，
 仍收到普通终止原因；旧接收分派忽略未知的 `0x550E` 锁定状态包。
 
