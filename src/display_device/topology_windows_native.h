@@ -125,6 +125,11 @@ namespace display_device::topology {
     std::optional<std::uint32_t> problem;
     /** The monitor devnodes and display paths of the driver, as one line for the log. */
     std::string detail;
+    /**
+     * How many raw display paths on the driver's adapter are active, listed in the inventory or not (a head whose
+     * monitor device is disabled stays active but is never listed); nullopt when they cannot be read.
+     */
+    std::optional<std::size_t> active_driver_paths;
   };
 
   /**
@@ -253,6 +258,10 @@ namespace display_device::topology {
     /** Reads the device database now (`native_edge_t::describe_missing_head`). */
     std::string
     explain_missing_head(const head_guid_t &intent) override;
+
+    /** Waits (bounded) until no monitor device of `intents` is present and no display path of the driver is active. */
+    std::optional<std::string>
+    heads_remain(const std::vector<head_guid_t> &intents) override;
 
   private:
     result_t<creation_delivery_e>

@@ -240,6 +240,36 @@ namespace display_device::topology {
     return missing_head_explanation(edge_.describe_missing_head(intent));
   }
 
+  std::optional<std::string>
+  windows_native_platform_t::heads_remain(const std::vector<head_guid_t> &intents) {
+    // Read until both are gone: a monitor's departure completes asynchronously after DESTROYMONITOR returns.
+    const auto start = edge_.now();
+    while (true) {
+      std::string remains;
+      std::optional<std::size_t> active;
+      bool unreadable = false;
+      for (const auto &intent : intents) {
+        const auto report = edge_.describe_missing_head(intent);
+        if (!report.monitor_present || !report.active_driver_paths) unreadable = true;
+        if (report.monitor_present && *report.monitor_present) {
+          remains += "the monitor device of virtual display " + format_guid(intent.value) + " is still present" +
+                     (report.problem ? " (device problem " + std::to_string(*report.problem) + ")" : std::string {}) + "; ";
+        }
+        if (report.active_driver_paths) active = std::max(active.value_or(0), *report.active_driver_paths);
+      }
+      if (active && *active > 0) {
+        remains += std::to_string(*active) + (*active == 1 ? " display path" : " display paths") + " still active on the ZakoVDD adapter; ";
+      }
+      if (unreadable) remains += "the device or display database could not be read; ";
+      if (remains.empty()) return std::nullopt;
+      if (edge_.now() - start >= options_.wait) {
+        remains.resize(remains.size() - 2);
+        return remains;
+      }
+      edge_.sleep(options_.poll);
+    }
+  }
+
   std::optional<std::uint32_t>
   windows_native_platform_t::head_capacity() const {
     return options_.head_capacity ? options_.head_capacity() : std::nullopt;

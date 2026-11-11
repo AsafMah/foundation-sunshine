@@ -314,10 +314,12 @@ namespace display_device::topology::win32_edge {
     // when they are not valid (a hidden target may have no monitor path or name at all).
     if (const auto data = w_utils::query_display_config(w_utils::ALL_DEVICES)) {
       std::size_t named = 0;
+      std::size_t active = 0;
       for (const auto &path : data->paths) {
         const auto friendly = w_utils::get_friendly_name(path);
         const auto monitor = w_utils::get_monitor_device_path(path);
         if (!zako_adapter(path.targetInfo.adapterId) && !contains_ignoring_case(monitor, "zak") && !contains_ignoring_case(friendly, "zako")) continue;
+        if (w_utils::is_active(path)) ++active;
         if (++named > 12) continue;
         const auto &adapter = path.targetInfo.adapterId;
         detail += "path target=" + std::to_string(path.targetInfo.id) + " adapter=" + hex32(static_cast<std::uint32_t>(adapter.HighPart)) + ":" +
@@ -329,6 +331,7 @@ namespace display_device::topology::win32_edge {
       }
       detail += std::to_string(named) + " of " + std::to_string(data->paths.size()) + " display paths are on the ZakoVDD adapter or name its monitor" +
                 (named > 12 ? " (first 12 shown)" : "");
+      report.active_driver_paths = active;
     }
     else {
       detail += "display paths unreadable";

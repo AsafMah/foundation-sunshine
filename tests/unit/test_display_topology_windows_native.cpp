@@ -11,6 +11,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <map>
@@ -209,6 +210,9 @@ namespace {
       const bool disabled = std::ranges::find(disabled_monitors, intent) != disabled_monitors.end();
       dt::missing_head_report_t report { listed || hidden || disabled, std::nullopt, "fake monitors=" + std::to_string(hidden_monitors.size()) };
       if (disabled) report.problem = 22;
+      report.active_driver_paths = unlisted_active_paths + static_cast<std::size_t>(std::ranges::count_if(displays, [](const auto &display) {
+        return display.kind == head_class_e::driver_head && display.layout.has_value();
+      }));
       return report;
     }
 
@@ -223,9 +227,13 @@ namespace {
       clock += duration;
     }
 
+    /** A delivered DESTROYMONITOR whose departures succeed: every monitor of the driver goes, listed or not. */
     void
     drop_heads() {
       std::erase_if(displays, [](const auto &display) { return display.kind == head_class_e::driver_head; });
+      hidden_monitors.clear();
+      disabled_monitors.clear();
+      unlisted_active_paths = 0;
     }
 
     bool available { true };
@@ -263,6 +271,8 @@ namespace {
     std::vector<dt::head_guid_t> hidden_monitors;
     /** Monitors the driver created whose device another program disabled (CM_PROB_DISABLED). */
     std::vector<dt::head_guid_t> disabled_monitors;
+    /** Active display paths on the driver's adapter that the inventory cannot list (a disabled monitor's head). */
+    std::size_t unlisted_active_paths {};
     std::vector<dt::head_guid_t> described;
   };
 
@@ -1462,4 +1472,113 @@ TEST_F(WindowsNative, AHeadWhoseMonitorIsDisabledIsRefusedNamingTheDisabledDevic
   EXPECT_TRUE(mentions(prepared.reason, "no virtual display appeared: its monitor device is disabled (CM_PROB_DISABLED)")) << prepared.reason;
   EXPECT_EQ(edge.destroys, 1);
   EXPECT_FALSE(store.bytes);
+}
+
+namespace {
+  /** gh-all run 20261109-174516 as review of 47f5326d read it: the head's monitor device is disabled, so the head is never
+   * listed, yet its path stays active on the driver's adapter; DESTROYMONITOR is delivered and changes neither. */
+  void
+  disabled_head_survives_removal(fake_edge_t &edge, bool monitor_stays, std::size_t active_paths) {
+    edge.on_create = [&edge, active_paths](const dt::head_guid_t &intent) {
+      edge.disabled_monitors.push_back(intent);
+      edge.unlisted_active_paths = active_paths;
+      return dt::edge_send_t { edge_delivery_e::delivered, {} };
+    };
+    edge.on_destroy = [&edge, monitor_stays] {
+      if (!monitor_stays) edge.disabled_monitors.clear();
+      return dt::edge_send_t { edge_delivery_e::delivered, {} };
+    };
+  }
+
+  bool
+  create_still_attempted(const memory_store_t &store) {
+    const auto record = store.record();
+    return record && std::ranges::any_of(record->steps, [](const dt::journal_step_t &step) {
+      return step.operation == dt::journal_operation_e::create_head && step.state == dt::journal_step_state_e::attempted;
+    });
+  }
+}  // namespace
+
+TEST_F(WindowsNative, ARollbackWhoseDisabledHeadStaysActiveOnTheDriverAdapterIsLeftUnresolved) {
+  disabled_head_survives_removal(edge, true, 1);
+  memory_store_t store;
+  dt::native_executor_t executor { store, platform, { next_uuid, 2, driver() } };
+  const auto prepared = prepare_with(executor);
+  EXPECT_EQ(prepared.verdict, native_verdict_e::conflict) << prepared.reason;
+  EXPECT_TRUE(mentions(prepared.reason, "its removal could not be confirmed")) << prepared.reason;
+  EXPECT_TRUE(mentions(prepared.reason, "1 display path still active on the ZakoVDD adapter")) << prepared.reason;
+  EXPECT_TRUE(mentions(prepared.reason, "is still present (device problem 22)")) << prepared.reason;
+  EXPECT_EQ(edge.destroys, 1);
+  EXPECT_TRUE(create_still_attempted(store)) << "the creation is not settled as removed while its head is on the desktop";
+  // A later restore sees no listed head either, and must not clear the journal over it.
+  const auto restored = restore_with(executor);
+  EXPECT_EQ(restored.verdict, native_verdict_e::conflict) << restored.reason;
+  EXPECT_TRUE(mentions(restored.reason, "left unresolved (unconfirmed virtual display creation)")) << restored.reason;
+  EXPECT_TRUE(create_still_attempted(store));
+}
+
+TEST_F(WindowsNative, ARestoreAfterTheHeadsMonitorWasDisabledMidStreamKeepsTheJournal) {
+  // Prepared fine; then a program disables the head's monitor device, so the head leaves the list but stays active.
+  memory_store_t store;
+  dt::native_executor_t executor { store, platform, { next_uuid, 2, driver() } };
+  ASSERT_EQ(prepare_with(executor).verdict, native_verdict_e::ok);
+  for (const auto &display : edge.displays) {
+    if (display.kind == head_class_e::driver_head && display.container) edge.disabled_monitors.push_back(dt::head_guid_t { *display.container });
+  }
+  std::erase_if(edge.displays, [](const auto &display) { return display.kind == head_class_e::driver_head; });
+  edge.unlisted_active_paths = 1;
+  const auto restored = restore_with(executor);
+  EXPECT_EQ(restored.verdict, native_verdict_e::conflict) << restored.reason;
+  EXPECT_TRUE(mentions(restored.reason, "is not listed but not gone either")) << restored.reason;
+  EXPECT_TRUE(store.bytes) << "the journal is kept";
+  EXPECT_EQ(edge.destroys, 0) << "a head the inventory cannot see is not removed blind";
+}
+
+TEST_F(WindowsNative, RemovalIsConfirmedOnlyWhenNeitherTheMonitorNorADriverPathRemains) {
+  for (const auto &[monitor_stays, paths, confirmed] : std::vector<std::tuple<bool, std::size_t, bool>> {
+         { true, 0, false }, { false, 1, false }, { false, 0, true } }) {
+    fake_edge_t local;
+    disabled_head_survives_removal(local, monitor_stays, paths);
+    dt::windows_native_platform_t local_platform { local, options() };
+    memory_store_t store;
+    dt::native_executor_t executor { store, local_platform, { next_uuid, 2, driver() } };
+    const auto prepared = prepare_with(executor);
+    const auto shape = "monitor_stays=" + std::to_string(monitor_stays) + " paths=" + std::to_string(paths) + ": " + prepared.reason;
+    if (confirmed) {
+      EXPECT_EQ(prepared.verdict, native_verdict_e::refused) << shape;
+      EXPECT_FALSE(store.bytes) << shape;
+    }
+    else {
+      EXPECT_EQ(prepared.verdict, native_verdict_e::conflict) << shape;
+      EXPECT_TRUE(create_still_attempted(store)) << shape;
+    }
+  }
+}
+
+TEST_F(WindowsNative, AnUnreadableDeviceDatabaseDoesNotConfirmARemoval) {
+  disabled_head_survives_removal(edge, false, 0);
+  edge.describes = false;
+  memory_store_t store;
+  dt::native_executor_t executor { store, platform, { next_uuid, 2, driver() } };
+  const auto prepared = prepare_with(executor);
+  EXPECT_EQ(prepared.verdict, native_verdict_e::conflict) << prepared.reason;
+  EXPECT_TRUE(mentions(prepared.reason, "could not be read")) << prepared.reason;
+  EXPECT_TRUE(create_still_attempted(store));
+}
+TEST_F(WindowsNative, ARestoreWhoseRemovedHeadLeavesItsMonitorBehindKeepsTheJournal) {
+  memory_store_t store;
+  dt::native_executor_t executor { store, platform, { next_uuid, 2, driver() } };
+  ASSERT_EQ(prepare_with(executor).verdict, native_verdict_e::ok);
+  edge.on_destroy = [&] {
+    // The head leaves the list, but its monitor device stays: disabled while the departure was under way.
+    for (const auto &display : edge.displays) {
+      if (display.kind == head_class_e::driver_head && display.container) edge.disabled_monitors.push_back(dt::head_guid_t { *display.container });
+    }
+    std::erase_if(edge.displays, [](const auto &display) { return display.kind == head_class_e::driver_head; });
+    return dt::edge_send_t { edge_delivery_e::delivered, {} };
+  };
+  const auto restored = restore_with(executor);
+  EXPECT_EQ(restored.verdict, native_verdict_e::conflict) << restored.reason;
+  EXPECT_TRUE(mentions(restored.reason, "removal could not be confirmed")) << restored.reason;
+  EXPECT_TRUE(store.bytes) << "the journal is kept";
 }

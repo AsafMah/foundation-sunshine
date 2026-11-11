@@ -102,6 +102,16 @@ namespace display_device::topology {
       return {};
     }
 
+    /**
+     * After every head was removed and none is listed: why the removal of the heads of `intents` is still not
+     * confirmed by what the host shows beyond the inventory, or nullopt when it is. A head whose monitor device is
+     * disabled is never listed but can stay on the desktop (gh-all run 20261109-174516). Reads only.
+     */
+    virtual std::optional<std::string>
+    heads_remain(const std::vector<head_guid_t> &) {
+      return std::nullopt;
+    }
+
     /** How many heads the driver can show at once, or nullopt when unknown (then nothing is refused for it). */
     virtual std::optional<std::uint32_t>
     head_capacity() const {

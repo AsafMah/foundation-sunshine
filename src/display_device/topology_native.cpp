@@ -535,6 +535,19 @@ namespace display_device::topology {
       });
     }
 
+    /** The GUIDs of every creation that was sent and not settled as failed: heads that may exist. */
+    std::vector<head_guid_t>
+    sent_creations(const journal_record_t &record) {
+      std::vector<head_guid_t> intents;
+      for (const auto &step : record.steps) {
+        if (step.operation == journal_operation_e::create_head && step.head_intent && step.state != journal_step_state_e::planned &&
+            step.state != journal_step_state_e::failed) {
+          intents.push_back(*step.head_intent);
+        }
+      }
+      return intents;
+    }
+
     const journal_step_t *
     observed_create(const journal_record_t &record) {
       const auto it = std::find_if(record.steps.rbegin(), record.steps.rend(), [](const journal_step_t &step) {
@@ -1205,8 +1218,13 @@ namespace display_device::topology {
     if (!after.available || !virtual_heads(platform_, after).empty()) {
       return conflict(why + "; its removal could not be confirmed");
     }
-    // The driver's list is empty now, so no request of this run can still appear: its creations are settled. If the
-    // layout cannot be put back below, a later restore retries just that (gh-all run 20261109-174516).
+    // A head whose monitor device is disabled is never listed but can stay on the desktop, so an empty list alone does
+    // not settle the creations (review of 47f5326d): the journal keeps them until the host shows them gone.
+    if (const auto remains = platform_.heads_remain(sent_creations(record))) {
+      return conflict(why + "; its removal could not be confirmed: " + *remains);
+    }
+    // No head of this run is listed or left, so no request of this run can still appear: its creations are settled. If
+    // the layout cannot be put back below, a later restore retries just that (gh-all run 20261109-174516).
     auto settled = record;
     bool resolved = false;
     for (auto &step : settled.steps) {
@@ -1644,6 +1662,9 @@ namespace display_device::topology {
       }
     }
     if (restores.empty() && owned_displays.empty()) {
+      if (const auto remains = platform_.heads_remain(sent_creations(record))) {
+        return conflict("A virtual display this host created is not listed but not gone either, so the native journal is kept: " + *remains);
+      }
       // Nothing was written, so the first observation is the readback.
       auto now = current;
       if (const auto error = put_back(capability, record, now, "Other displays differ from the baseline, so the native journal is kept", true)) {
@@ -1670,6 +1691,9 @@ namespace display_device::topology {
     }
     if (!owned_displays.empty() && !virtual_heads(platform_, after).empty()) {
       return conflict("The virtual display is still present after its removal");
+    }
+    if (const auto remains = platform_.heads_remain(sent_creations(record))) {
+      return conflict("The virtual display's removal could not be confirmed, so the native journal is kept: " + *remains);
     }
     if (const auto error = put_back(capability, record, after, "Other displays differ from the baseline after restoring", true)) {
       return conflict(*error);
