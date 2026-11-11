@@ -67,6 +67,7 @@ extern "C" {
 #include "network.h"
 #include "rtsp.h"
 #include "stream.h"
+#include "streaming/broadcast_telemetry.h"
 #include "streaming/fec.h"
 #include "streaming/perf_recorder.h"
 #include "streaming/restart_intent.h"
@@ -216,6 +217,27 @@ namespace stream {
     float
     read_dynamic_param_f32(std::string_view payload, std::size_t offset) {
       return std::bit_cast<float>(read_dynamic_param_u32(payload, offset));
+    }
+
+    // Cumulative CPU time (user+kernel) of the calling thread, for stall telemetry.
+    std::chrono::nanoseconds
+    current_thread_cpu_time() {
+#ifdef _WIN32
+      FILETIME created, exited, kernel, user;
+      if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) {
+        return {};
+      }
+      const auto to_100ns = [](const FILETIME &ft) {
+        return (static_cast<std::uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+      };
+      return std::chrono::nanoseconds((to_100ns(kernel) + to_100ns(user)) * 100);
+#else
+      timespec ts;
+      if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) {
+        return {};
+      }
+      return std::chrono::seconds(ts.tv_sec) + std::chrono::nanoseconds(ts.tv_nsec);
+#endif
     }
 
     std::int64_t
@@ -3679,10 +3701,42 @@ namespace stream {
 
     auto ratecontrol_next_frame_start = std::chrono::steady_clock::now();
 
+    stream::telemetry::broadcast_telemetry_t stall_telemetry { std::chrono::steady_clock::now(), current_thread_cpu_time() };
+    const auto timed_lock_wait = [&](auto &&fn) -> decltype(auto) {
+      const auto begin = std::chrono::steady_clock::now();
+      struct finish_t {
+        decltype(stall_telemetry) &telemetry;
+        std::chrono::steady_clock::time_point begin;
+        ~finish_t() { telemetry.note_lock_wait(std::chrono::steady_clock::now() - begin); }
+      } finish { stall_telemetry, begin };
+      return fn();
+    };
+
     while (auto packet = video::pop_packet(packets)) {
       if (shutdown_event->peek()) {
         break;
       }
+
+      const auto iteration_start = std::chrono::steady_clock::now();
+      stall_telemetry.note_queue_age(iteration_start - packet->queued_at);
+      // Observation only: runs on every exit from this iteration, including continue.
+      struct iteration_end_t {
+        decltype(stall_telemetry) &telemetry;
+        std::chrono::steady_clock::time_point start;
+        udp::socket &sock;
+        ~iteration_end_t() {
+          const auto now = std::chrono::steady_clock::now();
+          telemetry.note_iteration(now - start);
+          if (auto report = telemetry.poll(now, current_thread_cpu_time())) {
+            int sndbuf = 0;
+#ifdef _WIN32
+            int len = sizeof(sndbuf);
+            getsockopt((SOCKET) sock.native_handle(), SOL_SOCKET, SO_SNDBUF, (char *) &sndbuf, &len);
+#endif
+            BOOST_LOG(warning) << stream::telemetry::format(*report) << " so_sndbuf=" << sndbuf;
+          }
+        }
+      } iteration_end { stall_telemetry, iteration_start, sock };
 
       frame_network_latency_logger.first_point_now();
 
@@ -3763,7 +3817,7 @@ namespace stream {
         uint16_t latency = duration_to_latency(frame_dequeue_time - *processing_start);
         frame_header.frame_processing_latency = latency;
         frame_processing_latency_logger.collect_and_log(latency / 10.);
-        perf::record_host_latency(session->launch_session_id, latency / 10., frame_dequeue_time);
+        timed_lock_wait([&] { perf::record_host_latency(session->launch_session_id, latency / 10., frame_dequeue_time); });
       }
       else {
         frame_header.frame_processing_latency = 0;
@@ -3787,7 +3841,7 @@ namespace stream {
         sample.packet_to_broadcast_ms = elapsed_ms(trace.packet_ready, std::optional { frame_dequeue_time });
         sample.total_ms = elapsed_ms(trace.capture_ready, std::optional { frame_dequeue_time });
         sample.pyrowave = trace.pyrowave;
-        perf::record_pipeline_sample(session->launch_session_id, sample, frame_dequeue_time);
+        timed_lock_wait([&] { perf::record_pipeline_sample(session->launch_session_id, sample, frame_dequeue_time); });
       }
 
       unsigned fecPercentage = 0;
@@ -3828,8 +3882,8 @@ namespace stream {
       const auto frame_data = (payload.size() + blocksize - 1) / blocksize;
       if (!is_pyrowave) {
         const auto now = steady_now_ms();
-        requested_fec = session->config.fec_control->percentage(frame_data, session->config.minRequiredFecPackets, now);
-        session->config.monitor.bitrate_budget->observe_fec(requested_fec, now);
+        requested_fec = timed_lock_wait([&] { return session->config.fec_control->percentage(frame_data, session->config.minRequiredFecPackets, now); });
+        timed_lock_wait([&] { session->config.monitor.bitrate_budget->observe_fec(requested_fec, now); });
         // Higher protection requires a successfully lowered encoder target.
         // Buffered frames retain the allowance from their own submission.
         fecPercentage = std::min(requested_fec, packet->fec_percentage);
@@ -3997,8 +4051,12 @@ namespace stream {
               batch_info.block_count = current_batch_size;
 
               frame_send_batch_latency_logger.first_point_now();
+              const auto send_begin = std::chrono::steady_clock::now();
+              // The batch is one WSASendMsg call; the fallback loop is timed per packet below.
               // Use a batched send if it's supported on this platform
-              if (!platf::send_batch(batch_info)) {
+              const bool batch_ok = platf::send_batch(batch_info);
+              stall_telemetry.note_send(std::chrono::steady_clock::now() - send_begin);
+              if (!batch_ok) {
                 // Batched send is not available, so send each packet individually
                 BOOST_LOG(verbose) << "Falling back to unbatched send"sv;
                 for (auto y = 0; y < current_batch_size; y++) {
@@ -4013,7 +4071,17 @@ namespace stream {
                     session->localAddress,
                   };
 
-                  platf::send(send_info);
+                  // A failed batch alone is expected where USO is unavailable; only count failed single sends.
+                  const auto single_begin = std::chrono::steady_clock::now();
+                  const bool single_ok = platf::send(send_info);
+                  stall_telemetry.note_send(std::chrono::steady_clock::now() - single_begin);
+                  if (!single_ok) {
+#ifdef _WIN32
+                    stall_telemetry.note_send_failure(WSAGetLastError());
+#else
+                    stall_telemetry.note_send_failure(errno);
+#endif
+                  }
                 }
               }
               frame_send_batch_latency_logger.second_point_now_and_log();

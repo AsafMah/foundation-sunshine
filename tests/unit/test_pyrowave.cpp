@@ -19,6 +19,7 @@
 #include "src/platform/windows/pyrowave/rate_control.h"
 #include "src/platform/windows/pyrowave/transport.h"
 #include "src/video_packet_queue.h"
+#include "src/streaming/broadcast_telemetry.h"
 #endif
 
 extern "C" {
@@ -1657,4 +1658,59 @@ TEST(PyrowaveSessionTest, FailedSessionCanNegotiateAgain) {
 
   EXPECT_EQ(session.negotiate(enabled_config(), supported_device(), supported_client()), pyrowave::failure_e::none);
   EXPECT_EQ(session.snapshot().state, pyrowave::session_state_e::prepared);
+}
+
+TEST(BroadcastTelemetryTest, QuietWindowIsNotReported) {
+  using namespace std::chrono_literals;
+  const auto t0 = stream::telemetry::clock_t::now();
+  stream::telemetry::broadcast_telemetry_t telemetry { t0 };
+  telemetry.note_iteration(2ms);
+  telemetry.note_send(1ms);
+  telemetry.note_queue_age(3ms);
+  telemetry.note_lock_wait(100us);
+  EXPECT_FALSE(telemetry.poll(t0 + 1s, 900ms));
+}
+
+TEST(BroadcastTelemetryTest, ReportWaitsForTheOneSecondWindowAndKeepsMaxima) {
+  using namespace std::chrono_literals;
+  const auto t0 = stream::telemetry::clock_t::now();
+  stream::telemetry::broadcast_telemetry_t telemetry { t0 };
+  telemetry.note_iteration(900ms);
+  telemetry.note_iteration(5ms);
+  EXPECT_FALSE(telemetry.poll(t0 + 500ms, 10ms));
+  const auto report = telemetry.poll(t0 + 1s, 20ms);
+  ASSERT_TRUE(report);
+  EXPECT_EQ(report->max_iteration, 900ms);
+  EXPECT_EQ(report->iterations, 2u);
+  EXPECT_EQ(report->window, 1s);
+}
+
+TEST(BroadcastTelemetryTest, SeparatesCpuStarvationFromBlocking) {
+  using namespace std::chrono_literals;
+  const auto t0 = stream::telemetry::clock_t::now();
+  stream::telemetry::broadcast_telemetry_t telemetry { t0, 5s };
+  telemetry.note_send(800ms);
+  telemetry.note_lock_wait(3ms);
+  telemetry.note_queue_age(40ms);
+  telemetry.note_send_failure(10035);
+  const auto report = telemetry.poll(t0 + 1s, 5s + 30ms);
+  ASSERT_TRUE(report);
+  EXPECT_EQ(report->cpu, 30ms);
+  EXPECT_EQ(report->max_send, 800ms);
+  EXPECT_EQ(report->max_lock_wait, 3ms);
+  EXPECT_EQ(report->max_queue_age, 40ms);
+  EXPECT_EQ(report->send_failures, 1u);
+  EXPECT_EQ(report->last_send_error, 10035);
+  const auto text = stream::telemetry::format(*report);
+  EXPECT_NE(text.find("max_send=800.00ms"), std::string::npos);
+  EXPECT_NE(text.find("last_send_error=10035"), std::string::npos);
+}
+
+TEST(BroadcastTelemetryTest, WindowResetsAfterReport) {
+  using namespace std::chrono_literals;
+  const auto t0 = stream::telemetry::clock_t::now();
+  stream::telemetry::broadcast_telemetry_t telemetry { t0 };
+  telemetry.note_lock_wait(50ms);
+  ASSERT_TRUE(telemetry.poll(t0 + 1s, 0ns));
+  EXPECT_FALSE(telemetry.poll(t0 + 2s, 0ns));
 }
