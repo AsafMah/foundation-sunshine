@@ -100,6 +100,16 @@ const importsOf = (source) => {
   return map
 }
 
+// Fork settings (AsafMah/foundation-sunshine) that have a switch on these pages but no search entry: the index is the pinned
+// upstream foundation-ui package's src/settings/searchIndex.js, which the fork does not patch. Value: the page with the switch
+// (web/tests/configKeys.test.js checks the switch is there).
+export const FORK_UNINDEXED = Object.freeze({
+  allow_client_resolution_change: 'configs/tabs/display/DisplayModes.vue',
+  clipboard_sync: 'configs/tabs/Inputs.vue',
+  file_transfer: 'configs/tabs/Inputs.vue',
+  file_upload: 'configs/tabs/Inputs.vue',
+})
+
 export function buildConfigIndex(tabsDir = TABS_DIR) {
   const entries = []
   const seen = new Set()
@@ -133,7 +143,7 @@ export function buildConfigIndex(tabsDir = TABS_DIR) {
       for (const [groupId, groupTitle] of groupKeys(tag)) {
         if (!seen.has(groupId)) { seen.add(groupId); entries.push({ id: groupId, title: groupTitle, path: pathOf(ctx), tab: ctx.tab, sub: ctx.sub }) }
       }
-      if (id && title && !seen.has(id)) {
+      if (id && title && !seen.has(id) && !(id in FORK_UNINDEXED)) {
         seen.add(id)
         entries.push({ id, title, path: pathOf(ctx), tab: ctx.tab, sub: ctx.sub })
       }

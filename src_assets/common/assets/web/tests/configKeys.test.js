@@ -45,15 +45,10 @@ const NO_CONTROL = Object.freeze({
   video_pacing_threshold: 'new with the poster and pacing work (bytes, 0 = off, default 65536): no control in the redesigned UI, set in the config file',
 })
 
-// Fork keys that DO have a switch (the fork sections of configs/tabs/Inputs.vue and configs/tabs/display/DisplayModes.vue) but no entry in the
-// settings search: the search index belongs to the pinned upstream foundation-ui package, which the fork does not patch.
-// Each must keep its switch; the test below checks that, so the exception cannot hide a key without a control.
-const FORK_UNINDEXED = Object.freeze({
-  allow_client_resolution_change: 'configs/tabs/display/DisplayModes.vue',
-  clipboard_sync: 'configs/tabs/Inputs.vue',
-  file_transfer: 'configs/tabs/Inputs.vue',
-  file_upload: 'configs/tabs/Inputs.vue',
-})
+// Fork keys that DO have a switch but no settings search entry (the index is the pinned upstream foundation-ui package's);
+// one list, shared with the index generator. Each must keep its switch: the last test checks it, so the exception cannot hide
+// a key without a control.
+const { FORK_UNINDEXED } = await import('../../../../../scripts/gen-config-index.mjs')
 
 const source = readFileSync(new URL('../../../../../src/config.cpp', import.meta.url), 'utf8')
 const hostKeys = [...new Set([...source.matchAll(/_f\(\s*vars,\s*"([a-z0-9_]+)"/g)].map((m) => m[1]))].sort()
