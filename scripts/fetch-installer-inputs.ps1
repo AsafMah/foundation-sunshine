@@ -6,8 +6,10 @@
 #            Microsoft's Authenticode signature (the worker runs it when the Runtime is missing)
 # A changed hash fails the step: bump installer-inputs.json deliberately, never fetch "latest".
 # usage: fetch-installer-inputs.ps1 -Destination <new dir>   -> <dir>/gui/, <dir>/MicrosoftEdgeWebview2Setup.exe
+# Forks pass -NoGui: they build the GUI from their own Panel submodule (scripts/build-fork-gui.ps1), so neither the pinned
+# upstream GUI nor the pin/submodule match applies; the WebView2 bootstrapper is still pinned and verified.
 
-param([Parameter(Mandatory)][string]$Destination)
+param([Parameter(Mandatory)][string]$Destination, [switch]$NoGui)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -22,6 +24,7 @@ function Get-Pinned([string]$Url, [string]$Path, [string]$Sha256) {
 if (Test-Path -LiteralPath $Destination) { throw 'Choose a fresh destination' }
 New-Item -ItemType Directory -Path $Destination | Out-Null
 
+if (-not $NoGui) {
 # The Panel pin and the committed Panel submodule must agree.
 $entry = git -C (Join-Path $PSScriptRoot '..') ls-tree HEAD src_assets/common/sunshine-control-panel
 if ($LASTEXITCODE -ne 0 -or $entry -notmatch '^160000 commit ([0-9a-f]{40})\s') { throw 'Unable to resolve the committed Panel submodule' }
@@ -37,6 +40,7 @@ foreach ($name in @('sunshine-gui.exe', 'alkaidlab-plugin-stylus.dll')) {
     $file = Get-Item -LiteralPath (Join-Path $Destination "gui/$name")
     if ($file.Length -eq 0) { throw "Empty required GUI file: $name" }
 }
+}
 
 $wv2 = Join-Path $Destination 'MicrosoftEdgeWebview2Setup.exe'
 Get-Pinned $pins.webview2.url $wv2 $pins.webview2.sha256
@@ -45,4 +49,5 @@ if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notm
     throw "The WebView2 bootstrapper is not validly signed by $($pins.webview2.signer): $($signature.Status)"
 }
 
-Write-Output "GUI $($pins.gui.tag) ($($pins.gui.commit)) and the WebView2 bootstrapper verified in $Destination"
+if ($NoGui) { Write-Output "WebView2 bootstrapper verified in $Destination (GUI skipped)" }
+else { Write-Output "GUI $($pins.gui.tag) ($($pins.gui.commit)) and the WebView2 bootstrapper verified in $Destination" }

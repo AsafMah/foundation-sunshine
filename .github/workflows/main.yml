@@ -49,6 +49,10 @@ on:
           - 'AUTO'
           - 'ON'
           - 'OFF'
+      fork_release:
+        description: 'Forks only: publish a GitHub Release that the fork-built control panel updates from'
+        type: boolean
+        default: false
 
 # Read-only by default; the jobs that write ask for it themselves (setup_release, the cache prune in build_win, publish).
 permissions:
@@ -287,12 +291,13 @@ jobs:
     if: needs.changes.outputs.build == 'true'
     outputs:
       # Whether this run publishes a pre-release: see "Automatic pre-releases" and the manual step below.
-      publish_release: ${{ steps.auto_gate.outputs.publish || steps.setup_release_manual.outputs.publish_release }}
-      release_body: ${{ steps.filter_release_contributors.outputs.release_body || steps.setup_release_auto.outputs.release_body || steps.setup_release_manual.outputs.release_body }}
-      release_commit: ${{ steps.setup_release_auto.outputs.release_commit || steps.setup_release_manual.outputs.release_commit }}
-      release_generate_release_notes: ${{ steps.setup_release_auto.outputs.release_generate_release_notes || steps.setup_release_manual.outputs.release_generate_release_notes }}
-      release_tag: ${{ steps.setup_release_auto.outputs.release_tag || steps.setup_release_manual.outputs.release_tag }}
-      release_version: ${{ steps.setup_release_auto.outputs.release_version || steps.setup_release_manual.outputs.release_version }}
+      fork_release: ${{ steps.setup_release_fork.outputs.fork_release || 'false' }}
+      publish_release: ${{ steps.setup_release_fork.outputs.publish_release || steps.auto_gate.outputs.publish || steps.setup_release_manual.outputs.publish_release }}
+      release_body: ${{ steps.setup_release_fork.outputs.release_body || steps.filter_release_contributors.outputs.release_body || steps.setup_release_auto.outputs.release_body || steps.setup_release_manual.outputs.release_body }}
+      release_commit: ${{ steps.setup_release_fork.outputs.release_commit || steps.setup_release_auto.outputs.release_commit || steps.setup_release_manual.outputs.release_commit }}
+      release_generate_release_notes: ${{ steps.setup_release_fork.outputs.release_generate_release_notes || steps.setup_release_auto.outputs.release_generate_release_notes || steps.setup_release_manual.outputs.release_generate_release_notes }}
+      release_tag: ${{ steps.setup_release_fork.outputs.release_tag || steps.setup_release_auto.outputs.release_tag || steps.setup_release_manual.outputs.release_tag }}
+      release_version: ${{ steps.setup_release_fork.outputs.release_version || steps.setup_release_auto.outputs.release_version || steps.setup_release_manual.outputs.release_version }}
     permissions:
       contents: write  # read does not work to check squash and merge details
     # Pinned: the ubuntu-latest label migrates to Ubuntu 26 (actions/runner-images#14748); move this on purpose, not by label.
@@ -300,6 +305,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # Fork releases locate their upstream base release by ancestry.
+          fetch-depth: ${{ github.repository == 'AlkaidLab/foundation-sunshine' && 1 || 0 }}
+
+      - name: Test fork release version gates
+        if: github.repository != 'AlkaidLab/foundation-sunshine'
+        run: python3 -m unittest discover -s tests/tools -p test_fork_release_version.py
 
       - name: Setup Release (Auto)
         id: setup_release_auto
@@ -361,6 +373,38 @@ jobs:
             echo "release_generate_release_notes=false"
             echo "release_tag=$STAMP"
             echo "release_version=$STAMP"
+          } >> "$GITHUB_OUTPUT"
+
+      # Forks: a dispatch with fork_release=true publishes v<newest upstream base reachable from HEAD>.<run>.杂鱼 as the fork's latest
+      # stable release (publish_fork_release); upstream's publish/AUTO_PRERELEASE paths stay off on forks. Numeric ordering is gated
+      # here and again immediately before publication.
+      - name: Setup Release (Fork)
+        id: setup_release_fork
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          github.repository != 'AlkaidLab/foundation-sunshine' &&
+          inputs.fork_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/AlkaidLab/foundation-sunshine/releases?per_page=100" > "$RUNNER_TEMP/upstream-releases.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RUNNER_TEMP/fork-releases.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" > "$RUNNER_TEMP/latest-release.json"
+          tag=$(python3 scripts/fork-release-version.py \
+            --upstream "$RUNNER_TEMP/upstream-releases.json" \
+            --fork "$RUNNER_TEMP/fork-releases.json" \
+            --latest "$RUNNER_TEMP/latest-release.json" \
+            --run-number "$GITHUB_RUN_NUMBER")
+          echo "Fork release ${tag}, preserving reachable release lineage"
+          {
+            echo "fork_release=true"
+            echo "publish_release=false"
+            echo "release_body=Fork build of ${GITHUB_REF_NAME} (${GITHUB_SHA}), preserving reachable release lineage"
+            echo "release_commit=${GITHUB_SHA}"
+            echo "release_generate_release_notes=false"
+            echo "release_tag=${tag}"
+            echo "release_version=${tag}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Filter bot contributors
@@ -557,8 +601,8 @@ jobs:
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           $dest = "$env:RUNNER_TEMP/installer-inputs/pinned"
-          ./scripts/fetch-installer-inputs.ps1 -Destination $dest
-          "GUI_BUNDLE_DIR=$dest/gui" >> $env:GITHUB_ENV
+          ./scripts/fetch-installer-inputs.ps1 -Destination $dest -NoGui:$${{ github.repository != 'AlkaidLab/foundation-sunshine' }}
+          if (Test-Path "$dest/gui") { "GUI_BUNDLE_DIR=$dest/gui" >> $env:GITHUB_ENV }
 
       # Keep this step and build_win's "Configure Windows" in step: the shards only help while their object command lines are
       # the ones build_win runs (build_win prints the compiler-cache hit rate and warns when it falls under 95%).
@@ -572,6 +616,7 @@ jobs:
           BRANCH: ${{ github.head_ref || github.ref_name }}
           BUILD_VERSION: ${{ needs.setup_release.outputs.release_tag }}.杂鱼
           COMMIT: ${{ needs.setup_release.outputs.release_commit }}
+          FORK_RELEASE: ${{ needs.setup_release.outputs.fork_release }}
           SUNSHINE_BUILD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
           SUNSHINE_BUILD_BRANCH: ${{ github.head_ref || github.ref_name }}
           SUNSHINE_BUILD_CHANNEL: ${{ needs.setup_release.outputs.publish_release == 'true' && 'beta' || 'dev' }}
@@ -586,7 +631,9 @@ jobs:
           if [[ -n "${GITHUB_TOKEN:-}" ]]; then echo "::error::the configure step must not have GITHUB_TOKEN"; exit 1; fi
           mkdir -p build
           ccache --zero-stats
-          gui_options=(-DFETCH_GUI=OFF "-DGUI_DIR=$GUI_BUNDLE_DIR")
+          gui_options=(-DFETCH_GUI=OFF)
+          # Forks fetch no upstream GUI (fetch-installer-inputs.ps1 -NoGui); the shard compiles objects only.
+          if [[ -n "${GUI_BUNDLE_DIR:-}" ]]; then gui_options+=("-DGUI_DIR=$GUI_BUNDLE_DIR"); fi
           cmake \
             -B build \
             -G Ninja \
@@ -712,8 +759,8 @@ jobs:
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           $dest = "$env:RUNNER_TEMP/installer-inputs/pinned"
-          ./scripts/fetch-installer-inputs.ps1 -Destination $dest
-          "GUI_BUNDLE_DIR=$dest/gui" >> $env:GITHUB_ENV
+          ./scripts/fetch-installer-inputs.ps1 -Destination $dest -NoGui:$${{ github.repository != 'AlkaidLab/foundation-sunshine' }}
+          if (Test-Path "$dest/gui") { "GUI_BUNDLE_DIR=$dest/gui" >> $env:GITHUB_ENV }
 
       - name: Test the adapter build configuration without the SDK
         shell: msys2 {0}
@@ -726,6 +773,9 @@ jobs:
           gui_options=()
           if [[ -n "${GUI_BUNDLE_DIR:-}" ]]; then
             gui_options=(-DFETCH_GUI=OFF "-DGUI_DIR=$GUI_BUNDLE_DIR")
+          else
+            # Forks without a built GUI (no packaging in this job) never download the upstream one.
+            gui_options=(-DFETCH_GUI=OFF)
           fi
           cmake -B build-adapter-config -G Ninja -S . "${gui_options[@]}" \
             -DBUILD_DOCS=OFF -DBUILD_TESTS=ON -DBUILD_TRAY_TESTS=ON -DBUILD_WEB_UI=OFF \
@@ -910,6 +960,9 @@ jobs:
       - name: Build Web UI
         if: needs.changes.outputs.package == 'true'
         shell: pwsh
+        env:
+          # Forks: the Web UI update notice checks this repository's releases.
+          FOUNDATION_RELEASE_REPOSITORY: ${{ github.repository != 'AlkaidLab/foundation-sunshine' && github.repository || '' }}
         run: |
           # A failing native command fails the step (PowerShell 7.4+; the runner already sets ErrorActionPreference=Stop).
           $PSNativeCommandUseErrorActionPreference = $true
@@ -980,12 +1033,12 @@ jobs:
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           $dest = "$env:RUNNER_TEMP/installer-inputs/pinned"
-          ./scripts/fetch-installer-inputs.ps1 -Destination $dest
-          "GUI_BUNDLE_DIR=$dest/gui" >> $env:GITHUB_ENV
+          ./scripts/fetch-installer-inputs.ps1 -Destination $dest -NoGui:$${{ github.repository != 'AlkaidLab/foundation-sunshine' }}
+          if (Test-Path "$dest/gui") { "GUI_BUNDLE_DIR=$dest/gui" >> $env:GITHUB_ENV }
           "WEBVIEW2_BOOTSTRAPPER=$dest/MicrosoftEdgeWebview2Setup.exe" >> $env:GITHUB_ENV
 
       - name: Fetch paired GUI artifact
-        if: github.event_name == 'workflow_dispatch' && inputs.gui_run_id != ''
+        if: github.repository == 'AlkaidLab/foundation-sunshine' && github.event_name == 'workflow_dispatch' && inputs.gui_run_id != ''
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -995,6 +1048,17 @@ jobs:
           if ($env:GUI_RUN_ID) { $arguments.RunId = $env:GUI_RUN_ID }
           ./scripts/fetch-paired-gui.ps1 @arguments
           "GUI_BUNDLE_DIR=$env:RUNNER_TEMP/paired-gui" >> $env:GITHUB_ENV
+
+      # Forks ship their own control panel: built from the committed Panel submodule, its updater follows this repository.
+      - name: Build fork control panel
+        if: github.repository != 'AlkaidLab/foundation-sunshine' && needs.changes.outputs.package == 'true'
+        shell: pwsh
+        env:
+          FOUNDATION_RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          ./scripts/build-fork-gui.ps1 -FoundationUi "$env:GITHUB_WORKSPACE/../ds5-ui-m3e" -Output "$env:RUNNER_TEMP/fork-gui"
+          "GUI_BUNDLE_DIR=$env:RUNNER_TEMP/fork-gui" >> $env:GITHUB_ENV
 
       - name: Configure Windows
         id: configure_windows
@@ -1010,6 +1074,7 @@ jobs:
           BRANCH: ${{ github.head_ref || github.ref_name }}
           BUILD_VERSION: ${{ needs.setup_release.outputs.release_tag }}.杂鱼
           COMMIT: ${{ needs.setup_release.outputs.release_commit }}
+          FORK_RELEASE: ${{ needs.setup_release.outputs.fork_release }}
           # Build identity (cmake/prep/build_info.cmake): master builds carry the full commit too. A published build is a
           # pre-release (beta); PRs and manual runs are dev builds. One build makes both packages, so the package stays auto.
           SUNSHINE_BUILD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -1038,6 +1103,9 @@ jobs:
           gui_options=()
           if [[ -n "${GUI_BUNDLE_DIR:-}" ]]; then
             gui_options=(-DFETCH_GUI=OFF "-DGUI_DIR=$GUI_BUNDLE_DIR")
+          else
+            # Forks without a built GUI (no packaging in this job) never download the upstream one.
+            gui_options=(-DFETCH_GUI=OFF)
           fi
           cmake \
             -B build \
@@ -1386,6 +1454,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: sunshine-windows-r${{ github.run_number }}
+          # Full reruns keep the run number; the fork publish job needs this name.
+          overwrite: true
           path: |
             artifacts/Sunshine.*.WindowsInstaller.exe
             artifacts/Sunshine.*.Portable-x64.zip
@@ -1442,12 +1512,49 @@ jobs:
         shell: bash
         run: bash scripts/ci/publish-prerelease.sh dist | tee -a "$GITHUB_STEP_SUMMARY"
 
+  # Forks: publish the run's artifacts as the fork's latest stable release (the fork control panel's stable channel reads it).
+  publish_fork_release:
+    name: Publish fork release
+    needs: [setup_release, build_win]
+    if: needs.setup_release.outputs.fork_release == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Checkout release version gate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.setup_release.outputs.release_tag }}.杂鱼
+          NOTES: ${{ needs.setup_release.outputs.release_body }}
+          COMMIT: ${{ needs.setup_release.outputs.release_commit }}
+        run: |
+          set -euo pipefail
+          gh run download "${{ github.run_id }}" --repo "$GITHUB_REPOSITORY" \
+            --name "sunshine-windows-r${{ github.run_number }}" --dir artifacts
+          ls -l artifacts
+          gh api "repos/$GITHUB_REPOSITORY/releases/latest" > "$RUNNER_TEMP/latest-release.json"
+          python3 scripts/fork-release-version.py --candidate "$TAG" --latest "$RUNNER_TEMP/latest-release.json"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" artifacts/* --repo "$GITHUB_REPOSITORY" \
+              --target "$COMMIT" --title "$TAG" --notes "$NOTES" --latest
+          fi
+
   # The single status check to require. `always()` is what keeps a failed or cancelled job from being skipped past: a job
   # whose dependency failed is skipped, and a skipped required check counts as passing.
   ci-gate:
     name: CI gate
     if: always()
-    needs: [changes, docs-check, workflow-lint, webui, webui-docs, setup_release, vdd_smoke, mat_smoke, cold_plan, shard, adapter_config, setup_ui, build_win, publish]
+    needs: [changes, docs-check, workflow-lint, webui, webui-docs, setup_release, vdd_smoke, mat_smoke, cold_plan, shard, adapter_config, setup_ui, build_win, publish, publish_fork_release]
     runs-on: ubuntu-slim
     timeout-minutes: 5
     permissions: {}

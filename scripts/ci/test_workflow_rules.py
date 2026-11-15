@@ -45,7 +45,8 @@ class PublishTest(unittest.TestCase):
         writers = sorted(name for name, job in self.workflow["jobs"].items()
                          if "write" in (job.get("permissions") or {}).values())
         # shard / shard_cleanup: the claim refs of the cold compile (refs/claims/<run>/<chunk>), nothing else
-        self.assertEqual(writers, ["build_win", "publish", "setup_release", "shard", "shard_cleanup"])
+        # publish_fork_release: the fork release job (forks only) writes the release, like publish.
+        self.assertEqual(writers, ["build_win", "publish", "publish_fork_release", "setup_release", "shard", "shard_cleanup"])
         self.assertEqual(self.build["permissions"], {"contents": "read", "actions": "write"})
 
     def test_the_publish_decision_does_not_come_straight_from_the_release_action(self):
