@@ -83,6 +83,7 @@ extern "C" {
 #include "streaming/restart_intent.h"
 #include "streaming/restart_intent_enet.h"
 #include "streaming/video_pacing.h"
+#include "streaming/video_timestamps.h"
 #include "sync.h"
 #include "thread_safe.h"
 #include "tray/system_tray.h"
@@ -3852,7 +3853,7 @@ namespace stream {
 
     crash::watched_thread_t crash_watch("video-broadcast", 20000);
 
-    stream::telemetry::broadcast_telemetry_t stall_telemetry { std::chrono::steady_clock::now(), current_thread_cpu_time() };
+    stream::stall_telemetry::broadcast_telemetry_t stall_telemetry { std::chrono::steady_clock::now(), current_thread_cpu_time() };
     const auto timed_lock_wait = [&](auto &&fn) -> decltype(auto) {
       const auto begin = std::chrono::steady_clock::now();
       struct finish_t {
@@ -3885,7 +3886,7 @@ namespace stream {
             int len = sizeof(sndbuf);
             getsockopt((SOCKET) sock.native_handle(), SOL_SOCKET, SO_SNDBUF, (char *) &sndbuf, &len);
 #endif
-            BOOST_LOG(warning) << stream::telemetry::format(*report) << " so_sndbuf=" << sndbuf;
+            BOOST_LOG(warning) << stream::stall_telemetry::format(*report) << " so_sndbuf=" << sndbuf;
           }
         }
       } iteration_end { stall_telemetry, iteration_start, sock };
@@ -4108,7 +4109,7 @@ namespace stream {
         // capture presentation timestamp. Frames without a capture timestamp
         // (intentional duplicates) take the time this frame's send starts.
         const bool frame_is_dupe = !packet->frame_timestamp;
-        const auto presentation_time = packet->frame_timestamp.value_or(pacing.start);
+        const auto presentation_time = streaming::video_presentation_time(packet->frame_timestamp, video_pacer, pacing);
         const auto timestamp = video_rtp_timestamp(presentation_time, video_epoch);
 
         auto blockIndex = 0;

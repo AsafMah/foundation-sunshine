@@ -12,7 +12,7 @@
 #include <sstream>
 #include <string>
 
-namespace stream::telemetry {
+namespace stream::stall_telemetry {
   using clock_t = std::chrono::steady_clock;
   using std::chrono::nanoseconds;
 
@@ -117,4 +117,4 @@ namespace stream::telemetry {
     nanoseconds cpu_start;
     report_t current;
   };
-}  // namespace stream::telemetry
+}  // namespace stream::stall_telemetry

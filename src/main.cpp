@@ -25,7 +25,6 @@
 #include "crash/crash_env.h"
 #include "default_apps.h"
 #include "display_device/session.h"
-#include "ds5/config.h"
 #include "entry_handler.h"
 #include "file_handler.h"
 #include "globals.h"

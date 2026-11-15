@@ -192,7 +192,8 @@ target_link_libraries(video_idle_policy_unit_tests PRIVATE gtest_main sunshine_p
 set_target_properties(video_idle_policy_unit_tests PROPERTIES CXX_STANDARD 23)
 add_test(NAME video_idle_policy_unit_tests COMMAND video_idle_policy_unit_tests)
 
-add_executable(video_pacing_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_video_pacing.cpp)
+add_executable(video_pacing_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_video_pacing.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_video_timestamps.cpp)
 target_include_directories(video_pacing_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(video_pacing_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
 set_target_properties(video_pacing_unit_tests PROPERTIES CXX_STANDARD 23)
