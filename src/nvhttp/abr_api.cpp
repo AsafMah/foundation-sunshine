@@ -41,7 +41,7 @@ namespace nvhttp::abr_api {
 
     int
     host_max_bitrate_kbps() {
-      return std::max(config::video.max_bitrate, 0);
+      return std::max(config::host_max_bitrate_kbps(), 0);
     }
 
     const char *
@@ -68,6 +68,11 @@ namespace nvhttp::abr_api {
         auto parsed = parse_request(json::parse(request->content.string()), feedback);
         const int requested_max = parsed.config.max_bitrate_kbps;
         const int host_max = host_max_bitrate_kbps();
+        if (parsed.operation == abr::operation_e::configure) {
+          // Keep the client's own bounds so a later host-ceiling change recomputes the range from them.
+          parsed.config.client_min_kbps = parsed.config.min_bitrate_kbps;
+          parsed.config.client_max_kbps = parsed.config.max_bitrate_kbps;
+        }
         if (parsed.operation == abr::operation_e::configure && host_max > 0) {
           parsed.config.max_bitrate_kbps = requested_max > 0 ? std::min(requested_max, host_max) : host_max;
           parsed.config.min_bitrate_kbps = std::min(parsed.config.min_bitrate_kbps, parsed.config.max_bitrate_kbps);

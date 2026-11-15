@@ -86,6 +86,7 @@ validation and cannot be inferred from these tests.
 Use the Node.js version in `.node-version` and npm requirements in `package.json`. From the host repository root:
 
 ```bash
+git clone https://github.com/AlkaidLab/foundation-ui ../ds5-ui-m3e   # once; the Web UI imports it from this sibling directory
 npm ci
 npm run dev-server
 ```

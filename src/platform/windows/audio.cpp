@@ -5,6 +5,7 @@
 #define INITGUID
 
 // platform includes
+#include "src/startup_gate.h"
 #include <audioclient.h>
 #include <avrt.h>
 #include <chrono>
@@ -16,7 +17,6 @@
 
 // local includes
 #include "mic_write.h"
-#include "virtual_device_host/microphone_client.h"
 #include "misc.h"
 #include "src/config.h"
 #include "src/globals.h"
@@ -255,7 +255,7 @@ namespace platf::audio {
   class co_init_t: public deinit_t {
   public:
     co_init_t():
-        status {CoInitializeEx(nullptr, COINIT_MULTITHREADED | COINIT_SPEED_OVER_MEMORY)} {
+        status { CoInitializeEx(nullptr, COINIT_MULTITHREADED | COINIT_SPEED_OVER_MEMORY) } {
     }
 
     ~co_init_t() override {
@@ -500,7 +500,8 @@ namespace platf::audio {
           const auto remaining = sample_size - (sample_buf_pos - std::begin(sample_buf));
           std::fill_n(sample_buf_pos, remaining, 0.0f);
           sample_buf_pos += remaining;
-        } else if (capture_result != capture_e::ok) {
+        }
+        else if (capture_result != capture_e::ok) {
           return capture_result;
         }
       }
@@ -762,95 +763,6 @@ namespace platf::audio {
     HANDLE mmcss_task_handle = NULL;
   };
 
-  // 初始化、写入和释放操作都由麦克风接收线程串行执行。
-  std::unique_ptr<mic_write_wasapi_t> mic_redirect_device;
-  enum class mic_backend_e {
-    none,
-    vb_cable,
-    usbip,
-  };
-  enum class mic_redirect_owner_e {
-    none,
-    session,
-    test,
-  };
-  std::atomic<mic_backend_e> active_mic_backend { mic_backend_e::none };
-  std::atomic<mic_redirect_owner_e> mic_redirect_owner { mic_redirect_owner_e::none };
-  std::mutex mic_backend_status_mutex;
-  std::string mic_backend_fallback_reason;
-
-  void
-  report_mic_redirect_backend(std::string active_backend, std::string fallback_reason) {
-    if (active_backend == "usbip_experimental") {
-      active_mic_backend = mic_backend_e::usbip;
-    }
-    else if (active_backend == "vb_cable") {
-      active_mic_backend = mic_backend_e::vb_cable;
-    }
-    else {
-      active_mic_backend = mic_backend_e::none;
-    }
-    std::lock_guard lock(mic_backend_status_mutex);
-    mic_backend_fallback_reason = std::move(fallback_reason);
-  }
-
-  bool
-  try_begin_mic_redirect_test() {
-    auto expected = mic_redirect_owner_e::none;
-    return mic_redirect_owner.compare_exchange_strong(
-      expected, mic_redirect_owner_e::test);
-  }
-
-  void
-  end_mic_redirect_test() {
-    auto expected = mic_redirect_owner_e::test;
-    mic_redirect_owner.compare_exchange_strong(
-      expected, mic_redirect_owner_e::none);
-  }
-
-  mic_redirect_status_t
-  mic_redirect_status() {
-    mic_redirect_status_t result;
-    result.configured_backend = config::audio.microphone_redirect_backend;
-    switch (active_mic_backend.load()) {
-      case mic_backend_e::usbip:
-        result.active_backend = "usbip_experimental";
-        break;
-      case mic_backend_e::vb_cable:
-        result.active_backend = "vb_cable";
-        break;
-      default:
-        break;
-    }
-    {
-      std::lock_guard lock(mic_backend_status_mutex);
-      result.fallback_reason = mic_backend_fallback_reason;
-    }
-    const auto usbip = virtual_device_host::microphone_status();
-    result.component_available = usbip.component_available;
-    if (result.active_backend == "usbip_experimental" ||
-        (result.active_backend.empty() &&
-         (usbip.device_created || !usbip.error_code.empty()))) {
-      result.online = usbip.online;
-      result.device_created = usbip.device_created;
-      result.host_streaming = usbip.host_streaming;
-      result.generation = usbip.generation;
-      result.buffered_bytes = usbip.buffered_bytes;
-      result.underruns = usbip.underruns;
-      result.dropped_frames = usbip.dropped_frames;
-      result.submit_errors = usbip.submit_errors;
-      result.last_error = usbip.last_error;
-      result.state = usbip.state;
-      result.error_code = usbip.error_code;
-    }
-    else if (result.active_backend == "vb_cable") {
-      result.online = true;
-      result.device_created = true;
-      result.state = "ready";
-    }
-    return result;
-  }
-
   class audio_control_t: public ::platf::audio_control_t {
   public:
     std::optional<sink_t>
@@ -1064,7 +976,7 @@ namespace platf::audio {
       }
       else {
         BOOST_LOG(warning) << "Couldn't set ["sv << sink << "] to role ["sv << role << "]: 0x"sv
-                          << util::hex(status).to_string_view();
+                           << util::hex(status).to_string_view();
       }
     }
 
@@ -1341,7 +1253,8 @@ namespace platf::audio {
         "Sunshine is keeping the virtual audio device selected for host audio streaming. Stop the stream before switching playback devices.");
       task_pool.pushDelayed([notification_id]() {
         tray_state::clear_notification_if(notification_id);
-      }, std::chrono::seconds(10));
+      },
+        std::chrono::seconds(10));
 #if defined SUNSHINE_TRAY && SUNSHINE_TRAY >= 1
       system_tray::show_notification(
         "Audio device kept for streaming",
@@ -1631,102 +1544,17 @@ namespace platf::audio {
 
     int
     init_mic_redirect_device() override {
-      const auto &backend = config::audio.microphone_redirect_backend;
-      std::string usbip_fallback_reason;
-      if (backend == "disabled") {
-        report_mic_redirect_backend({}, "MIC_BACKEND_DISABLED");
-        BOOST_LOG(info) << "Client microphone redirection backend is disabled"sv;
-        return -1;
-      }
-      auto expected_owner = mic_redirect_owner_e::none;
-      if (!mic_redirect_owner.compare_exchange_strong(
-            expected_owner, mic_redirect_owner_e::session)) {
-        BOOST_LOG(warning) << "Microphone redirect path is already in use"sv;
-        return -1;
-      }
-
-      if (backend == "usbip_experimental" || backend == "auto") {
-        auto &usbip = virtual_device_host::persistent_microphone_client();
-        if (usbip.start()) {
-          report_mic_redirect_backend("usbip_experimental");
-          BOOST_LOG(info) << "Using the experimental USB/IP virtual microphone backend"sv;
-          return 0;
-        }
-
-        const auto usbip_status = virtual_device_host::microphone_status();
-        usbip_fallback_reason = usbip_status.error_code.empty() ?
-                                  "MIC_USBIP_DEVICE_UNAVAILABLE"s :
-                                  usbip_status.error_code;
-        if (backend == "usbip_experimental") {
-          report_mic_redirect_backend({}, usbip_fallback_reason);
-          BOOST_LOG(error) << "The experimental USB/IP virtual microphone backend failed: "sv
-                           << usbip_fallback_reason;
-          mic_redirect_owner = mic_redirect_owner_e::none;
-          return -1;
-        }
-        report_mic_redirect_backend("vb_cable", usbip_fallback_reason);
-        BOOST_LOG(warning) << "USB/IP virtual microphone unavailable; falling back to VB-Cable: "sv
-                           << usbip_fallback_reason;
-      }
-
-      if (!mic_redirect_device) {
-        mic_redirect_device = std::make_unique<mic_write_wasapi_t>();
-      }
-
-      if (mic_redirect_device->init() != 0) {
-        BOOST_LOG(warning) << "Failed to initialize client mic redirection device";
-        mic_redirect_device.reset();
-        report_mic_redirect_backend({}, backend == "auto" ?
-                                          usbip_fallback_reason :
-                                          "MIC_TEST_DEVICE_UNAVAILABLE");
-        auto expected_owner = mic_redirect_owner_e::session;
-        mic_redirect_owner.compare_exchange_strong(
-          expected_owner, mic_redirect_owner_e::none);
-        return -1;
-      }
-
-      if (backend != "auto") {
-        report_mic_redirect_backend("vb_cable");
-      }
-      BOOST_LOG(info) << "Successfully initialized client mic redirection device";
-
-      return 0;
+      return init_mic_redirect();
     }
 
     void
     release_mic_redirect_device() override {
-      if (active_mic_backend.load() == mic_backend_e::usbip) {
-        auto &usbip = virtual_device_host::persistent_microphone_client();
-        if (!usbip.flush()) {
-          BOOST_LOG(warning) << "Failed to flush the USB/IP virtual microphone"sv;
-        }
-        // Keep the endpoint alive across Moonlight sessions. Its process-wide
-        // owner destroys it when Sunshine exits.
-        mic_redirect_owner = mic_redirect_owner_e::none;
-        return;
-      }
-      if (mic_redirect_device) {
-        mic_redirect_device->restore_audio_devices();
-        mic_redirect_device.reset();
-      }
-      report_mic_redirect_backend({});
-      auto expected_owner = mic_redirect_owner_e::session;
-      mic_redirect_owner.compare_exchange_strong(
-        expected_owner, mic_redirect_owner_e::none);
+      release_mic_redirect();
     }
 
     int
     write_mic_pcm(const std::int16_t *samples, std::size_t frame_count) override {
-      if (active_mic_backend.load() == mic_backend_e::usbip) {
-        return virtual_device_host::persistent_microphone_client().write_pcm(
-          samples, frame_count);
-      }
-      if (!mic_redirect_device || mic_redirect_device->is_cleaning_up.load()) {
-        BOOST_LOG(warning) << "Mic redirect device not available or cleaning up";
-        return -1;
-      }
-
-      return mic_redirect_device->write_pcm(samples, frame_count);
+      return write_mic_redirect_pcm(samples, frame_count);
     }
   };
 }  // namespace platf::audio
@@ -1771,9 +1599,14 @@ namespace platf {
 
   std::unique_ptr<deinit_t>
   init() {
-    if (dxgi::init()) {
-      return nullptr;
+    const auto log_phase = [](const std::string &line) { BOOST_LOG(info) << line; };
+    {
+      startup::phase_t phase("platf: shaders (dxgi::init)", log_phase);
+      if (dxgi::init()) {
+        return nullptr;
+      }
     }
+    startup::phase_t audio_phase("platf: audio default device", log_phase);
 
     // Initialize COM
     auto co_init = std::make_unique<platf::audio::co_init_t>();

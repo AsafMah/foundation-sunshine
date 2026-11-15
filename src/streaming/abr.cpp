@@ -15,6 +15,7 @@
 #include "abr.h"
 #include "abr_session.h"
 #include "src/config.h"
+#include "bitrate.h"
 #include "src/ai/proxy.h"
 #include "src/logging.h"
 
@@ -531,6 +532,34 @@ namespace abr {
     return action;
   }
 
+  /// Set the session's range from its inputs under the ceiling and hold the current bitrate and the LLM target inside it.
+  static void
+  apply_range(session_state_t &state, int ceiling_kbps) {
+    const auto range = streaming::abr_range_under_ceiling(
+      state.client_min_kbps, state.client_max_kbps, state.preset_min_kbps, state.preset_max_kbps, ceiling_kbps);
+    state.config.min_bitrate_kbps = range.min_kbps;
+    state.config.max_bitrate_kbps = range.max_kbps;
+    if (range.max_kbps <= 0) return;
+    state.current_bitrate_kbps = std::clamp(state.current_bitrate_kbps, range.min_kbps, range.max_kbps);
+    if (state.llm_target_bitrate_kbps > 0) {
+      state.llm_target_bitrate_kbps = std::clamp(state.llm_target_bitrate_kbps, range.min_kbps, range.max_kbps);
+    }
+  }
+
+  void
+  apply_host_ceiling(int ceiling_kbps) {
+    std::lock_guard lock(sessions_mutex);
+    for (auto &[session_token, state] : sessions) {
+      if (!state.config.enabled) continue;
+      const auto was_max = state.config.max_bitrate_kbps;
+      apply_range(state, ceiling_kbps);
+      if (state.config.max_bitrate_kbps != was_max) {
+        BOOST_LOG(info) << "ABR range for session token_prefix=" << token_log_prefix(session_token) << " follows the host ceiling: ["
+                        << state.config.min_bitrate_kbps << "," << state.config.max_bitrate_kbps << "] Kbps";
+      }
+    }
+  }
+
   config_t
   enable(const std::string &session_token, const config_t &cfg, int initial_bitrate_kbps, const std::string &app_name) {
     std::lock_guard lock(sessions_mutex);
@@ -565,44 +594,28 @@ namespace abr {
       state.last_fg_detect = std::chrono::steady_clock::now();
     }
 
-    // Apply mode presets only for bounds that were not explicitly configured.
-    // This preserves a client/host maxBitrate cap when minBitrate is omitted.
-    if (state.config.min_bitrate_kbps <= 0 || state.config.max_bitrate_kbps <= 0) {
-      int preset_min_bitrate_kbps = 0;
-      int preset_max_bitrate_kbps = 0;
-      switch (cfg.mode) {
-        case mode_e::QUALITY:
-          preset_min_bitrate_kbps = std::max(5000, initial_bitrate_kbps / 2);
-          preset_max_bitrate_kbps = std::min<std::int64_t>(150000, std::int64_t {initial_bitrate_kbps} * 3 / 2);
-          break;
-        case mode_e::LOW_LATENCY:
-          preset_min_bitrate_kbps = 2000;
-          preset_max_bitrate_kbps = std::min<std::int64_t>(std::numeric_limits<int>::max(),
-            std::int64_t {initial_bitrate_kbps} * 6 / 5);
-          break;
-        case mode_e::BALANCED:
-        default:
-          preset_min_bitrate_kbps = std::max<std::int64_t>(3000, std::int64_t {initial_bitrate_kbps} * 3 / 10);
-          preset_max_bitrate_kbps = std::min<std::int64_t>(150000, std::int64_t {initial_bitrate_kbps} * 2);
-          break;
-      }
-      if (state.config.min_bitrate_kbps <= 0) {
-        state.config.min_bitrate_kbps = preset_min_bitrate_kbps;
-      }
-      if (state.config.max_bitrate_kbps <= 0) {
-        state.config.max_bitrate_kbps = preset_max_bitrate_kbps;
-      }
-      // Guard against inverted range when initial_bitrate is very low
-      if (state.config.min_bitrate_kbps > state.config.max_bitrate_kbps) {
-        state.config.min_bitrate_kbps = state.config.max_bitrate_kbps;
-      }
+    // The range is worked out from what the client asked for, the mode's preset for what it did not, and the host ceiling; the inputs stay in the state so a change of the ceiling recomputes it
+    // (apply_host_ceiling). This keeps a client/host maxBitrate cap when minBitrate is omitted, and a bound the client set is never replaced by a preset.
+    // Preset arithmetic is widened so a very high initial bitrate cannot overflow.
+    state.client_min_kbps = cfg.client_min_kbps >= 0 ? cfg.client_min_kbps : cfg.min_bitrate_kbps;
+    state.client_max_kbps = cfg.client_max_kbps >= 0 ? cfg.client_max_kbps : cfg.max_bitrate_kbps;
+    switch (cfg.mode) {
+      case mode_e::QUALITY:
+        state.preset_min_kbps = std::max(5000, initial_bitrate_kbps / 2);
+        state.preset_max_kbps = std::min<std::int64_t>(150000, std::int64_t {initial_bitrate_kbps} * 3 / 2);
+        break;
+      case mode_e::LOW_LATENCY:
+        state.preset_min_kbps = 2000;
+        state.preset_max_kbps = std::min<std::int64_t>(std::numeric_limits<int>::max(),
+          std::int64_t {initial_bitrate_kbps} * 6 / 5);
+        break;
+      case mode_e::BALANCED:
+      default:
+        state.preset_min_kbps = std::max<std::int64_t>(3000, std::int64_t {initial_bitrate_kbps} * 3 / 10);
+        state.preset_max_kbps = std::min<std::int64_t>(150000, std::int64_t {initial_bitrate_kbps} * 2);
+        break;
     }
-
-    // Clamp current bitrate to the computed range
-    state.current_bitrate_kbps = std::clamp(
-      state.current_bitrate_kbps,
-      state.config.min_bitrate_kbps,
-      state.config.max_bitrate_kbps);
+    apply_range(state, config::host_max_bitrate_kbps());
 
     BOOST_LOG(info) << "ABR enabled token_prefix=" << token_log_prefix(session_token)
                     << " app=" << app_name
@@ -664,6 +677,19 @@ namespace abr {
                       << "': " << action.target_bitrate_kbps << " Kbps"
                       << " (" << action.reason << ")";
     }
+  }
+
+  std::optional<reported_loss_t>
+  latest_reported_loss(const std::string &session_token) {
+    std::lock_guard lock(sessions_mutex);
+
+    auto it = sessions.find(session_token);
+    if (it == sessions.end() || it->second.recent_feedback.empty()) {
+      return std::nullopt;
+    }
+
+    const auto &latest = it->second.recent_feedback.back().feedback;
+    return reported_loss_t { latest.packet_loss, latest.dropped_frames };
   }
 
   action_t

@@ -98,8 +98,8 @@ namespace config {
       std::optional<bool> amd_high_motion_qb;
       std::optional<bool> amd_lowlatency_mode;
       // Standalone: AMF INPUT_QUEUE_SIZE. AVCodec compatibility: async_depth cap.
-      std::optional<int> amd_input_queue_size;   // 1-16
-      std::optional<int> amd_av1_latency_mode;   // AMF_VIDEO_ENCODER_AV1_ENCODING_LATENCY_MODE_*
+      std::optional<int> amd_input_queue_size;  // 1-16
+      std::optional<int> amd_av1_latency_mode;  // AMF_VIDEO_ENCODER_AV1_ENCODING_LATENCY_MODE_*
     } amd;
 
     struct {
@@ -119,8 +119,8 @@ namespace config {
 
     std::string output_name;
     std::string capture_target;  // "display" or "window" - determines whether to capture display or window
-    std::string window_title;     // Window title to capture when capture_target="window"
-    bool capture_cursor;          // Whether to composite the host mouse cursor into the stream (toggle: Ctrl+Alt+Shift+N)
+    std::string window_title;  // Window title to capture when capture_target="window"
+    bool capture_cursor;  // Whether to composite the host mouse cursor into the stream (toggle: Ctrl+Alt+Shift+N)
     int display_device_prep;
     int resolution_change;
     std::string manual_resolution;
@@ -138,12 +138,14 @@ namespace config {
     bool wgc_disable_secure_desktop;  // Auto-disable UAC secure desktop when using WGC capture
     bool dynamic_resolution_follow_display;  // If true, follow mid-stream host display resolution changes and notify client via extension; if false, keep initial stream resolution and let scaler handle changes (compatible with legacy clients like PSVita Moonlight that don't implement the extension)
     bool allow_client_resolution_change;  // If true, apply client-requested mid-stream resolution changes (0x5506 RESOLUTION); also requires dynamic_resolution_follow_display and automatic resolution_change
+    int video_pacing_threshold;  // Minimum encoded frame size in bytes for UDP pacing; 0 disables the additional pacing path
   };
 
   struct audio_t {
     std::string sink;
     std::string virtual_sink;
     bool keep_sink_default;  // Keep the selected Windows audio output device as the system default while streaming
+    bool host_audio;  // Default to keeping stream audio on the host as well as sending it to the client
     std::string microphone_redirect_backend;
     bool stream;
     bool stream_mic;
@@ -158,6 +160,7 @@ namespace config {
   struct stream_t {
     std::chrono::milliseconds ping_timeout;
     bool stop_on_last_video_session;
+    bool launch_splash;  ///< 启动画面: the Panel shows the app's name and stage on the streamed display until its window is up
 
     std::string file_apps;
 
@@ -171,9 +174,9 @@ namespace config {
   };
 
   // Sleep mode options for PC sleep command
-  constexpr int SLEEP_MODE_SUSPEND = 0;   // S3 Sleep (traditional suspend via SetSuspendState)
+  constexpr int SLEEP_MODE_SUSPEND = 0;  // S3 Sleep (traditional suspend via SetSuspendState)
   constexpr int SLEEP_MODE_HIBERNATE = 1;  // S4 Hibernate (deeper sleep, saves to disk)
-  constexpr int SLEEP_MODE_AWAY = 2;       // Away Mode (display off, system stays on, instant wake)
+  constexpr int SLEEP_MODE_AWAY = 2;  // Away Mode (display off, system stays on, instant wake)
 
   struct nvhttp_t {
     // Could be any of the following values:
@@ -184,6 +187,7 @@ namespace config {
     std::string cert;
 
     std::string sunshine_name;
+    std::string fs_host_icon;  ///< Optional specialised-client host icon token.
     std::string clients;
 
     std::string file_state;
@@ -192,7 +196,9 @@ namespace config {
     bool usb_forwarding_enabled;
     std::uint16_t usb_forwarding_port;  // 0: main port + 7; otherwise explicit override
 
-    std::string external_ip;
+    std::string external_ip;  ///< legacy single public address; external_endpoints wins when both are set
+    std::string external_endpoints;  ///< public endpoints, `host[:port]` separated by commas
+    std::string stun_servers;  ///< STUN servers of the network overview; empty: built-in list, "none": off
     std::vector<std::string> resolutions;
     std::vector<std::string> fps;  // 支持小数刷新率，如 "119.88"
 
@@ -292,6 +298,11 @@ namespace config {
     int max_log_size_mb;  // 日志文件最大大小（MB），超过后自动轮转，0=不限制
     bool notify_pre_releases;
     bool system_tray;
+    // Web UI session lifetimes. Defaults follow OWASP ASVS 4.0.3 V3.3.2.
+    int session_idle_minutes;
+    int session_absolute_hours;
+    int session_remember_idle_minutes;
+    int session_remember_days;
     std::vector<prep_cmd_t> prep_cmds;
   };
 
@@ -334,7 +345,16 @@ namespace config {
   get_effective_config_snapshot();
 
   bool
-  update_full_config(const std::map<std::string, std::string> &fullConfig);
+  update_full_config(const std::map<std::string, std::string> &fullConfig, std::string *previous_locale = nullptr);
+
+  /**
+   * The host's bitrate ceiling in Kbps (the `max_bitrate` setting, 0 = none). It is read while streams run and written when the configuration is saved (update_full_config), so every reader asks here and
+   * none caches `video.max_bitrate`. Relaxed atomics: a reader sees the old or the new value, never a torn one.
+   */
+  int
+  host_max_bitrate_kbps();
+  void
+  set_host_max_bitrate_kbps(int kbps);
 
   /**
    * Return a synchronized snapshot of the serialized per-client settings.
