@@ -34,6 +34,9 @@ install(DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/assets/web"
 # install sunshine control panel (Tauri GUI) — from pre-built download
 if(WIN32)
     option(SUNSHINE_PREFER_LOCAL_GUI "Prefer a locally-built Tauri GUI over the downloaded GUI binary" ON)
+# OFF only for configures that compile objects and never package (fork CI compile shards and the adapter check, which have
+# no GUI bundle); every packaging build keeps the requirement.
+option(SUNSHINE_REQUIRE_GUI_BUNDLE "Fail the configure when the GUI tray build has no complete GUI bundle" ON)
 
     set(_local_gui_dir "")
     if(SUNSHINE_PREFER_LOCAL_GUI)
@@ -83,7 +86,7 @@ if(WIN32)
             COMPONENT gui
             OPTIONAL)
     else()
-        if(SUNSHINE_ENABLE_TRAY AND NOT SUNSHINE_ENABLE_LEGACY_TRAY)
+        if(SUNSHINE_ENABLE_TRAY AND NOT SUNSHINE_ENABLE_LEGACY_TRAY AND SUNSHINE_REQUIRE_GUI_BUNDLE)
             message(FATAL_ERROR
                 "The complete Sunshine GUI bundle is required by the Windows GUI tray build. "
                 "Build the local GUI or configure an explicit GUI release before packaging.")

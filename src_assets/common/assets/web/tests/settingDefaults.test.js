@@ -90,6 +90,8 @@ const HOST_DEFAULTS = Object.freeze({
   amd_preanalysis: null, amd_vbaq: null, amd_coder: 'auto', amd_hevc_gop_size: -1, amd_high_motion_qb: null,
   amd_lowlatency_mode: null, amd_multi_hw_instance: null, amd_input_queue_size: null, amd_av1_latency_mode: null,
   vt_coder: 'auto', vt_software: 'auto', vt_realtime: true, sw_preset: 'superfast', sw_tune: 'zerolatency', min_threads: 2,
+  // Fork keys (src/config.cpp video/input defaults).
+  allow_client_resolution_change: false, clipboard_sync: true, file_transfer: true, file_upload: false,
 })
 
 const normalize = (value) => {

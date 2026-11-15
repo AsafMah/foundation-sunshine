@@ -633,7 +633,7 @@ jobs:
           ccache --zero-stats
           gui_options=(-DFETCH_GUI=OFF)
           # Forks fetch no upstream GUI (fetch-installer-inputs.ps1 -NoGui); the shard compiles objects only.
-          if [[ -n "${GUI_BUNDLE_DIR:-}" ]]; then gui_options+=("-DGUI_DIR=$GUI_BUNDLE_DIR"); fi
+          if [[ -n "${GUI_BUNDLE_DIR:-}" ]]; then gui_options+=("-DGUI_DIR=$GUI_BUNDLE_DIR"); else gui_options+=(-DSUNSHINE_REQUIRE_GUI_BUNDLE=OFF); fi
           cmake \
             -B build \
             -G Ninja \
@@ -775,7 +775,7 @@ jobs:
             gui_options=(-DFETCH_GUI=OFF "-DGUI_DIR=$GUI_BUNDLE_DIR")
           else
             # Forks without a built GUI (no packaging in this job) never download the upstream one.
-            gui_options=(-DFETCH_GUI=OFF)
+            gui_options=(-DFETCH_GUI=OFF -DSUNSHINE_REQUIRE_GUI_BUNDLE=OFF)
           fi
           cmake -B build-adapter-config -G Ninja -S . "${gui_options[@]}" \
             -DBUILD_DOCS=OFF -DBUILD_TESTS=ON -DBUILD_TRAY_TESTS=ON -DBUILD_WEB_UI=OFF \

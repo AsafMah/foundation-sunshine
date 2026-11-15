@@ -18,7 +18,6 @@ const NO_CONTROL = Object.freeze({
   client_fingerprint_rules_url: 'no control in the original UI',
   client_gamepad_override: 'no control in the original UI',
   clients: 'the paired clients are managed on the clients page, not a setting',
-  clipboard_sync: 'no control in the original UI',
   downscaling_quality: 'no control in the original UI',
   external_ip: 'replaced by external_endpoints, which the remote access card edits; the old key is still read',
   file_mapping_port: 'no control in the original UI',
@@ -46,6 +45,16 @@ const NO_CONTROL = Object.freeze({
   video_pacing_threshold: 'new with the poster and pacing work (bytes, 0 = off, default 65536): no control in the redesigned UI, set in the config file',
 })
 
+// Fork keys that DO have a switch (the fork sections of configs/tabs/Inputs.vue and configs/tabs/display/DisplayModes.vue) but no entry in the
+// settings search: the search index belongs to the pinned upstream foundation-ui package, which the fork does not patch.
+// Each must keep its switch; the test below checks that, so the exception cannot hide a key without a control.
+const FORK_UNINDEXED = Object.freeze({
+  allow_client_resolution_change: 'configs/tabs/display/DisplayModes.vue',
+  clipboard_sync: 'configs/tabs/Inputs.vue',
+  file_transfer: 'configs/tabs/Inputs.vue',
+  file_upload: 'configs/tabs/Inputs.vue',
+})
+
 const source = readFileSync(new URL('../../../../../src/config.cpp', import.meta.url), 'utf8')
 const hostKeys = [...new Set([...source.matchAll(/_f\(\s*vars,\s*"([a-z0-9_]+)"/g)].map((m) => m[1]))].sort()
 
@@ -60,8 +69,9 @@ test('every host configuration key is searchable, or listed as having no control
   const missing = []
   for (const key of hostKeys) {
     const row = zh.find((e) => e.keyName === key)
-    if (!row) { if (!(key in NO_CONTROL)) missing.push(key); continue }
+    if (!row) { if (!(key in NO_CONTROL) && !(key in FORK_UNINDEXED)) missing.push(key); continue }
     assert.ok(!(key in NO_CONTROL), `${key} has a control now: take it off the no-control list`)
+    assert.ok(!(key in FORK_UNINDEXED), `${key} is searchable now: take it off the fork exception list`)
     const rowEn = en.find((e) => e.keyName === key)
     assert.ok(searchEntries(zh, key, 8).includes(row), `${key} by key name`)
     assert.ok(searchEntries(zh, row.title, 12).some((e) => e.keyName === key), `${key} by Chinese label`)
@@ -72,4 +82,13 @@ test('every host configuration key is searchable, or listed as having no control
 
 test('the no-control list names only keys the host has', () => {
   for (const key of Object.keys(NO_CONTROL)) assert.ok(hostKeys.includes(key), key)
+})
+
+test('every fork key outside the search index is a host key with a switch on its page', () => {
+  for (const [key, page] of Object.entries(FORK_UNINDEXED)) {
+    assert.ok(hostKeys.includes(key), key)
+    assert.ok(!(key in NO_CONTROL), key)
+    const vue = readFileSync(new URL(`../${page}`, import.meta.url), 'utf8')
+    assert.match(vue, new RegExp(`<Cfg\\w+[^>]*\\sk="${key}"`), `${key} has no control in ${page}`)
+  }
 })
