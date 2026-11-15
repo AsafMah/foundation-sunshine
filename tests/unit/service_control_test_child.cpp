@@ -37,11 +37,14 @@ main(int argc, char **argv) {
       }
       // Pin any existing candidate before opening the reference: OpenEvent
       // itself could otherwise reuse the previously empty numeric slot.
+      // An inherited sentinel event can always be duplicated with DUPLICATE_SAME_ACCESS, so a failed
+      // duplicate (empty slot, or an unrelated object of this process that cannot be duplicated)
+      // means the sentinel is not at that slot. Treating only ERROR_INVALID_HANDLE as "absent" made
+      // the excluded case fail intermittently (exit 8) whenever the slot held such an object.
       HANDLE pinned = nullptr;
       if (!DuplicateHandle(GetCurrentProcess(), reinterpret_cast<HANDLE>(value),
-            GetCurrentProcess(), &pinned, 0, FALSE, DUPLICATE_SAME_ACCESS) &&
-          GetLastError() != ERROR_INVALID_HANDLE) {
-        return 8;
+            GetCurrentProcess(), &pinned, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
+        pinned = nullptr;
       }
       sc::handle candidate(pinned);
       sc::handle reference(OpenEventA(SYNCHRONIZE | 1, FALSE, sentinel_name.c_str()));
