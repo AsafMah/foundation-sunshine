@@ -316,11 +316,19 @@ function Remove-DeviceRecord($Record) {
   }
 }
 
-function Disable-LegacyDevice {
+function Get-LegacyDisableTargets([string[]]$InstanceIds, [string]$KeepInstanceId) {
+  # ROOT\USB\0000 is the legacy controller unless it is the one Ensure-RootDevice kept: usbip-win2's own installer creates
+  # its controller there, so on a host without an ALKAIDUSB node it is the sole exact-HWID node that was reused, and
+  # disabling it would leave the DualSense path without any controller.
+  return @($InstanceIds | Where-Object { $_ -ieq $OldInstanceId -and $_ -ine $KeepInstanceId })
+}
+
+function Disable-LegacyDevice([string]$KeepInstanceId) {
   $records = @(Get-DeviceRecords $true)
   try {
+    $targets = Get-LegacyDisableTargets @($records | ForEach-Object { $_.InstanceId }) $KeepInstanceId
     foreach ($record in $records) {
-      if ($record.InstanceId -ieq $OldInstanceId) {
+      if ($targets -contains $record.InstanceId) {
         try {
           Set-DeviceState $record.Set $record.Data $DICS_DISABLE
           Write-Verbose "Disabled legacy device $OldInstanceId."
@@ -396,7 +404,7 @@ function Ensure-RootDevice {
       $removed = Remove-DeviceRecord $duplicate
       Write-Output "$(if ($removed) { 'Removed' } else { 'Disabled' }) duplicate usbip root $($duplicate.InstanceId)."
     }
-    Disable-LegacyDevice
+    Disable-LegacyDevice $canonical.InstanceId
     return [pscustomobject]@{ RootPresent = $true; InstanceId = $canonical.InstanceId; NeedReboot = [bool]($created -and $created.NeedReboot) }
   }
   catch {
@@ -485,6 +493,8 @@ function Write-Result([string]$Operation, [bool]$RootPresent, [string]$InstanceI
   } | ConvertTo-Json -Compress
 }
 
+# Dot-sourcing (tests/tools/test_usbip_win2_root.ps1) loads the functions only.
+if ($MyInvocation.InvocationName -ne '.') {
 try {
   if ($Action -ne 'status' -and -not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw 'Administrative privileges are required for this action.'
@@ -530,4 +540,5 @@ catch {
     ds4_fallback = 'DS4 fallback remains active because the usbip-win2 root device could not be prepared.'
   } | ConvertTo-Json -Compress
   exit 1
+}
 }

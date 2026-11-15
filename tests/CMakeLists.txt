@@ -1229,6 +1229,15 @@ if(Python3_Interpreter_FOUND)
                 --source "${CMAKE_SOURCE_DIR}")
     set_tests_properties(protocol_flag_registry_tests PROPERTIES TIMEOUT 60)
 endif()
+if(WIN32)
+    find_program(WINDOWS_POWERSHELL_EXECUTABLE powershell)
+    if(WINDOWS_POWERSHELL_EXECUTABLE)
+        add_test(NAME usbip_win2_root_tests
+                COMMAND "${WINDOWS_POWERSHELL_EXECUTABLE}" -NoProfile -ExecutionPolicy Bypass
+                    -File "${CMAKE_SOURCE_DIR}/tests/tools/test_usbip_win2_root.ps1")
+        set_tests_properties(usbip_win2_root_tests PROPERTIES TIMEOUT 60)
+    endif()
+endif()
 find_program(REVERSE_TUNNEL_OPENSSL_EXECUTABLE openssl)
 if (Python3_Interpreter_FOUND AND REVERSE_TUNNEL_OPENSSL_EXECUTABLE)
     # The gate builds the ctest targets only; the probe is built here so the
