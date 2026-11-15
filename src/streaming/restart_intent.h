@@ -11,11 +11,12 @@
 #include <utility>
 
 namespace streaming::restart_intent {
-  // Next free fork registry bits below upstream endpoint refresh (0x8000); session state owns LI 0x800 / ML 0x100.
+  // Fork registry bits (tests/tools/test_protocol_flag_registry.py): 0x8000 endpoint refresh, 0x4000 bitrate callback and
+  // LI 0x2000 client resolution change are taken; session state owns LI 0x800 / ML 0x100.
   // The v1 reason, version attributes and wire layout remain unchanged.
   inline constexpr std::uint32_t SS_TERMINATION_HOST_RESTART_V1 = 0x53535201;
-  inline constexpr std::uint32_t LI_FF_HOST_RESTART = 0x4000;
-  inline constexpr std::uint32_t ML_FF_HOST_RESTART = 0x4000;
+  inline constexpr std::uint32_t LI_FF_HOST_RESTART = 0x1000;
+  inline constexpr std::uint32_t ML_FF_HOST_RESTART = 0x1000;
   inline constexpr std::uint32_t GRACEFUL_TERMINATION = 0x80030023;
   inline constexpr std::uint32_t LI_HOST_RESTART_PROTOCOL_VERSION = 1;
   inline constexpr std::string_view HOST_VERSION_ATTRIBUTE = "x-ss-restart.protocolVersion";

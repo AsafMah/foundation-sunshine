@@ -46,21 +46,31 @@ a migration.
 
 The fork-reserved v1 capability allocations are:
 `SS_TERMINATION_HOST_RESTART_V1=0x53535201`,
-`LI_FF_HOST_RESTART=0x4000`, `ML_FF_HOST_RESTART=0x4000`, and
+`LI_FF_HOST_RESTART=0x1000`, `ML_FF_HOST_RESTART=0x1000`, and
 `LI_HOST_RESTART_PROTOCOL_VERSION=1`. Host and client must both negotiate their
 feature bit and `x-ss-restart.protocolVersion:1` /
 `x-ml-restart.protocolVersion:1`, with encrypted control. Only an accepted
 session receives restart reason bytes `53 53 52 01`; genuine stops and legacy
 sessions retain `80 03 00 23`. No packet layout or existing encryption changes.
 
-Upstream's protocol extension registry
-(`third-party/moonlight-common-c/docs/protocol-extension-registry.md`) allocates
-fork extensions from `0x8000` downward and assigns `0x8000` to endpoint auto
-refresh, so restart uses the next free bit, `0x4000`. Host-session lock state
-retains host bit `0x800` / client bit `0x100`. `protocol_flag_registry_tests`
-fails if a host flag reuses a registry value under another name or two host
-capabilities share a bit. Earlier fork releases used `0x800`/`0x100`,
-`0x1000`/`0x200` and then `0x8000`/`0x8000`; there is
+Feature-bit allocations (LI = host `x-ss-general.featureFlags`, ML = client
+`x-ml-general.featureFlags`) are kept in one table, `ALLOCATIONS` in
+`tests/tools/test_protocol_flag_registry.py`: upstream's registry
+(`third-party/moonlight-common-c/docs/protocol-extension-registry.md`), upstream
+reservations not yet in the pinned registry, and the fork's own. Fork and recent
+upstream bits are `0x8000` endpoint auto refresh (LI/ML, upstream), `0x4000`
+bitrate callback (LI/ML, upstream), LI `0x2000` client resolution change
+(fork, #729), LI/ML `0x1000` restart intent (fork) and LI `0x400` controller
+haptics (upstream, reserved first). LI `0x10000` is reserved for the
+unreleased multi-screen `display_group`. `protocol_flag_registry_tests` compares
+every LI/ML definition in the host and the pinned common-c headers **by value**,
+whatever it is called (`LI_FF_*`, `ML_FF_*`, `platform_caps::*`, `*_feature`),
+and fails on a collision, an unallocated bit, or a registry row that disagrees.
+Host-session lock state retains host bit `0x800` / client bit `0x100`. LI
+`0x1000` meant restart intent in its only earlier use (host .13, Moonlight
+6.5.3.222/.224), so an old peer advertising it is read with its original
+meaning. Earlier fork releases used `0x800`/`0x100`, `0x1000`/`0x200`,
+`0x8000`/`0x8000` and then `0x4000`/`0x4000`; there is
 deliberately no legacy-bit alias. Ship the matching Moonlight/common-c update
 first. Clients with either earlier allocation lose restart-intent negotiation
 and receive ordinary termination; older receivers ignore the unknown `0x550E`

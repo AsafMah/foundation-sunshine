@@ -1,76 +1,131 @@
-"""Gate host protocol feature bits against the pinned common-c allocation registry."""
+"""Gate the host's protocol feature bits by value against one allocation table.
+
+Every LI (host-advertised, x-ss-general.featureFlags) and ML (client opt-in, x-ml-general.featureFlags) bit defined in the
+host sources or the pinned moonlight-common-c headers must match ALLOCATIONS by value: a value that the table gives to another
+meaning is a collision, whatever the constant is called (LI_FF_*, ML_FF_*, platform_caps::*, *_feature). The pinned registry
+(docs/protocol-extension-registry.md) must agree with the table too, so an upstream reassignment fails here first.
+"""
 import argparse
 import re
 import sys
 import unittest
 from pathlib import Path
 
-REGISTRY = Path("third-party/moonlight-common-c/docs/protocol-extension-registry.md")
-CAPS_HEADER = Path("src/platform/common.h")
-ROW = re.compile(r"^\|\s*`(?P<name>(?:LI|ML)_FF_[A-Z0-9_]+)`\s*\|\s*`(?P<value>0x[0-9A-Fa-f]+)`\s*\|", re.M)
-DEFINITION = re.compile(
-    r"(?:#define\s+(?P<d_name>(?:LI|ML)_FF_[A-Z0-9_]+)\s+(?P<d_value>0x[0-9A-Fa-f]+))"
-    r"|(?:constexpr\s+[\w:]+\s+(?P<c_name>(?:LI|ML)_FF_[A-Z0-9_]+)\s*=\s*(?P<c_value>0x[0-9A-Fa-f]+))")
+COMMON_C = Path("third-party/moonlight-common-c")
+REGISTRY = COMMON_C / "docs/protocol-extension-registry.md"
+
+# The fork's view of both registries: upstream rows, upstream reservations not yet in the pinned registry, and fork allocations.
+ALLOCATIONS = {
+    "LI": {
+        0x1: "PEN_TOUCH", 0x2: "CONTROLLER_TOUCH", 0x4: "CLIPBOARD_TEXT", 0x8: "CLIPBOARD_IMAGE", 0x10: "TOUCHPAD",
+        0x20: "TOUCHPAD_FRAME", 0x40: "CURSOR_SHAPE", 0x80: "DS5_HAPTICS_PCM", 0x100: "DYNAMIC_SDR_WHITE",
+        0x200: "REMOTE_TEXT_CONTEXT",
+        0x400: "CONTROLLER_HAPTICS",  # upstream (qiin), claimed first
+        0x800: "HOST_SESSION_STATE",
+        0x1000: "HOST_RESTART",  # fork: restart intent v1
+        0x2000: "CLIENT_RESOLUTION_CHANGE",  # fork: #729 client-requested resolution changes
+        0x4000: "BITRATE_CALLBACK",  # upstream: host-to-client runtime bitrate (0x5506 subtype 2)
+        0x8000: "ENDPOINT_AUTO_REFRESH",
+        0x10000: "DISPLAY_GROUP",  # fork: reserved for the unreleased multi-screen prototype
+    },
+    "ML": {
+        0x1: "FEC_STATUS", 0x2: "SESSION_ID_V1", 0x4: "DS5_HAPTICS_PCM", 0x8: "DS5_HAPTICS_IR_V2", 0x10: "REMOTE_TEXT_CONTEXT",
+        0x20: "PYROWAVE", 0x40: "DS5_HAPTICS_STATE", 0x80: "DS5_HAPTICS_IR_EXTENDED", 0x100: "HOST_SESSION_STATE",
+        0x1000: "HOST_RESTART",  # fork: restart intent v1
+        0x4000: "BITRATE_CALLBACK",  # upstream
+        0x8000: "ENDPOINT_AUTO_REFRESH",
+    },
+}
+# Values the fork release depends on; a change here is a protocol change and must be made on purpose.
+PINNED = {("LI", "HOST_RESTART"): 0x1000, ("ML", "HOST_RESTART"): 0x1000, ("LI", "CLIENT_RESOLUTION_CHANGE"): 0x2000,
+          ("LI", "BITRATE_CALLBACK"): 0x4000, ("ML", "BITRATE_CALLBACK"): 0x4000,
+          ("LI", "ENDPOINT_AUTO_REFRESH"): 0x8000, ("ML", "ENDPOINT_AUTO_REFRESH"): 0x8000}
+
+ROW = re.compile(r"^\|\s*`(?P<ns>LI|ML)_FF_(?P<name>[A-Z0-9_]+)`\s*\|\s*`(?P<value>0x[0-9A-Fa-f]+)`\s*\|", re.M)
+PREFIXED = re.compile(
+    r"(?:#define\s+(?P<ns1>LI|ML)_FF_(?P<n1>[A-Z0-9_]+)\s+\(?(?P<v1>0x[0-9A-Fa-f]+))"
+    r"|(?:constexpr\s+[\w:]+\s+(?P<ns2>LI|ML)_FF_(?P<n2>[A-Z0-9_]+)\s*=\s*(?P<v2>0x[0-9A-Fa-f]+))")
 CAPS_BLOCK = re.compile(r"namespace platform_caps\s*\{(?P<body>.*?)\};", re.S)
 CAP = re.compile(r"constexpr\s+caps_t\s+(?P<name>\w+)\s*=\s*(?P<value>0x[0-9A-Fa-f]+)")
+FEATURE = re.compile(r"constexpr\s+std::uint32_t\s+(?P<name>\w+)_feature\s*=\s*(?P<value>0x[0-9A-Fa-f]+)")
 
 
-def registry_flags(text):
-    """Return {(namespace, value): identifier} from the registry tables."""
-    flags = {}
-    for match in ROW.finditer(text):
-        name = match["name"]
-        flags[(name[:2], int(match["value"], 16))] = name
-    return flags
+def meaning(name):
+    name = name.upper()
+    for suffix in ("_EVENTS", "_FEATURE"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+    return name
 
 
-def fork_definitions(sources):
-    """Yield (path, identifier, value) for every LI_FF_/ML_FF_ definition in host sources."""
+def definitions(sources):
+    """Yield (where, namespace, meaning, value) for every feature bit definition, whatever its spelling."""
     for path, text in sources:
-        for match in DEFINITION.finditer(text):
-            name = match["d_name"] or match["c_name"]
-            yield path, name, int(match["d_value"] or match["c_value"], 16)
+        for m in PREFIXED.finditer(text):
+            ns, name, value = (m["ns1"], m["n1"], m["v1"]) if m["ns1"] else (m["ns2"], m["n2"], m["v2"])
+            yield f"{path}: {ns}_FF_{name}", ns, meaning(name), int(value, 16)
+        block = CAPS_BLOCK.search(text)
+        if block:
+            for m in CAP.finditer(block["body"]):
+                yield f"{path}: platform_caps::{m['name']}", "LI", meaning(m["name"]), int(m["value"], 16)
+        if path.replace("\\", "/").endswith("dynamic_param_protocol.h"):
+            for m in FEATURE.finditer(text):
+                yield f"{path}: {m['name']}_feature", "ML", meaning(m["name"]), int(m["value"], 16)
 
 
-def host_caps(text):
-    block = CAPS_BLOCK.search(text)
-    return [(m["name"], int(m["value"], 16)) for m in CAP.finditer(block["body"])] if block else []
-
-
-def collisions(registry_text, sources, caps_text):
-    registry = registry_flags(registry_text)
+def check(registry_text, sources, allocations=ALLOCATIONS, pinned=PINNED):
     problems = []
-    definitions = list(fork_definitions(sources))
-    for path, name, value in definitions:
-        owner = registry.get((name[:2], value))
-        if owner and owner != name:
-            problems.append(f"{path}: {name}=0x{value:X} collides with registry {owner}")
-    # Advertised host bits must be distinct across platform caps and fork LI_FF_ constants.
-    host_bits = {}
-    for name, value in host_caps(caps_text) + [(n, v) for _, n, v in definitions if n.startswith("LI_")]:
-        if value in host_bits and host_bits[value] != name:
-            problems.append(f"host bit 0x{value:X} is shared by {host_bits[value]} and {name}")
-        host_bits.setdefault(value, name)
+    by_name = {ns: {v: k for k, v in table.items()} for ns, table in allocations.items()}
+    for m in ROW.finditer(registry_text):
+        ns, name, value = m["ns"], meaning(m["name"]), int(m["value"], 16)
+        if allocations[ns].get(value) != name or by_name[ns].get(name) != value:
+            problems.append(f"registry {ns}_FF_{m['name']}=0x{value:X} disagrees with the allocation table "
+                            f"(table: 0x{value:X} is {allocations[ns].get(value)}, {name} is {by_name[ns].get(name)})")
+    seen = {}
+    for where, ns, name, value in definitions(sources):
+        owner = allocations[ns].get(value)
+        if owner is None:
+            problems.append(f"{where}=0x{value:X}: unallocated {ns} bit; reserve it in ALLOCATIONS first")
+        elif owner != name:
+            problems.append(f"{where}=0x{value:X} collides by value with {ns} {owner}")
+        expected = by_name[ns].get(name)
+        if expected is not None and expected != value:
+            problems.append(f"{where}=0x{value:X} but the table allocates {ns} {name} = 0x{expected:X}")
+        seen.setdefault((ns, name), set()).add(value)
+    for key, value in pinned.items():
+        if seen.get(key) != {value}:
+            problems.append(f"{key[0]} {key[1]} must be defined as exactly 0x{value:X} (found {sorted(seen.get(key, []))})")
     return problems
 
 
-class CollisionDetectorTests(unittest.TestCase):
-    REGISTRY_TEXT = "| `LI_FF_ENDPOINT_AUTO_REFRESH` | `0x8000` | x |\n| `ML_FF_ENDPOINT_AUTO_REFRESH` | `0x8000` | x |\n"
-    CAPS_TEXT = "namespace platform_caps {\n constexpr caps_t endpoint_auto_refresh = 0x8000;\n};"
+class GateTests(unittest.TestCase):
+    ALLOC = {"LI": {0x4000: "BITRATE_CALLBACK", 0x1000: "HOST_RESTART"}, "ML": {0x4000: "BITRATE_CALLBACK", 0x1000: "HOST_RESTART"}}
+    PIN = {("LI", "HOST_RESTART"): 0x1000, ("ML", "HOST_RESTART"): 0x1000}
 
-    def test_reused_registry_value_is_reported(self):
-        source = [("restart_intent.h", "inline constexpr std::uint32_t ML_FF_HOST_RESTART = 0x8000;")]
-        self.assertEqual(len(collisions(self.REGISTRY_TEXT, source, "")), 1)
+    def test_ml_collision_by_value_under_a_different_spelling(self):
+        # the case the name-based gate missed: upstream's bitrate_callback_feature against our restart bit
+        sources = [("restart_intent.h", "constexpr std::uint32_t LI_FF_HOST_RESTART = 0x1000;\n"
+                                        "constexpr std::uint32_t ML_FF_HOST_RESTART = 0x4000;"),
+                   ("src/streaming/dynamic_param_protocol.h", "constexpr std::uint32_t bitrate_callback_feature = 0x4000;")]
+        problems = check("", sources, self.ALLOC, self.PIN)
+        self.assertTrue(any("ML_FF_HOST_RESTART=0x4000 collides by value with ML BITRATE_CALLBACK" in p for p in problems), problems)
 
-    def test_shared_host_bit_is_reported(self):
-        source = [("restart_intent.h", "inline constexpr std::uint32_t LI_FF_HOST_RESTART = 0x8000;")]
-        problems = collisions("", source, self.CAPS_TEXT)
-        self.assertTrue(any("shared" in p for p in problems), problems)
+    def test_platform_cap_collision(self):
+        sources = [("common.h", "namespace platform_caps {\n constexpr caps_t bitrate_callback = 0x1000;\n};")]
+        self.assertTrue(check("", sources, self.ALLOC, {}))
 
-    def test_same_identifier_and_free_bits_pass(self):
-        source = [("stream.cpp", "#define ML_FF_ENDPOINT_AUTO_REFRESH 0x8000"),
-                  ("restart_intent.h", "inline constexpr std::uint32_t LI_FF_HOST_RESTART = 0x4000;")]
-        self.assertEqual(collisions(self.REGISTRY_TEXT, source, self.CAPS_TEXT), [])
+    def test_registry_reassignment_fails(self):
+        self.assertTrue(check("| `LI_FF_SOMETHING_ELSE` | `0x1000` | x |\n", [], self.ALLOC, {}))
+
+    def test_unallocated_bit_fails(self):
+        self.assertTrue(check("", [("x.h", "#define LI_FF_NEW 0x20000")], self.ALLOC, {}))
+
+    def test_consistent_tree_passes(self):
+        sources = [("restart_intent.h", "constexpr std::uint32_t LI_FF_HOST_RESTART = 0x1000;\n"
+                                        "constexpr std::uint32_t ML_FF_HOST_RESTART = 0x1000;"),
+                   ("src/streaming/dynamic_param_protocol.h", "constexpr std::uint32_t bitrate_callback_feature = 0x4000;"),
+                   ("common.h", "namespace platform_caps {\n constexpr caps_t bitrate_callback = 0x4000;\n};")]
+        self.assertEqual(check("| `ML_FF_BITRATE_CALLBACK` | `0x4000` | x |", sources, self.ALLOC, self.PIN), [])
 
 
 def check_tree(root):
@@ -78,14 +133,13 @@ def check_tree(root):
     if not registry.is_file():
         print(f"missing {registry}; initialise the moonlight-common-c submodule", file=sys.stderr)
         return 1
+    files = sorted((root / "src").rglob("*")) + sorted((root / COMMON_C / "src").glob("*.h"))
     sources = [(str(p.relative_to(root)), p.read_text(encoding="utf-8", errors="replace"))
-               for p in sorted((root / "src").rglob("*")) if p.suffix in {".h", ".hpp", ".cpp", ".c"}]
-    problems = collisions(registry.read_text(encoding="utf-8"), sources,
-                          (root / CAPS_HEADER).read_text(encoding="utf-8"))
+               for p in files if p.suffix in {".h", ".hpp", ".cpp", ".c"}]
+    problems = check(registry.read_text(encoding="utf-8"), sources)
     for problem in problems:
         print(problem, file=sys.stderr)
-    print(f"checked {len(registry_flags(registry.read_text(encoding='utf-8')))} registry flags, "
-          f"{len(list(fork_definitions(sources)))} host definitions: {len(problems)} collision(s)")
+    print(f"checked {sum(1 for _ in definitions(sources))} feature-bit definitions: {len(problems)} problem(s)")
     return 1 if problems else 0
 
 
