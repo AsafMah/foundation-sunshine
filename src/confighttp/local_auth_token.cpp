@@ -29,6 +29,9 @@
 #ifdef _WIN32
   #include <aclapi.h>
   #include <windows.h>
+  #include <wtsapi32.h>
+
+  #include "token_user_session.h"
 #else
   #include <sys/stat.h>
 #endif
@@ -57,6 +60,7 @@ namespace confighttp::local_auth_token {
     struct user_identity_t {
       bool system = false;
       std::vector<BYTE> sid;
+      std::uint32_t session = 0xFFFFFFFF;  ///< the session whose user was granted (SYSTEM only; for the log)
     };
 
     std::mutex monitor_mutex;
@@ -127,6 +131,36 @@ namespace confighttp::local_auth_token {
       return IsValidSid(storage.data()) != FALSE;
     }
 
+    token_user_session::wts_view_t
+    real_wts_view() {
+      return {
+        [] { return static_cast<std::uint32_t>(WTSGetActiveConsoleSessionId()); },
+        [] {
+          std::vector<token_user_session::session_t> out;
+          PWTS_SESSION_INFOW sessions = nullptr;
+          DWORD count = 0;
+          if (!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &count)) {
+            // An unknown session list fails closed (token_user_session.h).
+            out.push_back({ 0, false, false, false });
+            return out;
+          }
+          for (DWORD i = 0; i < count; ++i) {
+            LPWSTR user = nullptr;
+            DWORD bytes = 0;
+            bool has_user = false;
+            const bool known = WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, sessions[i].SessionId, WTSUserName, &user, &bytes) != FALSE;
+            if (known) {
+              has_user = user && user[0] != L'\0';
+              WTSFreeMemory(user);
+            }
+            out.push_back({ static_cast<std::uint32_t>(sessions[i].SessionId), sessions[i].State == WTSActive, has_user, known });
+          }
+          WTSFreeMemory(sessions);
+          return out;
+        },
+      };
+    }
+
     bool
     query_user_identity(user_identity_t &identity) {
       // A SYSTEM service may query the physical console token only through
@@ -136,13 +170,17 @@ namespace confighttp::local_auth_token {
       identity.system = platf::is_running_as_system();
       HANDLE token = nullptr;
       if (identity.system) {
-        token = platf::retrieve_users_token(false);
-        if (!token) {
-          // A service can start before a console user logs on.  In that state
+        // The console user, or the lone active Remote Desktop user when the console is at the sign-in screen
+        // (token_user_session.h); nobody when it is ambiguous.
+        const auto session = token_user_session::pick(real_wts_view());
+        if (!session || !WTSQueryUserToken(*session, &token)) {
+          // A service can start before a user signs in.  In that state
           // the DACL intentionally contains only SYSTEM and Administrators.
           identity.sid.clear();
+          identity.session = token_user_session::no_session;
           return true;
         }
+        identity.session = *session;
       }
       else if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
         return false;
@@ -283,7 +321,8 @@ namespace confighttp::local_auth_token {
   namespace {
     bool
     same_identity(const user_identity_t &left, const user_identity_t &right) {
-      return left.system == right.system && left.sid == right.sid;
+      // The session too: the same account moving between the console and Remote Desktop gets a fresh token.
+      return left.system == right.system && left.sid == right.sid && left.session == right.session;
     }
 
     bool
@@ -314,7 +353,15 @@ namespace confighttp::local_auth_token {
       if (same_identity(identity, current_identity)) return;
       current_token.clear();
       if (!rotate_token_locked(identity)) {
-        BOOST_LOG(error) << "Could not rotate the local Web UI token after the console user changed";
+        BOOST_LOG(error) << "Could not rotate the local Web UI token after the signed-in user changed";
+      }
+      else if (identity.system) {
+        if (identity.sid.empty()) {
+          BOOST_LOG(info) << "Local host credential: no single signed-in user; readable by SYSTEM and Administrators only";
+        }
+        else {
+          BOOST_LOG(info) << "Local host credential: readable by the user of session " << identity.session;
+        }
       }
     }
   }  // namespace

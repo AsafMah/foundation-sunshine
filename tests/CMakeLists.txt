@@ -636,6 +636,7 @@ add_test(NAME session_store_unit_tests COMMAND session_store_unit_tests)
 # of globals those handlers read.
 add_executable(session_auth_routes_unit_tests
         ${CMAKE_SOURCE_DIR}/tests/unit/test_session_auth_routes.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_token_user_session.cpp
         ${CMAKE_SOURCE_DIR}/src/confighttp/auth.cpp
         ${CMAKE_SOURCE_DIR}/src/confighttp/local_auth_token.cpp
         ${CMAKE_SOURCE_DIR}/src/confighttp/common.cpp
