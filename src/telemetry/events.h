@@ -27,6 +27,15 @@ namespace telemetry {
   inline constexpr std::size_t MAX_MESSAGE_CHARS = 200;
   /** The longest message of a user_report (what the person wrote in the error dialog). */
   inline constexpr std::size_t MAX_USER_REPORT_CHARS = 2000;
+  /** The longest contact line a person can leave with a user_report. */
+  inline constexpr std::size_t MAX_USER_CONTACT_CHARS = 200;
+  /** The most bytes of a screenshot that is taken with a feedback report (the page sends at most 700 KB; the Worker takes 1 MiB). */
+  inline constexpr std::size_t MAX_USER_SHOT_BYTES = 800 * 1024;
+
+  /** What the host tells the page about a batch besides how many events it kept. `shot`: what became of the screenshot of a feedback report in the batch ("uploaded", or why it was left out); empty when there was none. */
+  struct ingest_report_t {
+    std::string shot;
+  };
 
   enum class kind_e {
     usage,
@@ -52,12 +61,39 @@ namespace telemetry {
     nlohmann::json props = nlohmann::json::object();
     std::string product = "host";  ///< host | panel | web | sparxie-launch
     std::string version;  ///< product version when it differs from the host's (panel and web); empty = the host's
+    int priority = -1;  ///< 0, 1 or 2 (see event_priority); -1: by the event's name
+    std::string report_id;  ///< a feedback report sent with both switches off: its one-time random id, used in place of an install id (empty for every other event)
+    std::string report_install;  ///< a feedback report: the install id it was given when it was accepted (empty when it has a one-time `report_id` instead, and for every other event). The identity of a report is fixed at that moment and never looked up again
+    std::uint64_t count = 1;  ///< occurrences the sender merged into this record (see aggregate_events); 1 is a single event
+    std::string session_id;  ///< a record about an earlier run (session_abnormal): that run's session id, sent in an envelope of its own; empty = this run
   };
+
+  /** True for the high-volume usage and experience families the sender holds and merges before it uploads. */
+  bool high_volume_event(std::string_view name);
+
+  /** True when a stage of a stream start took longer than its bound (3 s; 5 s for the app launch and the first frame): only those are worth an event. */
+  bool stage_is_slow(std::string_view stage, std::int64_t ms);
+
+  /**
+   * Merges the high-volume events of one batch by name, kind, version and their non-numeric properties. Counters and bucket vectors (page_vitals, api_latency) are summed, the other numbers are
+   * averaged, `count` holds the occurrences. Everything else (priority records, reports) passes through unchanged. `origin[i]` lists the positions in `events` that went into the result `i`.
+   */
+  std::vector<event_t> aggregate_events(const std::vector<event_t> &events, std::vector<std::vector<std::size_t>> &origin);
+
+  /**
+   * How much an event matters when something has to give: 0 is never sampled away, sent first and the last to be dropped (user reports, fatal errors, the first report of an error, serious stream problems, the
+   * per-stream summary); 1 is reduced when the server asks (further reports of a known error, smaller problems, comparisons with the install's own baseline); 2 is the first to shrink or stop (usage, performance detail).
+   */
+  int
+  event_priority(const event_t &event);
 
   /** Products the host sender accepts events for. */
   bool known_product(std::string_view product);
   /** Event names a page (panel or web) may send through the host API; the host-only names (streams, quality, log summary) are refused so one stream is never counted twice. */
   bool client_may_send(std::string_view product, kind_e kind, std::string_view name);
+
+  /** A feedback report the person sent on purpose: pressing 发送 is the consent for that one send, so the error-report switch does not hold it back. */
+  inline bool is_user_report(kind_e kind, std::string_view name) { return kind == kind_e::error && name == "user_report"; }
 
   /**
    * Text with names, addresses, paths and secrets removed, no control characters, cut to `max` characters (counted as UTF-8 code points).
@@ -113,6 +149,11 @@ namespace telemetry {
    * `events` must all carry `product`; a product version on an event (panel, web) replaces the context's version.
    */
   std::vector<nlohmann::json> build_envelopes(const context_t &context, std::string_view product, const std::vector<event_t> &events);
+
+  /** The same, and `members` receives the positions in `events` that every envelope holds (a version starts its own envelope, so they are not a range): a caller that
+   *  puts back what a failed write left unwritten re-queues the events of the envelopes that were not pushed, not the whole group. */
+  std::vector<nlohmann::json> build_envelopes(const context_t &context, std::string_view product, const std::vector<event_t> &events,
+    std::vector<std::vector<std::size_t>> &members);
 
   /** event <-> json (the form kept in the disk queue and sent in a batch). */
   nlohmann::json event_to_json(const event_t &event);

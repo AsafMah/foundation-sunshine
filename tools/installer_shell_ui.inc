@@ -308,41 +308,15 @@ panel_exe() {
   return GetFileAttributesW(exe.c_str()) == INVALID_FILE_ATTRIBUTES ? std::wstring() : exe;
 }
 
-// The host records the start guide in its configuration (config\sunshine.conf next to sunshine.exe): the keys
-// guide_done, guide_finished, guide_closed and guide_active that foundation-ui guideHost.js writes. Only
-// guide_finished matters here. An unreadable file reads as "not recorded".
-bool
-guide_finished_on_host() {
-  const std::wstring dir = install_dir();
-  if (dir.empty()) return false;
-  const std::string conf = read_file(dir + L"\\config\\sunshine.conf");
-  const auto trim = [](std::string v) {
-    while (!v.empty() && (v.back() == ' ' || v.back() == '\t' || v.back() == '\r')) v.pop_back();
-    size_t b = 0;
-    while (b < v.size() && (v[b] == ' ' || v[b] == '\t')) ++b;
-    return v.substr(b);
-  };
-  size_t pos = 0;
-  while (pos < conf.size()) {
-    size_t end = conf.find('\n', pos);
-    if (end == std::string::npos) end = conf.size();
-    const std::string line = conf.substr(pos, end - pos);
-    pos = end + 1;
-    const size_t eq = line.find('=');
-    if (eq == std::string::npos || trim(line.substr(0, eq)) != "guide_finished") continue;
-    const std::string value = trim(line.substr(eq + 1));
-    return value == "true" || value == "1";
-  }
-  return false;
-}
-
-// 开启串流旅程 opens the Panel at the start guide only when the guide is still to do: always after a fresh install;
-// after an upgrade or a maintenance run only when the host has not recorded the guide as finished. Otherwise the
-// Panel starts plainly and its own first-run logic (guideEntry) decides.
+// 开启串流旅程 opens the Panel at the start guide only for a first run (installer_guide.h): a fresh install passes --start-guide
+// until the host records the guide as finished (guide_finished) or closed (guide_closed) in config\sunshine.conf next to
+// sunshine.exe, which foundation-ui guideHost.js writes. An upgrade or a maintenance run never passes it: the Panel's own
+// first-run logic (guideEntry) decides and shows what is new once per version. An unreadable file reads as "not recorded".
 bool
 guide_pending() {
-  if (!S.v.upgrade && !S.v.maintenance) return true;
-  return !guide_finished_on_host();
+  const std::wstring dir = install_dir();
+  const std::string conf = dir.empty() ? std::string() : read_file(dir + L"\\config\\sunshine.conf");
+  return installer_guide::start_guide(S.v.upgrade, S.v.maintenance, conf);
 }
 
 // The panel is started from this (user-level) process, so it gets the user's token and the
@@ -807,10 +781,10 @@ std::wstring
 component_list() {
   // tile order: vdd, gamepad, usbip, vmouse, firewall, autostart, tools, then the desktop shortcut task
   static const wchar_t *names[] = { L"vdd", L"gamepad", L"usbip", L"vmouse", L"firewall", L"autostart", L"tools" };
-  bool all = true;
-  for (int i = 0; i < kTileCount; ++i) all = all && S.v.tiles[i];
-  g_run.tasks = all ? L"" : (S.v.tiles[7] ? L"desktopicon" : L"none");
-  if (all) return {};
+  // Always the explicit current selection, never an empty "use the defaults": the setup engine has UsePreviousSetupType=yes, and
+  // without /COMPONENTS and /MERGETASKS it restores the choices of the last install, so a component unticked now (USB/IP) would
+  // be installed again.
+  g_run.tasks = S.v.tiles[7] ? L"desktopicon" : L"none";
   std::wstring list = L"application,assets,gui";
   for (int i = 0; i < 7; ++i)
     if (S.v.tiles[i]) list += std::wstring(L",") + names[i];
@@ -1012,6 +986,9 @@ click(int id) {
         S.v.opening = !S.v.panel_failed;
         S.opening_since = GetTickCount64();
         go(pg::done);
+        // The Panel is a process of its own: once it was started the installer has nothing left to do and closes after "Opening…" was seen. A Panel that did not start keeps the
+        // window, with the retry on the same button.
+        if (!S.v.panel_failed) SetTimer(S.window, kCloseTimer, kCloseAfterLaunchMs, nullptr);
       }
       else {
         restart_windows();  // the weak button; Windows asks open apps to close, and the user can cancel there
@@ -1256,6 +1233,11 @@ window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
       draw_control(*reinterpret_cast<DRAWITEMSTRUCT *>(lparam));
       return TRUE;
     case WM_TIMER:
+      if (wparam == kCloseTimer) {
+        KillTimer(window, kCloseTimer);
+        if (S.v.page == pg::done && !S.v.panel_failed) DestroyWindow(window);
+        return 0;
+      }
       if (wparam == kTimer) {
         poll_run();
         if (S.v.page != pg::uac && S.v.page != pg::installing) KillTimer(window, kTimer);
@@ -1311,6 +1293,7 @@ window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
       return 0;
     case WM_DESTROY:
       KillTimer(window, kTimer);
+      KillTimer(window, kCloseTimer);
       release_target();
       S.tcache.clear();
       if (S.brand_source) {

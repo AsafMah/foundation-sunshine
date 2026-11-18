@@ -18,6 +18,9 @@
 // local includes
 #include "mic_write.h"
 #include "misc.h"
+#include "src/audio_default_wait.h"
+#include "src/audio_devices.h"
+#include "src/audio_sink_plan.h"
 #include "src/config.h"
 #include "src/globals.h"
 #include "src/logging.h"
@@ -385,23 +388,125 @@ namespace platf::audio {
     return audio_client;
   }
 
+  /**
+   * @brief The default playback device, without logging.
+   * @param status Receives the HRESULT of the call when given. `E_NOTFOUND` means the system has no playback device that is enabled.
+   */
   device_t
-  default_device(device_enum_t &device_enum) {
+  default_device_quiet(device_enum_t &device_enum, HRESULT *status = nullptr) {
     device_t device;
-    HRESULT status;
-    status = device_enum->GetDefaultAudioEndpoint(
+    const HRESULT result = device_enum->GetDefaultAudioEndpoint(
       eRender,
       eConsole,
       &device);
+    if (status) {
+      *status = result;
+    }
+    if (FAILED(result)) {
+      return nullptr;
+    }
+    return device;
+  }
 
-    if (FAILED(status)) {
-      BOOST_LOG(error) << "Couldn't get default audio endpoint [0x"sv << util::hex(status).to_string_view() << ']';
+  // A computer with no playback device asks again every few seconds while it waits: each reason is said once per audio session
+  // (audio_control() starts a new one), later answers go to the debug level.
+  audio_default_wait::once_per_session_t default_device_notice;
 
+  device_t
+  default_device(device_enum_t &device_enum) {
+    HRESULT status = S_OK;
+    auto device = default_device_quiet(device_enum, &status);
+    if (!device) {
+      const bool not_found = status == HRESULT_FROM_WIN32(ERROR_NOT_FOUND);  // E_NOTFOUND
+      const auto reason = not_found ? audio_default_wait::reason::no_default : audio_default_wait::reason::service;
+      if (default_device_notice.first(reason)) {
+        if (not_found) {
+          BOOST_LOG(warning) << "The system has no default playback device (no speakers, headphones or virtual speaker is enabled), "
+                                "so there is nothing to capture; the stream goes on without sound until one appears [0x"sv
+                             << util::hex(status).to_string_view() << ']';
+        }
+        else {
+          BOOST_LOG(warning) << "The default playback device is not available (the Windows audio service did not answer) [0x"sv
+                             << util::hex(status).to_string_view() << ']';
+        }
+      }
+      else {
+        BOOST_LOG(debug) << "Still no default playback device [0x"sv << util::hex(status).to_string_view() << ']';
+      }
       return nullptr;
     }
 
     return device;
   }
+
+  /// Raises a gate when a playback device appears, becomes active, or becomes the default: the wait for a device ends at once
+  /// instead of at the next poll (IMMNotificationClient, Microsoft Learn: "Device events in the Core Audio APIs").
+  class device_arrival_t: public ::IMMNotificationClient {
+  public:
+    explicit device_arrival_t(audio_default_wait::gate_t &gate):
+        gate { gate } {}
+
+    // IUnknown implementation (unused by IMMDeviceEnumerator)
+    ULONG STDMETHODCALLTYPE
+    AddRef() {
+      return 1;
+    }
+
+    ULONG STDMETHODCALLTYPE
+    Release() {
+      return 1;
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    QueryInterface(REFIID riid, VOID **ppvInterface) {
+      if (IID_IUnknown == riid) {
+        *ppvInterface = (IUnknown *) this;
+        return S_OK;
+      }
+      else if (__uuidof(IMMNotificationClient) == riid) {
+        *ppvInterface = (IMMNotificationClient *) this;
+        return S_OK;
+      }
+      *ppvInterface = nullptr;
+      return E_NOINTERFACE;
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR pwstrDefaultDeviceId) {
+      // the id is null when the last playback device went away
+      if (flow == eRender && pwstrDefaultDeviceId) {
+        gate.signal();
+      }
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    OnDeviceAdded(LPCWSTR pwstrDeviceId) {
+      gate.signal();
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    OnDeviceRemoved(LPCWSTR pwstrDeviceId) {
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    OnDeviceStateChanged(LPCWSTR pwstrDeviceId, DWORD dwNewState) {
+      if (dwNewState & DEVICE_STATE_ACTIVE) {
+        gate.signal();
+      }
+      return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE
+    OnPropertyValueChanged(LPCWSTR pwstrDeviceId, const PROPERTYKEY key) {
+      return S_OK;
+    }
+
+  private:
+    audio_default_wait::gate_t &gate;
+  };
 
   class audio_notification_t: public ::IMMNotificationClient {
   public:
@@ -771,7 +876,8 @@ namespace platf::audio {
 
       // Fill host sink name with the device_id of the current default audio device.
       {
-        auto device = default_device(device_enum);
+        // quiet: the caller says why there is none (audio::start_audio_control), once
+        auto device = default_device_quiet(device_enum);
         if (!device) {
           return std::nullopt;
         }
@@ -782,15 +888,23 @@ namespace platf::audio {
         sink.host = to_utf8(id.get());
       }
 
-      // Prepare to search for the device_id of the virtual audio sink device,
-      // this device can be either user-configured or
-      // the Steam Streaming Speakers we use by default.
+      // Prepare to search for the device_id of the virtual audio sink device, this device can be
+      // user-configured, the virtual device chosen as the one to capture, or the Steam Streaming Speakers we use by default.
       match_fields_list_t match_list;
-      if (config::audio.virtual_sink.empty()) {
-        match_list = match_steam_speakers();
-      }
-      else {
-        match_list = match_all_fields(from_utf8(config::audio.virtual_sink));
+      const bool audio_sink_is_virtual = config::audio.virtual_sink.empty() && !config::audio.sink.empty() && is_virtual_output_device(config::audio.sink);
+      switch (audio_sink_plan::choose_virtual_target(config::audio.virtual_sink, config::audio.sink, audio_sink_is_virtual)) {
+        case audio_sink_plan::virtual_target_e::virtual_sink:
+          match_list = match_all_fields(from_utf8(config::audio.virtual_sink));
+          break;
+        case audio_sink_plan::virtual_target_e::audio_sink:
+          // VB-CABLE chosen as the device to capture: the game only plays to the Windows default, so the default goes there
+          BOOST_LOG(info) << "The captured audio device is a virtual device, the stream runs on it"sv;
+          match_list = match_all_fields(from_utf8(config::audio.sink));
+          sink.null_is_selected_device = true;
+          break;
+        case audio_sink_plan::virtual_target_e::steam_streaming:
+          match_list = match_steam_speakers();
+          break;
       }
 
       // Search for the virtual audio sink device currently present in the system.
@@ -812,6 +926,56 @@ namespace platf::audio {
       }
 
       return sink;
+    }
+
+    /**
+     * @brief Whether a configured device name or id points at a known virtual output device (VB-CABLE, Steam, other VB-Audio devices).
+     */
+    bool
+    is_virtual_output_device(const std::string &configured) {
+      const auto matched = find_device_id(match_all_fields(from_utf8(configured)));
+      if (!matched) {
+        return false;
+      }
+
+      device_t device;
+      if (FAILED(device_enum->GetDevice(matched->second.c_str(), &device))) {
+        return false;
+      }
+
+      audio::prop_t prop;
+      if (FAILED(device->OpenPropertyStore(STGM_READ, &prop))) {
+        return false;
+      }
+
+      auto read = [&prop](const PROPERTYKEY &key) {
+        prop_var_t value;
+        if (FAILED(prop->GetValue(key, &value.prop)) || value.prop.vt != VT_LPWSTR || !value.prop.pwszVal) {
+          return std::string {};
+        }
+        return to_utf8(value.prop.pwszVal);
+      };
+
+      audio_devices::endpoint_t endpoint;
+      endpoint.name = read(PKEY_Device_FriendlyName);
+      endpoint.adapter = read(PKEY_DeviceInterface_FriendlyName);
+      endpoint.description = read(PKEY_Device_DeviceDesc);
+      return audio_devices::is_virtual_output_kind(audio_devices::classify_virtual(endpoint));
+    }
+
+    bool
+    default_output_missing() override {
+      return !default_device_quiet(device_enum);
+    }
+
+    bool
+    wait_for_default_output(std::chrono::milliseconds timeout) override {
+      if (default_device_quiet(device_enum)) {
+        return true;
+      }
+      // a device added, enabled or made the default raises the gate; the timeout makes the caller look again
+      default_output_gate.wait_for(timeout);
+      return static_cast<bool>(default_device_quiet(device_enum));
     }
 
     bool
@@ -869,6 +1033,21 @@ namespace platf::audio {
       return std::nullopt;
     }
 
+    /**
+     * @brief The order in which the waveformats of a virtual sink are tried.
+     * @note The bit depth of the default device is a preference (switching between depths has caused glitches for some people), not a
+     *       condition: VB-CABLE has no 32-bit format at all, and a rule that skipped every format of another depth left it with none.
+     */
+    std::vector<std::size_t>
+    waveformat_try_order(const virtual_sink_waveformats_t &waveformats) {
+      std::vector<int> bits;
+      bits.reserve(waveformats.size());
+      for (const auto &waveformat : waveformats) {
+        bits.push_back(waveformat.Samples.wValidBitsPerSample);
+      }
+      return audio_sink_plan::format_try_order(bits, default_device_bits_per_sample().value_or(32));
+    }
+
     bool
     is_sink_format_supported(const std::string &sink) override {
       auto virtual_sink_info = extract_virtual_sink_info(sink);
@@ -883,14 +1062,10 @@ namespace platf::audio {
         return true;
       }
 
-      // Only the waveformats set_format() would try, a device that rejects all of them counts as unsupported
-      auto wanted_bits_per_sample = default_device_bits_per_sample().value_or(32);
-      for (const auto &waveformat : virtual_sink_info->second.get().virtual_sink_waveformats) {
-        if (wanted_bits_per_sample != waveformat.Samples.wValidBitsPerSample) {
-          continue;
-        }
-
-        if (audio_client->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, (const WAVEFORMATEX *) &waveformat, nullptr) != AUDCLNT_E_UNSUPPORTED_FORMAT) {
+      // Only the waveformats set_format() would try, in its order; a device that rejects all of them counts as unsupported
+      const auto &waveformats = virtual_sink_info->second.get().virtual_sink_waveformats;
+      for (const auto index : waveformat_try_order(waveformats)) {
+        if (audio_client->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, (const WAVEFORMATEX *) &waveformats[index], nullptr) != AUDCLNT_E_UNSUPPORTED_FORMAT) {
           return true;
         }
       }
@@ -1131,19 +1306,20 @@ namespace platf::audio {
 
       auto &device_id = virtual_sink_info->first;
       auto &waveformats = virtual_sink_info->second.get().virtual_sink_waveformats;
-      for (const auto &waveformat : waveformats) {
+      for (const auto index : waveformat_try_order(waveformats)) {
+        const auto &waveformat = waveformats[index];
         // We're using completely undocumented and unlisted API,
         // better not pass objects without copying them first.
         auto device_id_copy = device_id;
         auto waveformat_copy = waveformat;
         auto waveformat_copy_pointer = reinterpret_cast<WAVEFORMATEX *>(&waveformat_copy);
 
-        if (wanted_bits_per_sample != waveformat.Samples.wValidBitsPerSample) {
-          continue;
-        }
-
         WAVEFORMATEXTENSIBLE p {};
         if (SUCCEEDED(policy->SetDeviceFormat(device_id_copy.c_str(), waveformat_copy_pointer, (WAVEFORMATEX *) &p))) {
+          if (waveformat.Samples.wValidBitsPerSample != wanted_bits_per_sample) {
+            BOOST_LOG(info) << "The virtual audio sink has no "sv << wanted_bits_per_sample << "-bit format for this layout, using "sv
+                            << waveformat.Samples.wValidBitsPerSample << "-bit"sv;
+          }
           BOOST_LOG(info) << "Changed virtual audio sink format to " << logging::bracket(waveformat_to_pretty_string(waveformat));
           return device_id;
         }
@@ -1527,14 +1703,28 @@ namespace platf::audio {
         return -1;
       }
 
+      // Without it the wait for a playback device only polls: not a reason to fail.
+      if (SUCCEEDED(device_enum->RegisterEndpointNotificationCallback(&device_arrival))) {
+        device_arrival_registered = true;
+      }
+      else {
+        BOOST_LOG(debug) << "Couldn't register the playback device notification; waiting for a device polls instead"sv;
+      }
+
       return 0;
     }
 
     ~audio_control_t() override {
+      if (device_arrival_registered && device_enum) {
+        device_enum->UnregisterEndpointNotificationCallback(&device_arrival);
+      }
     }
 
     policy_t policy;
     audio::device_enum_t device_enum;
+    audio_default_wait::gate_t default_output_gate;
+    device_arrival_t device_arrival { default_output_gate };
+    bool device_arrival_registered = false;
     std::string assigned_sink;
     std::optional<std::wstring> assigned_sink_device_id;
     std::vector<std::optional<std::wstring>> original_default_device_roles;
@@ -1569,6 +1759,7 @@ namespace platf {
 
   std::unique_ptr<audio_control_t>
   audio_control() {
+    audio::default_device_notice.reset();
     auto control = std::make_unique<audio::audio_control_t>();
 
     if (control->init()) {

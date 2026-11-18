@@ -3,7 +3,9 @@
  * @brief Definitions for input handling on Windows.
  */
 #define WIN32_LEAN_AND_MEAN
-#define NOMINMAX
+#ifndef NOMINMAX
+  #define NOMINMAX
+#endif
 #define WINVER 0x0A00
 #include <windows.h>
 
@@ -12,6 +14,7 @@
 #include <limits>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include <ViGEm/Client.h>
 
@@ -25,6 +28,7 @@
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "src/platform/gamepad_selection.h"
+#include "src/telemetry/telemetry.h"
 #include "virtual_mouse.h"
 
 // Note: HSYNTHETICPOINTERDEVICE and related functions are now included in
@@ -287,6 +291,7 @@ namespace platf {
         auto status = vigem_connect(client.get());
         if (!VIGEM_SUCCESS(status)) {
           BOOST_LOG(warning) << "Couldn't setup connection to ViGEm for gamepad support ["sv << util::hex(status).to_string_view() << ']';
+          telemetry::driver_failed("gamepad", "probe", std::string { util::hex(status).to_string_view() });
           client.reset();
           return -1;
         }
@@ -317,6 +322,7 @@ namespace platf {
       auto status = vigem_target_add(client.get(), gamepad.gp.get());
       if (!VIGEM_SUCCESS(status)) {
         BOOST_LOG(error) << "Couldn't add Gamepad to ViGEm connection ["sv << util::hex(status).to_string_view() << ']';
+        telemetry::driver_failed("gamepad", "create", std::string { util::hex(status).to_string_view() });
 
         return -1;
       }
@@ -1965,10 +1971,14 @@ namespace platf {
 
   void
   unicode(input_t &input, char *utf8, int size) {
-    // We can do no worse than one UTF-16 character per byte of UTF-8
-    WCHAR wide[size];
+    if (size <= 0) {
+      return;
+    }
 
-    int chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, size, wide, size);
+    // We can do no worse than one UTF-16 character per byte of UTF-8
+    std::vector<WCHAR> wide(size);
+
+    int chars = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, size, wide.data(), size);
     if (chars <= 0) {
       return;
     }

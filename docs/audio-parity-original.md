@@ -2,8 +2,8 @@
 
 Checked on 2026-11-12 against the upstream sources (read only; behaviour is described here, no code is copied):
 
-- host and Web UI: <https://github.com/qiin2333/foundation-sunshine>, `master` at 6225dcb (2026-11-12), called **host-up** below;
-- control panel: <https://github.com/qiin2333/sunshine-control-panel>, `main` at 502a671, called **panel-up**.
+- host and Web UI: <https://github.com/AlkaidLab/foundation-sunshine>, `master` at 6225dcb (2026-11-12), called **host-up** below;
+- control panel: <https://github.com/qiin2333/sunshine-control-panel/tree/502a6719bf4dbc17c42f3e4a2154fb8957890773>, historical `main` at 502a671, called **panel-up**. This comparison refers to the original Panel snapshot, not the current foundation-panel repository.
 
 Our product is a superset of the original (the native-superset principle): nothing the original offers may be missing or harder to reach.
 
@@ -31,9 +31,9 @@ State of **our** product before this round (feat/audio-devices at `1f7d1fa08` / 
 
 | # | Original | Ours before (Web / Panel) | Verdict | Now |
 |---|---|---|---|---|
-| 1 audio_sink | text field | picker over the real devices, typed id kept / same page in the frame | **better**, but titled 音频采集设备 | renamed 采集哪个扬声器 |
-| 2 virtual_sink | on the page | **behind 高级** (an expert row) / same | **worse** | on the page, 串流时切换到的扬声器, picker over the devices |
-| 3 keep_sink_default | on the page | **behind 高级**, titled 强制保持音频输出设备 / same | **worse** | on the page, 锁定扬声器 |
+| 1 audio_sink | text field | picker over the real devices, typed id kept / same page in the frame | **better**, but titled 音频采集设备 | renamed 目标采集扬声器 |
+| 2 virtual_sink | on the page | **behind 高级** (an expert row) / same | **worse** | on the page, 串流时的虚拟扬声器, picker over the devices |
+| 3 keep_sink_default | on the page | **behind 高级**, titled 强制保持音频输出设备 / same | **worse** | on the page, 锁定默认扬声器 |
 | 4 install_steam_audio_drivers | on the page | **behind 高级** / same | **worse** | on the page |
 | 5 stream_audio, stream_mic | switches | same | same | same |
 | 6 microphone mode | select, all four modes | a list row (dialog) whose names were sentences; Panel: a four-button group | **worse** on the Web page (the modes were one click deeper) | four buttons, 麦克风方式, on the microphone page of the Web UI and of the Panel; the line below says what the chosen mode does |

@@ -10,7 +10,7 @@
     <MPinHost ref="pinHost" storage-key="web-home" :locale="String(uiLocale)">
     <MAnnouncementPopup v-if="!hideList" :item="announcements.popup.value" :locale="String(uiLocale)" @shown="announcements.markShown" @acknowledge="announcements.acknowledge" @hide="announcements.hide" @open-url="(u) => openExternalUrl(u).catch(() => {})" />
     <MCoachMarks v-if="!hideList" :locale="String(uiLocale)" storage-key="foundation.coach.web" guide-key="foundation.guide.web" />
-    <MCaption v-if="!hideList" bem="web-caption"><template v-if="backButton" #back><MCaptionBack :page="backPage" :locale="String(uiLocale)" @back="jumps.back()" /></template><template #version><MCaptionVersion :version="shellVersion" :build="buildInfo" :os="osName()" :locale="String(uiLocale)" :update="notice.version" @copied="onVersionCopied" @open-update="nav.go('about')" /></template><template #brand><MBrand class="web-caption__brand" :size="20" /></template><template #announcements><MStatusBell :locale="String(uiLocale)" /><MAnnouncementButton :unread="announcements.unread.value" :locale="String(uiLocale)" @open="nav.go('announcements')" /></template><template #search><div class="web-caption__search"><MUnifiedSearch :search="uni" :texts="searchT" :compact="compactSearch || caption.tight.value" :height="38" /></div></template><template v-if="compactSearch" #account><ShellUtils placement="bar" /></template><template #connect><button type="button" class="m-caption-connect" :aria-label="connectT.title" :data-tip="connectT.title" @click="connect.show('pair')"><MIcon name="person_add" /><span>{{ connectT.title }}</span></button></template></MCaption>
+    <MCaption v-if="!hideList" bem="web-caption"><template v-if="backButton" #back><MCaptionBack :page="backPage" :locale="String(uiLocale)" @back="jumps.back()" /></template><template #version><MCaptionVersion :version="shellVersion" :build="buildInfo" :os="osName()" :locale="String(uiLocale)" :update="notice.version" @copied="onVersionCopied" @open-update="nav.go('about')" /></template><template #brand><MBrand class="web-caption__brand" :size="20" /></template><template #announcements><MStatusBell :locale="String(uiLocale)" /><MFeedbackButton :locale="String(uiLocale)" /><MAnnouncementButton :unread="announcements.unread.value" :locale="String(uiLocale)" @open="nav.go('announcements')" /></template><template #search><div class="web-caption__search"><MUnifiedSearch :search="uni" :texts="searchT" :compact="compactSearch || caption.tight.value" :height="38" /></div></template><template v-if="compactSearch" #account><ShellUtils placement="bar" /></template><template #connect><button type="button" class="m-caption-connect" :aria-label="connectT.title" :data-tip="connectT.title" @click="connect.show('pair')"><MIcon name="person_add" /><span>{{ connectT.title }}</span></button></template></MCaption>
     <MScene v-if="!hideList" :nav="nav" :caption-height="48" :jumps="jumps" :chip="backChip" :rail-items="railItems" :texts="sceneTexts" :bar-items="barItems" :bar-current="barCurrent" :overlay="hostUnusable" :status="hostUnusable" storage-key="foundation-ui.web.list" @rail="onRail">
       <template #back-chip><MBackChip :page="backPage" :locale="String(uiLocale)" @back="jumps.back()" /></template>
       <template #rail-foot><ShellUtils placement="rail" /></template>
@@ -64,9 +64,10 @@ import { computed, defineAsyncComponent, defineComponent, getCurrentInstance, h,
 import { useI18n } from 'vue-i18n'
 import QRCode from 'qrcode'
 import { trackEvents, setTelemetryContext } from '../config/telemetry.js'
-import { answerRedactRequests, homeTexts, MContextProvider, useTelemetryConsent, MErrorHost, installErrorHandlers, setErrorContext, startAutoReport, MPageLoading, useNotify, useSystemNotices, MStatusBell, MPage, MGroup, MItem, MSection, MIcon, MBrand, MCaption, MCaptionVersion, MCaptionBack, MBackChip, useCaptionRoom, createJumpHistory, useBackVariant, showsButton, showsChip, captionTexts, MCoachMarks, MConnectDialog, MPairPrompt, MPinHost, pinSpecForPage, pinTexts, pinToHome, isPinnedOnHome, createPairingPending, MSnackbar, connectTexts, useConnectDialog, MUnifiedSearch, useUnifiedSearch, requestPageFilter, searchTexts, actionDocs, settingDocs, clientDocs, appDocs, tileDocs, addTileToHome, MHostOffline, useHostConnection, MButton, MContextMenu, MNavList, MScene, aboutTexts, latencyClockTexts, statusTexts, networkOverviewTexts, doctorTexts, testToolTexts, createNav, announcementTexts, useAnnouncements, MAnnouncementButton, MAnnouncementPage, MAnnouncementPopup, ackedAt, useAppearance, useSettingsList, useErrors, useDeveloperMode, DevReportHost, registerDevReport, openDevReport, devmodeTexts } from 'foundation-ui/vue'
+import { answerRedactRequests, MFeedbackButton, openFeedbackHere, homeTexts, MContextProvider, useTelemetryConsent, MErrorHost, installErrorHandlers, setErrorContext, startAutoReport, MPageLoading, useNotify, useSystemNotices, MStatusBell, MPage, MGroup, MItem, MSection, MIcon, MBrand, MCaption, MCaptionVersion, MCaptionBack, MBackChip, useCaptionRoom, createJumpHistory, useBackVariant, showsButton, showsChip, captionTexts, MCoachMarks, MConnectDialog, MPairPrompt, MPinHost, pinSpecForPage, pinTexts, pinToHome, isPinnedOnHome, createPairingPending, MSnackbar, connectTexts, useConnectDialog, MUnifiedSearch, useUnifiedSearch, requestPageFilter, searchTexts, actionDocs, settingDocs, clientDocs, appDocs, tileDocs, addTileToHome, MHostOffline, useHostConnection, MButton, MContextMenu, MNavList, MScene, aboutTexts, latencyClockTexts, statusTexts, networkOverviewTexts, doctorTexts, testToolTexts, createNav, announcementTexts, useAnnouncements, MAnnouncementButton, MAnnouncementPage, MAnnouncementPopup, ackedAt, useAppearance, useSettingsList, useErrors, useDeveloperMode, DevReportHost, registerDevReport } from 'foundation-ui/vue'
 import { afterCheck, afterOpened, noticeView, readNotice, writeNotice } from 'foundation-ui/update'
-import { SEARCH_INDEX, categoryOfRow, labelOf, parseSettingsHash, rowIdOf, settingsHash } from 'foundation-ui/settings/index.js'
+import { SEARCH_INDEX } from '../config/settingsData/index.js'
+import { categoryOfRow, labelOf, parseSettingsHash, rowIdOf, settingsHash } from 'foundation-ui/settings/index.js'
 import { canOpenBigScreen, openBigScreenOnHost } from '../composables/openBigScreen.js'
 import ShellUtils from '../components/layout/ShellUtils.vue'
 import { streamTimerTexts } from './streamTimerTexts.js'
@@ -75,6 +76,7 @@ import WebDialogHost from '../components/layout/WebDialogHost.vue'
 import { registerPending } from '../composables/pendingSources.js'
 import ConfirmDialog from '../components/common/ConfirmDialog.vue'
 import { useLogout } from '../composables/useLogout.js'
+import { useAudioDevices } from '../composables/useAudioDevices.js'
 import { useShellLive } from '../composables/useShellLive.js'
 import { useUpdateStatus } from '../composables/useUpdateStatus.js'
 import { useComponentStatus } from '../composables/useComponentStatus.js'
@@ -220,7 +222,11 @@ for (const r of RAIL) if (r.id !== 'overview' && r.id !== 'help') routes[`${r.id
 for (const [id, p] of Object.entries(PAGES)) routes[id] = { role: 'detail', rail: p.rail, list: p.list, supporting: p.supporting, push: p.push, rootRail: p.rootRail }
 
 const normalise = (path) => path.replace(/\.html$/, '').replace(/\/+$/, '') || '/'
-const pageLabel = (p) => (p.text ? p.text(uiLocale.value) : t(p.label))
+const pageLabel = (p) => {
+  if (typeof p?.text === 'function') return String(p.text(uiLocale.value) || '')
+  if (typeof p?.label === 'string' && p.label) return t(p.label)
+  return ''
+}
 const idFromPath = (path) => {
   const p = normalise(path)
   if (p === '/index') return 'home'
@@ -309,16 +315,18 @@ provide('telemetryConsent', telemetry)
 watch(() => nav.current.value, (page) => { if (!embedded && page) trackEvents.pageView(String(page)) }, { immediate: true })
 const osName = () => { const n = typeof navigator === 'undefined' ? '' : navigator; return String(n.userAgentData?.platform || n.platform || '') }
 const errorBack = () => { if (nav.canPop.value) nav.pop(); else nav.selectRail('overview') }
-const restartHost = async () => { await apiFetch('/api/restart', { method: 'POST' }).catch(() => null) }
+const restartHost = async () => { await apiFetch('/api/restart?reason=shell', { method: 'POST' }).catch(() => null) }
 const errorContext = () => ({ product: 'web', version: shellVersion.value, os: osName(), page: String(nav.current.value || ''), locale: String(uiLocale.value), logs: String(recentLogText.value || '').split('\n').slice(-40).join('\n'), components: `webui=${shellVersion.value || '?'}` })
 setErrorContext(errorContext)
-// a browser cannot take a screenshot of its page or read the host log: the report sheet says so; the report goes privately to the developers or into a zip, never to a public issue
+// a browser cannot take a screenshot of its page silently: there is no capture here, and the sheet's screenshot row is a picture the person chooses, pastes or drops (`shots`: the host takes it with the report, uploads it and
+// the developers see it only in the one issue of the report; nothing in it is covered automatically and the sheet says so). The report goes privately to the developers or into a zip, never to a public issue
 const developerMode = useDeveloperMode()
 registerDevReport({
   // the host log's last lines (the host answers it to a page of its own origin); the lines the error report carried are added by the sheet
   logs: async () => { await refreshLogs(); return String(recentLogText.value || '') },
   env: () => [`product: Foundation Sunshine Web UI`, `version: ${shellVersion.value || ''}`, `os: ${osName()}`, `locale: ${String(uiLocale.value)}`, `user agent: ${navigator.userAgent}`].join('\n'),
   save: (name, bytes, mime) => { const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([bytes], { type: mime })); link.download = name; document.body.appendChild(link); link.click(); link.remove(); setTimeout(() => URL.revokeObjectURL(link.href), 4000) },
+  shots: true,
   product: 'web',
 })
 let removeErrorHandlers = null
@@ -339,7 +347,8 @@ const contextMenu = ref(null)
 // 运行体检 is 全部检查 of the components page: the page opens and every check runs
 const ctxCallbacks = { search: (text) => { uni.query.value = text; uni.show() }, connect: () => { connect.open.value = true }, notice: (m) => useNotify().snack(m), openExternal: (u) => openExternalUrl(u), restartHost: () => restartHost(), doctor: () => { componentStatus.openPage(); void componentStatus.checkAll() },
   // developer mode (seven taps on the version): 「在 Issue 中报告此处」 opens the report with the place filled in; the browser has no DevTools button to press, the menu says which key
-  reportHere: ({ route, place, text }) => { void openDevReport({ kind: 'feedback', draft: { title: '', description: `${devmodeTexts(String(uiLocale.value)).ctxReport}: ${route}${place ? ` (${place})` : ''}${text ? ` — ${text}` : ''}\n\n` } }) } }
+  // 反馈此处的问题: the one feedback panel, with the page and what was under the pointer (the text of what was under the pointer shows in the panel and is not sent)
+  reportHere: ({ place, text }) => { void openFeedbackHere({ place, text }) } }
 const embeddedCtxCallbacks = { notice: (m) => useNotify().snack(m), openExternal: (u) => openExternalUrl(u) }
 const pinHost = ref(null)
 let menuHandler = null
@@ -366,7 +375,9 @@ const backPage = computed(() => {
   const page = PAGES[place.id]
   return (page ? pageLabel(page) : '') || railLabel(place.rail)
 })
-provide('webShell', { hideList, nav: jumpNav, openConfig: jumpConfig, pending, showMenu, openSetting: (key) => { const entry = settingsList.searchItems.value.find((e) => e.keyName === key); if (entry) onNavigate(entry) }, askLogout: () => { logoutAsk.value = true } })
+// the playback devices of the host: the audio row shows the chosen device by its name, the setting holds an id (another system answers `unsupported`)
+const audioDevices = useAudioDevices('windows')
+provide('webShell', { hideList, nav: jumpNav, openConfig: jumpConfig, audio: audioDevices.render, refreshAudio: audioDevices.refresh, pending, showMenu, openSetting: (key) => { const entry = settingsList.searchItems.value.find((e) => e.keyName === key); if (entry) onNavigate(entry) }, askLogout: () => { logoutAsk.value = true } })
 
 // Second lines of the list rows from live host data
 const live = useShellLive()
@@ -413,7 +424,7 @@ const barItems = computed(() => {
 const barCurrent = computed(() => (nav.current.value === 'settings-hub' ? 'settings-hub' : BAR_GROUP[nav.rail.value] || 'overview'))
 const railLabel = (rail) => t(RAIL.find((r) => r.id === rail)?.label || 'navbar.home')
 // The settings list is the shared model (categories in groups, one live line each, recently used); every other rail is one group of pages
-const settingsList = useSettingsList({ locale: uiLocale, config: live.config, dualsenseKeys: live.dualsenseKeys, sources: { clients: computed(() => live.clients.value?.list), apps: live.apps, components: computed(() => componentStatus.rows.value), ds: live.ds, mic: live.mic } })
+const settingsList = useSettingsList({ locale: uiLocale, config: live.config, dualsenseKeys: live.dualsenseKeys, sources: { clients: computed(() => live.clients.value?.list), apps: live.apps, components: computed(() => componentStatus.rows.value), ds: live.ds, mic: live.mic, audio: audioDevices.render } })
 watchEffect(() => { hubLines.value = settingsList.lines.value })
 // the row ids of foundation-ui's rowLines for the pages of the list panes
 const ROW_OF_PAGE = { pin: 'clients', apps: 'apps', downloads: 'downloads', gamepad: 'gamepad', keyboard: 'keyboard', mouse: 'mouse', usb: 'usb', microphone: 'microphone', 'display-output': 'display-output', 'display-modes': 'display-modes', 'display-encoders': 'display-encoders', 'display-hdr': 'display-hdr', 'display-advanced': 'display-advanced', 'audio-output': 'audio-output', vdd: 'vdd', components: 'components', network: 'network', 'latency-clock': 'latency-clock', 'test-tools': 'test-tools', 'stream-timer': 'stream-timer', troubleshooting: 'diagnostics', about: 'help' }
@@ -526,7 +537,7 @@ const reopenGuide = async () => {
 }
 const bigScreenHere = computed(() => canOpenBigScreen({ platform: hostPlatform.value, hostname: window.location.hostname }))
 const actionHandlers = computed(() => ({
-  restart: async () => { try { await apiFetch('/api/restart', { method: 'POST' }) } catch { /* the connection drops while the host restarts: the offline state takes over */ } },
+  restart: async () => { try { await apiFetch('/api/restart?reason=shell', { method: 'POST' }) } catch { /* the connection drops while the host restarts: the offline state takes over */ } },
   connect: () => connect.show('pair'),
   download: () => connect.show('install'),
   logs: () => jumpNav.go('troubleshooting'),

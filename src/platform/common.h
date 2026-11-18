@@ -575,6 +575,10 @@ namespace platf {
     };
 
     std::optional<null_t> null;
+
+    // The device in `null` is the one chosen as the device to capture (a virtual device such as VB-CABLE), not Steam Streaming
+    // Speakers or the configured virtual sink: the stream runs on it whether or not the client plays the audio on the host
+    bool null_is_selected_device = false;
   };
 
   /**
@@ -926,6 +930,26 @@ namespace platf {
     sink_info() = 0;
 
     /**
+     * @brief Whether the system has no default playback device right now (Windows: nothing plugged in, enabled or virtual).
+     * @returns True only when the platform knows there is none. The stream then goes on without sound until a device appears:
+     *          see wait_for_default_output().
+     */
+    virtual bool
+    default_output_missing() {
+      return false;
+    }
+
+    /**
+     * @brief Wait for a default playback device.
+     * @param timeout Longest time to block; a device that appears (or becomes the default) ends the wait early.
+     * @returns True when a default playback device exists now. Platforms that always have one return true at once.
+     */
+    virtual bool
+    wait_for_default_output(std::chrono::milliseconds timeout) {
+      return true;
+    }
+
+    /**
      * @brief Write mono 48 kHz signed 16-bit PCM to the virtual microphone device.
      * @param samples Pointer to the PCM samples.
      * @param frame_count Number of mono frames to write.
@@ -1063,8 +1087,11 @@ namespace platf {
   bool
   system_hibernate();
 
+  /**
+   * Restart the program. `reason` is one word of src/restart_reason.h that says what asked (it is reported with the restart; an unknown word is "api").
+   */
   void
-  restart();
+  restart(std::string_view reason = "api");
 
   /**
    * @brief Set an environment variable.
@@ -1383,7 +1410,7 @@ namespace platf {
   get_capabilities(std::string_view client_gamepad);
 
   /**
-   * @brief Query whether the interactive console session is locked.
+   * @brief Query whether the capture process's interactive session is locked.
    * @return The lock state, or std::nullopt when the platform cannot determine it.
    * @note Distinguishes the lock screen from other secure desktops such as UAC prompts.
    */

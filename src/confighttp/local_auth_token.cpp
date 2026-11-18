@@ -3,7 +3,7 @@
  * @brief Per-process credential file and constant-time matcher.
  *
  * The Windows file DACL follows Microsoft Learn's DACL model: an explicit,
- * protected DACL names SYSTEM, BUILTIN\\Administrators and the active console
+ * protected DACL names SYSTEM, BUILTIN\\Administrators and the active interactive
  * user rather than inheriting an installation-directory default
  * [ds5-ms-acl-20261107] [ds5-ms-set-entries-acl-20261107]. The Windows file is
  * created with that descriptor and replaced atomically using the documented
@@ -161,20 +161,46 @@ namespace confighttp::local_auth_token {
       };
     }
 
+    std::mutex wts_view_mutex;
+    std::optional<token_user_session::wts_view_t> wts_view_override;
+
+    token_user_session::wts_view_t
+    wts_view() {
+      std::lock_guard lock(wts_view_mutex);
+      return wts_view_override ? *wts_view_override : real_wts_view();
+    }
+
     bool
     query_user_identity(user_identity_t &identity) {
-      // A SYSTEM service may query the physical console token only through
-      // the WTS APIs; a user-mode process uses its own TokenUser SID
+      // The GUI may run in a different session from a SYSTEM capture process.
+      // Resolve its interactive user through WTS; user-mode uses its own SID
       // [ds5-ms-wts-active-20261107] [ds5-ms-wts-query-20261107]
       // [ds5-ms-token-user-20261107].
       identity.system = platf::is_running_as_system();
       HANDLE token = nullptr;
       if (identity.system) {
-        // The console user, or the lone active Remote Desktop user when the console is at the sign-in screen
-        // (token_user_session.h); nobody when it is ambiguous.
-        const auto session = token_user_session::pick(real_wts_view());
-        if (!session || !WTSQueryUserToken(*session, &token)) {
-          // A service can start before a user signs in.  In that state
+        // Upstream's choice (platf::retrieve_interactive_users_token: the console user, else the active Remote Desktop user;
+        // it fails closed when a session cannot be read), granted only when it is also the single session
+        // token_user_session::grant allows: several signed-in users grant nobody.
+        token = platf::retrieve_interactive_users_token(false);
+        std::optional<std::uint32_t> upstream_session;
+        if (token) {
+          DWORD session_id = 0;
+          DWORD size = 0;
+          if (!GetTokenInformation(token, TokenSessionId, &session_id, sizeof(session_id), &size)) {
+            // Not a usable token: an identity query failure, as upstream treats it.
+            CloseHandle(token);
+            return false;
+          }
+          upstream_session = session_id;
+        }
+        const auto session = token_user_session::grant(wts_view(), upstream_session);
+        if (!session) {
+          if (token) CloseHandle(token);
+          token = nullptr;
+        }
+        if (!token) {
+          // A service can start before an interactive user logs on. In that state
           // the DACL intentionally contains only SYSTEM and Administrators.
           identity.sid.clear();
           identity.session = token_user_session::no_session;
@@ -350,7 +376,9 @@ namespace confighttp::local_auth_token {
       }
 
       std::lock_guard lock(token_mutex);
-      if (same_identity(identity, current_identity)) return;
+      if (!current_token.empty() && same_identity(identity, current_identity)) {
+        return;
+      }
       current_token.clear();
       if (!rotate_token_locked(identity)) {
         BOOST_LOG(error) << "Could not rotate the local Web UI token after the signed-in user changed";
@@ -448,6 +476,14 @@ namespace confighttp::local_auth_token {
     if (monitor_thread.joinable()) monitor_thread.join();
 #endif
   }
+
+#ifdef _WIN32
+  void
+  set_session_view_for_testing(std::optional<token_user_session::wts_view_t> view) {
+    std::lock_guard lock(wts_view_mutex);
+    wts_view_override = std::move(view);
+  }
+#endif
 
   bool
   matches(const std::string_view candidate) {

@@ -246,6 +246,73 @@ TEST(DoctorAudio, MissingSinkFailsMissingVirtualWarnsMicOffSkips) {
   expect_contract(items);
 }
 
+TEST(DoctorAudio, ChosenDeviceIsNamedNeverShownAsAnId) {
+  // the picker stores the endpoint id; the checks read the name from the endpoint list, and a lost device is described without the id
+  audio_fact_t found { .checked = true, .sink = "CABLE Input (VB-Audio Virtual Cable)", .sink_found = true, .virtual_checked = true, .virtual_found = true, .virtual_name = "扬声器 (Steam Streaming Speakers)", .mic_checked = true, .mic_state = "disabled" };
+  const auto pass = evaluate_audio(found, lang_e::zh);
+  EXPECT_EQ(find(pass, "audio.sink")->status, status_e::pass);
+  EXPECT_EQ(find(pass, "audio.sink")->detail, "CABLE Input (VB-Audio Virtual Cable)");
+
+  const std::string id = "{0.0.0.00000000}.{172f61d5-5aff-4b19-9233-e02c0003996f}";
+  audio_fact_t lost { .checked = true, .sink = id, .sink_found = false, .virtual_sink = id, .virtual_checked = true, .virtual_found = false, .mic_checked = true, .mic_state = "disabled" };
+  for (const auto lang : { lang_e::zh, lang_e::en }) {
+    const auto items = evaluate_audio(lost, lang);
+    EXPECT_EQ(find(items, "audio.sink")->status, status_e::fail);
+    EXPECT_EQ(find(items, "audio.sink")->detail.find("0.0.0.00000000"), std::string::npos);
+    EXPECT_EQ(find(items, "audio.virtual")->detail.find("172f61d5"), std::string::npos);
+  }
+
+  // an id that is still stored when the check could not rename it is described, not printed
+  audio_fact_t unnamed { .checked = true, .sink = id, .sink_found = true, .virtual_checked = true, .virtual_found = true, .mic_checked = true, .mic_state = "disabled" };
+  EXPECT_EQ(find(evaluate_audio(unnamed, lang_e::zh), "audio.sink")->detail.find("0.0.0.00000000"), std::string::npos);
+}
+
+TEST(DoctorAudio, NoDefaultPlaybackDeviceWarnsAndSaysWhatToDo) {
+  // a computer with no speakers, headphones or virtual output: not a fault of the host, the stream just has no sound
+  audio_fact_t facts { .checked = true, .no_default_output = true, .virtual_checked = true, .virtual_found = false, .mic_checked = true, .mic_state = "disabled" };
+  for (const auto lang : { lang_e::zh, lang_e::en }) {
+    const auto items = evaluate_audio(facts, lang);
+    const auto *sink = find(items, "audio.sink");
+    ASSERT_NE(sink, nullptr);
+    EXPECT_EQ(sink->status, status_e::warn);
+    ASSERT_TRUE(sink->fix.action.has_value());
+    EXPECT_EQ(sink->fix.action->kind, "open");
+    EXPECT_EQ(sink->fix.action->target, "page:audio");
+    // the reason and the way out are both there, in plain words
+    const auto &detail = sink->detail;
+    const auto &how = sink->fix.text;
+    if (lang == lang_e::zh) {
+      EXPECT_NE(detail.find("没有默认播放设备"), std::string::npos);
+      EXPECT_NE(how.find("音箱或耳机"), std::string::npos);
+      EXPECT_NE(how.find("VB-CABLE"), std::string::npos);
+      EXPECT_NE(how.find("Steam Streaming Speakers"), std::string::npos);
+    }
+    else {
+      EXPECT_NE(detail.find("no default playback device"), std::string::npos);
+      EXPECT_NE(how.find("speakers or headphones"), std::string::npos);
+      EXPECT_NE(how.find("VB-CABLE"), std::string::npos);
+    }
+    expect_contract(items, lang);
+  }
+}
+
+TEST(DoctorAudio, ADefaultDeviceKeepsTheSinkCheckAsItWas) {
+  audio_fact_t facts { .checked = true, .sink_found = true, .no_default_output = false, .virtual_checked = true, .virtual_found = true, .mic_checked = true, .mic_state = "disabled" };
+  const auto items = evaluate_audio(facts, lang_e::zh);
+  EXPECT_EQ(find(items, "audio.sink")->status, status_e::pass);
+  EXPECT_EQ(find(items, "audio.default"), nullptr);
+}
+
+TEST(DoctorAudio, AChosenDeviceWithoutADefaultAddsTheDefaultRow) {
+  // a device is chosen and found, but the muted route follows the system default: say that the stream waits
+  audio_fact_t facts { .checked = true, .sink = "CABLE Input (VB-Audio Virtual Cable)", .sink_found = true, .no_default_output = true, .virtual_checked = true, .virtual_found = true, .mic_checked = true, .mic_state = "disabled" };
+  const auto items = evaluate_audio(facts, lang_e::zh);
+  EXPECT_EQ(find(items, "audio.sink")->status, status_e::pass);
+  ASSERT_NE(find(items, "audio.default"), nullptr);
+  EXPECT_EQ(find(items, "audio.default")->status, status_e::warn);
+  expect_contract(items);
+}
+
 TEST(DoctorInput, WindowsWithoutVigemFailsAndLinuxUinputIsChecked) {
   input_fact_t windows { .windows = true, .gamepad = "auto", .vigem_checked = true, .vigem_ok = false, .vigem_error = "bus not found", .usbip_supported = true, .usbip_tool_found = true, .usbip_driver_checked = true, .usbip_driver_found = true, .usbip_driver = "usbip2_ude" };
   auto items = evaluate_input(windows, lang_e::zh);
@@ -260,6 +327,17 @@ TEST(DoctorInput, WindowsWithoutVigemFailsAndLinuxUinputIsChecked) {
   EXPECT_EQ(find(items, "input.ds5")->status, status_e::pass);
   EXPECT_EQ(find(items, "input.usb")->status, status_e::skip);
   expect_contract(items);
+}
+
+TEST(DoctorInput, ExternalUsbipStaysAvailableAndIsLabelled) {
+  input_fact_t facts { .windows = true, .gamepad = "auto", .usbip_supported = true, .usbip_tool_found = true, .usbip_driver_checked = true, .usbip_driver_found = true, .usbip_externally_managed = true };
+  const auto items = evaluate_input(facts, lang_e::en);
+  for (const auto *id : { "input.usb", "input.ds5" }) {
+    const auto *item = find(items, id);
+    ASSERT_NE(item, nullptr);
+    EXPECT_EQ(item->status, status_e::pass);
+    EXPECT_NE(item->detail.find("externally managed"), std::string::npos);
+  }
 }
 
 TEST(DoctorNetwork, ClosedPortBlockedFirewallAndVerdicts) {

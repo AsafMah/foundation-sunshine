@@ -1,13 +1,15 @@
 import { effectScope, ref, watch } from 'vue'
 import { usePending, exposePending } from 'foundation-ui/pending'
-import { SEARCH_INDEX, constraintText, labelOf, localizedKeyLabel, validateSetting } from 'foundation-ui/settings/index.js'
+import { SEARCH_INDEX } from '../config/settingsData/index.js'
+import { constraintText, labelOf, localizedKeyLabel, validateSetting } from 'foundation-ui/settings/index.js'
 import { isIpAddress } from '../utils/listenerSettings.js'
 import { useConfig } from './useConfig.js'
 import { useSharedConfig, setConfigLoadedHook } from './configStore.js'
 import { useDualsenseShared, useDualsenseTuning } from './dualsenseShared.js'
 import { apiFetch, apiJson } from '../utils/apiFetch.js'
 import { AppService } from '../services/appService.js'
-import { appsEntries, applyAppEntries, revertAppEntries } from './pendingApps.js'
+import { appsEntries, applyAppEntries, revertAppEntries, syncRevertedApps } from './pendingApps.js'
+import { postPendingMessage } from './pendingBridge.js'
 import { needsRestart } from './restartKeys.js'
 import { optionLabelOf } from './optionLabels.js'
 
@@ -28,7 +30,7 @@ let started = false
 const state = { t: (k) => k, te: () => false, locale: 'en' }
 
 async function restartHost() {
-  const response = await apiFetch('/api/restart', { method: 'POST' })
+  const response = await apiFetch('/api/restart?reason=settings', { method: 'POST' })
   // the native proxy can answer 503 when the core exits before it replies: that is the restart
   if (response.status !== 503 && !response.ok) throw new Error(`HTTP ${response.status}`)
 }
@@ -168,13 +170,18 @@ export function registerPending({ t, te, locale, embedded = false }) {
       try { await AppService.saveApps(applyAppEntries(await AppService.getApps(), entries), null); return { ok: true } } catch (error) { return { ok: false, error: error.message } }
     },
     revertSaved: async (entries) => {
-      try { await AppService.saveApps(revertAppEntries(await AppService.getApps(), entries), null); return { ok: true } } catch (error) { return { ok: false, error: error.message } }
+      try {
+        const restored = revertAppEntries(await AppService.getApps(), entries)
+        await AppService.saveApps(restored, null)
+        syncRevertedApps(restored)
+        return { ok: true }
+      } catch (error) { return { ok: false, error: error.message } }
     },
   })
 
   // the frame of the control panel shows the one bar
   if (embedded) exposePending(pending, {
-    post: (message) => window.parent.postMessage(message, '*'),
+    post: (message) => postPendingMessage(window.parent, message),
     listen: (fn) => { const on = (event) => { if (event.source === window.parent) fn(event.data) }; window.addEventListener('message', on); return () => window.removeEventListener('message', on) },
   })
 }

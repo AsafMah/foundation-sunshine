@@ -4,25 +4,54 @@
  */
 #include "telemetry.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
+#include <sstream>
 #include <thread>
+
+#ifndef _WIN32
+  #include <unistd.h>
+#endif
+#ifdef __APPLE__
+  #include <sys/sysctl.h>
+  #include <sys/time.h>
+#endif
+#ifdef _WIN32
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <windows.h>
+#endif
 
 #include <boost/log/core.hpp>
 #include <boost/log/sinks/basic_sink_backend.hpp>
 #include <boost/log/sinks/sync_frontend.hpp>
 #include <boost/log/attributes/value_extraction.hpp>
 
+#include "error_report.h"
+#include "device_facts.h"
+#include "install_journal.h"
+#include "service_lifecycle.h"
 #include "service.h"
-#include "transport.h"
 #include "src/build_info.h"
 #include "src/crash/crash.h"
 #include "src/config.h"
 #include "src/logging.h"
+#include "src/logging_site.h"
 #include "src/platform/common.h"
 #include "src/system_info.h"
+#include "transport.h"
+#include "wer_event.h"
 
 using json = nlohmann::json;
 using namespace std::literals;
@@ -149,6 +178,194 @@ namespace telemetry {
       return "host";
     }
 
+    // ---- device facts and the installer's journal (stage c) ------------------------------------------------------------------------------------------------
+
+    std::int64_t
+    wall_ms() {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    }
+
+    std::string
+    read_small_file(const std::filesystem::path &path, std::size_t max_bytes) {
+      std::ifstream in { path, std::ios::binary };
+      if (!in) return {};
+      std::string data(max_bytes + 1, '\0');
+      in.read(data.data(), static_cast<std::streamsize>(data.size()));
+      data.resize(static_cast<std::size_t>(in.gcount()));
+      if (data.size() > max_bytes) data.erase(0, data.size() - max_bytes);
+      return data;
+    }
+
+#ifdef _WIN32
+    /** The screens on the desktop and the highest refresh rate among them (the current mode, not the list of modes). */
+    void
+    probe_displays(device_facts::facts_t &facts) {
+      int count = 0;
+      double max_hz = 0;
+      DISPLAY_DEVICEW device {};
+      device.cb = sizeof(device);
+      for (DWORD i = 0; EnumDisplayDevicesW(nullptr, i, &device, 0); ++i) {
+        if (!(device.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) || (device.StateFlags & DISPLAY_DEVICE_MIRRORING_DRIVER)) continue;
+        DEVMODEW mode {};
+        mode.dmSize = sizeof(mode);
+        if (!EnumDisplaySettingsExW(device.DeviceName, ENUM_CURRENT_SETTINGS, &mode, 0)) continue;
+        ++count;
+        if (mode.dmDisplayFrequency > 1) max_hz = std::max(max_hz, static_cast<double>(mode.dmDisplayFrequency));
+      }
+      facts.displays = count;
+      if (max_hz > 0) facts.refresh_hz = device_facts::standard_refresh_hz(max_hz);
+    }
+#else
+    void
+    probe_displays(device_facts::facts_t &) {}
+#endif
+
+    /** The facts of this computer from the inventory the host already keeps (GPU, OS, adapters) and a short look at the screens. */
+    device_facts::facts_t
+    facts_from(const system_info::snapshot_t &snapshot) {
+      device_facts::facts_t facts;
+      const system_info::gpu_info_t *gpu = nullptr;
+      for (const auto &g : snapshot.gpus)
+        if (g.is_streaming_adapter) {
+          gpu = &g;
+          break;
+        }
+      if (!gpu && !snapshot.gpus.empty()) gpu = &snapshot.gpus.front();
+      if (gpu) {
+        facts.gpu_vendor = gpu_vendor_of(gpu->vendor);
+        for (const char c : gpu->driver_version)
+          if ((c >= '0' && c <= '9') || c == '.') facts.gpu_driver.push_back(c);
+        if (facts.gpu_driver.size() > 24) facts.gpu_driver.resize(24);
+      }
+      facts.os_build = device_facts::os_build_token(snapshot.os.build.empty() ? snapshot.os.version : snapshot.os.build);
+      std::vector<device_facts::nic_t> nics;
+      for (const auto &n : snapshot.nics) nics.push_back({ std::string { system_info::to_string(n.type) }, n.up, n.link_speed_mbps, n.is_default_route });
+      if (const auto nic = device_facts::pick_nic(nics)) {
+        facts.nic_link = device_facts::nic_link_class(nic->type);
+        facts.nic_speed = device_facts::nic_speed_class(nic->link_speed_mbps);
+      }
+      probe_displays(facts);
+      return facts;
+    }
+
+    /** Reports the facts when they are new or changed (and the last report is a day old): one small event, remembered in <dir>/device_facts.json. */
+    void
+    report_device_facts(service_t &service, const std::filesystem::path &dir, const device_facts::facts_t &facts) {
+      std::optional<device_facts::state_t> last;
+      const auto path = dir / "device_facts.json";
+      try {
+        last = device_facts::state_from_json(json::parse(read_small_file(path, 4096), nullptr, false));
+      }
+      catch (...) {
+      }
+      const auto now = wall_ms();
+      if (!device_facts::should_send(last, facts, now)) return;
+      service.emit(kind_e::experience, "device_facts", device_facts::to_props(facts));
+      try {
+        std::filesystem::create_directories(dir);
+        std::ofstream out { path, std::ios::binary | std::ios::trunc };
+        out << device_facts::state_to_json({ device_facts::fingerprint(facts), now }).dump();
+      }
+      catch (...) {
+      }
+    }
+
+    /** The installer's journal becomes install_result and install_summary events and is deleted; a run that is still going is left for the next start. */
+    void
+    report_install_journal(service_t &service, const std::filesystem::path &dir) {
+      try {
+        const auto path = dir / "install_journal.jsonl";
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) return;
+        const auto written = std::filesystem::last_write_time(path, ec);
+        if (ec) return;
+        const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(std::filesystem::file_time_type::clock::now() - written).count();
+        const auto result = install_journal::events_from_journal(read_small_file(path, install_journal::MAX_BYTES), age);
+        if (!result.consumed) return;
+        for (const auto &item : result.items) service.emit(item.kind, item.name, item.props);
+        std::filesystem::remove(path, ec);
+      }
+      catch (...) {
+      }
+    }
+
+    // ---- the service and the start-up (service_lifecycle.h) ----------------------------------------------------------------------------------------------------
+
+    /// When the host could serve its web interface (set by host_ready): the end of the start-up time the service measures.
+    std::atomic<std::int64_t> ready_wall_ms { 0 };
+    // the "core" start-up time is the difference of two readings of the steady clock (a change of the system clock in between must not show up as a slow start); the wall clock is kept for the service's own records
+    std::atomic<std::int64_t> start_steady_ms { 0 };  // when telemetry started
+    std::atomic<std::int64_t> ready_steady_ms { 0 };  // when the web interface became ready
+    std::int64_t
+    steady_ms() {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    std::mutex lifecycle_state_mutex;
+
+    service_lifecycle::state_t
+    load_lifecycle_state(const std::filesystem::path &dir) {
+      try {
+        return service_lifecycle::state_from_json(json::parse(read_small_file(dir / "service_state.json", 8192), nullptr, false));
+      }
+      catch (...) {
+        return {};
+      }
+    }
+
+    void
+    save_lifecycle_state(const std::filesystem::path &dir, const service_lifecycle::state_t &state) {
+      try {
+        std::filesystem::create_directories(dir);
+        std::ofstream out { dir / "service_state.json", std::ios::binary | std::ios::trunc };
+        out << service_lifecycle::state_to_json(state).dump();
+      }
+      catch (...) {
+      }
+    }
+
+    long long
+    own_pid() {
+#ifdef _WIN32
+      return static_cast<long long>(GetCurrentProcessId());
+#else
+      return static_cast<long long>(getpid());
+#endif
+    }
+
+    /// One start-up time (service to core, or page) is judged against the limit and the install's own usual time: always a startup_timing, and a host_anomaly when it is slow.
+    void
+    judge_and_emit_ready(service_t &service, const std::filesystem::path &dir, std::string_view which, std::int64_t ms) {
+      std::lock_guard lock { lifecycle_state_mutex };
+      auto state = load_lifecycle_state(dir);
+      const auto anomaly = service_lifecycle::judge_ready(which, ms, state, wall_ms());
+      service.emit(kind_e::experience, "startup_timing", service_lifecycle::timing_props(which, ms, anomaly.has_value()));
+      if (anomaly) service.emit(kind_e::experience, "host_anomaly", service_lifecycle::anomaly_props(*anomaly));
+      save_lifecycle_state(dir, state);
+    }
+
+    /// What sunshinesvc left (tools/sunshinesvc_lifecycle.h): the counts, an XP_SVC_CORE_RESTART when the core ended without being asked, and the time from the start of the service to the web interface of this core.
+    void
+    report_service_lifecycle(service_t &service, const std::filesystem::path &dir) {
+      try {
+        const auto path = dir / "service_lifecycle.jsonl";
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) return;
+        const auto records = service_lifecycle::parse(read_small_file(path, service_lifecycle::MAX_BYTES));
+        std::filesystem::remove(path, ec);
+        const auto summary = service_lifecycle::summarize(records);
+        if (summary.launched + summary.adopted + summary.extras_ended + summary.exits + summary.restarts_requested > 0) service.emit(kind_e::experience, "svc_lifecycle", service_lifecycle::summary_props(summary));
+        {
+          std::lock_guard lock { lifecycle_state_mutex };
+          auto state = load_lifecycle_state(dir);
+          if (const auto anomaly = service_lifecycle::judge_restart(summary, state, wall_ms())) service.emit(kind_e::experience, "host_anomaly", service_lifecycle::anomaly_props(*anomaly));
+          save_lifecycle_state(dir, state);
+        }
+        if (const auto ms = service_lifecycle::svc_to_ready_ms(records, own_pid(), ready_wall_ms.load())) judge_and_emit_ready(service, dir, "svc_core", *ms);
+      }
+      catch (...) {
+      }
+    }
+
     class log_backend_t: public bl::sinks::basic_sink_backend<bl::sinks::synchronized_feeding> {
     public:
       void
@@ -156,12 +373,15 @@ namespace telemetry {
         // runs on the thread that logged: a counter and a copy of the line, nothing else (the line is scrubbed later, on the sender thread)
         try {
           const auto severity = record.attribute_values()["Severity"].extract<int>();
-          if (!severity || severity.get() < 3 || severity.get() > 5) return;
+          if (!severity) return;
           const auto service = current();
           if (!service) return;
           const auto message = record.attribute_values()["Message"].extract<std::string>();
           const std::string text = message ? message.get() : std::string {};
-          service->note_log(severity.get(), text.c_str(), text.size(), component_of(text.c_str(), text.size()));
+          // every severity goes to the short ring an anomaly excerpt is cut from; only warnings and above are tallied
+          service->note_log_line(severity.get(), text.c_str(), text.size());
+          if (severity.get() < 3 || severity.get() > 5) return;
+          service->note_log(severity.get(), text.c_str(), text.size(), component_of(text.c_str(), text.size()), severity.get() >= logging::SITE_MIN_SEVERITY ? logging::site_text(record) : std::string {});
         }
         catch (...) {
         }
@@ -217,10 +437,16 @@ namespace telemetry {
           for (const auto &gpu : snapshot.gpus) {
             if (gpu.is_streaming_adapter) {
               ctx.gpu_vendor = gpu_vendor_of(gpu.vendor);
+              service_->set_gpu_driver(gpu.driver_version);
               break;
             }
           }
-          if (ctx.gpu_vendor.empty() && !snapshot.gpus.empty()) ctx.gpu_vendor = gpu_vendor_of(snapshot.gpus.front().vendor);
+          if (ctx.gpu_vendor.empty() && !snapshot.gpus.empty()) {
+            ctx.gpu_vendor = gpu_vendor_of(snapshot.gpus.front().vendor);
+            service_->set_gpu_driver(snapshot.gpus.front().driver_version);
+          }
+          // coarse facts about the computer, once per start and only when they changed (device_facts.h)
+          report_device_facts(*service_, platf::appdata() / "telemetry", facts_from(snapshot));
         }
         catch (...) {
         }
@@ -234,6 +460,9 @@ namespace telemetry {
         auto last_tick = clock_t::now();
         auto last_config = clock_t::now();
         bool context_done = false;
+        bool lifecycle_done = false;
+        bool core_timing_done = false;
+        const auto run_started = clock_t::now();
         while (true) {
           {
             std::unique_lock lock { mutex_ };
@@ -247,6 +476,19 @@ namespace telemetry {
             // the OS and the GPU are read here, not at start: the probe is not part of the host's start-up
             context_done = true;
             fill_context();
+            // what the installer left for this start (install_journal.h)
+            report_install_journal(*service_, platf::appdata() / "telemetry");
+          }
+          // what the service left, once the web interface is up (or a minute after the start when it never says so)
+          if (!lifecycle_done && context_done && (ready_wall_ms.load() != 0 || now - run_started > 60s)) {
+            lifecycle_done = true;
+            report_service_lifecycle(*service_, platf::appdata() / "telemetry");
+          }
+          // the time from the start of this core to its web interface, for every install (a host that runs without the service has no service time, and had no start-up time at all). It has its own
+          // state: a web interface that is ready after the service summary was reported (a start that takes more than a minute is the one worth knowing) is still timed, once.
+          if (!core_timing_done && context_done && ready_steady_ms.load() != 0) {
+            core_timing_done = true;
+            if (const auto ready = ready_steady_ms.load(), began = start_steady_ms.load(); began > 0 && ready >= began) judge_and_emit_ready(*service_, platf::appdata() / "telemetry", "core", ready - began);
           }
           if (now - last_config >= CONFIG_RECHECK) {
             last_config = now;
@@ -266,6 +508,7 @@ namespace telemetry {
             service_->flush();
           }
           service_->pump();
+          service_->pump_logs();
         }
         {
           std::lock_guard lock { mutex_ };
@@ -285,6 +528,47 @@ namespace telemetry {
 
     std::unique_ptr<runner_t> runner;
     std::mutex lifecycle_mutex;
+
+    // A word that every process of one boot of the computer sees alike and the next boot does not: the kernel's own boot id where there is one. Empty when it cannot be read (the run is then reported as "unknown", never as a restart).
+    std::string
+    boot_identity() {
+#ifdef _WIN32
+      // no boot id in the API: a volatile key of the registry is deleted by the system at every boot, so the word stored in it lives exactly as long as one boot (the first reader after the boot makes it)
+      try {
+        HKEY key = nullptr;
+        DWORD disposition = 0;
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\FoundationSunshine\\BootId", 0, nullptr, REG_OPTION_VOLATILE, KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr, &key, &disposition) != ERROR_SUCCESS) return {};
+        wchar_t word[80] = {};
+        DWORD size = sizeof(word) - sizeof(wchar_t);
+        DWORD type = 0;
+        std::string result;
+        if (RegQueryValueExW(key, L"Word", nullptr, &type, reinterpret_cast<LPBYTE>(word), &size) == ERROR_SUCCESS && type == REG_SZ && size >= sizeof(wchar_t)) {
+          for (const wchar_t c : std::wstring { word })
+            if (c < 128) result.push_back(static_cast<char>(c));
+        }
+        else {
+          const auto fresh = new_uuid_v4();
+          std::wstring wide(fresh.begin(), fresh.end());
+          if (RegSetValueExW(key, L"Word", 0, REG_SZ, reinterpret_cast<const BYTE *>(wide.c_str()), static_cast<DWORD>((wide.size() + 1) * sizeof(wchar_t))) == ERROR_SUCCESS) result = fresh;
+        }
+        RegCloseKey(key);
+        return result;
+      }
+      catch (...) {
+        return {};
+      }
+#elif defined(__APPLE__)
+      char word[64] = {};
+      std::size_t size = sizeof(word) - 1;
+      if (sysctlbyname("kern.bootsessionuuid", word, &size, nullptr, 0) != 0) return {};
+      return std::string { word };
+#else
+      std::ifstream in { "/proc/sys/kernel/random/boot_id" };
+      std::string word;
+      if (in) std::getline(in, word);
+      return word;
+#endif
+    }
   }  // namespace
 
   void
@@ -302,10 +586,39 @@ namespace telemetry {
       service_options_t options;
       options.dir = platf::appdata() / "telemetry";
       options.endpoint = endpoint;
+      options.aggregate_interval_ms = 6 * 60 * 60 * 1000;  // high-volume usage and experience records leave merged, at most every six hours and at exit
+      for (const char *variable : { "COMPUTERNAME", "HOSTNAME", "USERNAME", "USER", "LOGNAME" })
+        if (const char *value = std::getenv(variable)) options.redact_words.emplace_back(value);
       service_deps_t deps;
       deps.consent = [] { return consent_t { consent_cache.usage.load(std::memory_order_relaxed), consent_cache.errors.load(std::memory_order_relaxed) }; };
       deps.post = [](const std::string &url, const std::string &body) { return http_post(url, "application/json", body); };
       deps.session_log = [](const std::string &endpoint, const std::string &install_id, const std::string &version) { return crash::upload_session_log(endpoint, install_id, version); };
+      deps.session_log_state = [] { return std::string { crash::session_log_state() }; };
+      deps.session_shot = [](const std::string &endpoint, const std::string &install_id, const std::string &version, const std::string &image) { return crash::upload_session_shot(endpoint, install_id, version, image); };
+      deps.session_shot_state = [] { return std::string { crash::session_shot_state() }; };
+      deps.boot_ms = [] {
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+#ifdef _WIN32
+        return static_cast<std::int64_t>(now - static_cast<std::int64_t>(GetTickCount64()));
+#elif defined(__APPLE__)
+        // macOS has no CLOCK_BOOTTIME: the kernel keeps the time of the boot itself
+        (void) now;
+        timeval boot {};
+        std::size_t size = sizeof(boot);
+        int name[2] = { CTL_KERN, KERN_BOOTTIME };
+        if (sysctl(name, 2, &boot, &size, nullptr, 0) != 0 || boot.tv_sec <= 0) return std::int64_t { 0 };
+        return static_cast<std::int64_t>(boot.tv_sec) * 1000 + boot.tv_usec / 1000;
+#elif defined(CLOCK_BOOTTIME)
+        timespec ts {};
+        if (clock_gettime(CLOCK_BOOTTIME, &ts) != 0) return std::int64_t { 0 };
+        return static_cast<std::int64_t>(now - (static_cast<std::int64_t>(ts.tv_sec) * 1000 + ts.tv_nsec / 1'000'000));
+#else
+        (void) now;
+        return std::int64_t { 0 };
+#endif
+      };
+      deps.boot_id = [] { return boot_identity(); };
+      start_steady_ms.store(steady_ms());
       auto service = std::make_shared<service_t>(std::move(options), std::move(deps));
       context_t ctx;
       ctx.version = build_info::version();
@@ -314,12 +627,43 @@ namespace telemetry {
       ctx.arch = arch_name();
       ctx.locale = config::sunshine.locale;
       service->set_context(std::move(ctx));
+      service->reconcile_consent();  // a choice that was turned off while the host was not running (the config file edited) gets its record now; the first run only remembers the choices
+      service->begin_run_marker();  // the previous run did not end by itself? reported once, for that run
       {
         std::lock_guard lock { slot_mutex };
         service_slot() = service;
       }
+      // the per-frame timings and counters of the streaming code reach the stream trackers through these (a null hook until now: the encode and capture sums of stream_quality were empty)
+      hooks::table().frame_encoded.store(&telemetry::frame_encoded, std::memory_order_release);
+      hooks::table().encode_ms.store(&telemetry::encode_ms, std::memory_order_release);
+      hooks::table().capture_ms.store(&telemetry::capture_ms, std::memory_order_release);
+      hooks::table().sample.store(&telemetry::record_sample, std::memory_order_release);
+      hooks::table().count.store(&telemetry::record_count, std::memory_order_release);
+      hooks::table().frame_done.store(&telemetry::record_frame_done, std::memory_order_release);
       log_sink = boost::make_shared<log_sink_t>(boost::make_shared<log_backend_t>());
       bl::core::get()->add_sink(log_sink);
+#ifdef _WIN32
+      // An install that failed earlier names its step and a code word in install-result.json (tools/installer_shell.cpp, kRunRoot): the first start after it reports each once as an error of the installer.
+      if (const char *program_data = std::getenv("ProgramData"))
+        for (const auto &failure : take_installer_failures(std::filesystem::path { program_data } / "FoundationSunshine" / "install-runs")) service->report_error(failure);
+      // A crash of the virtual display driver leaves an Application Error event (1000) for ZakoVDD.dll. Each one is reported once, as the facts only: it happened, when (the event's time is the event's
+      // own, the report carries the time of sending), the module, the exception code and the offset. The cursor is the time of the newest one taken; the first start looks back one day.
+      try {
+        const auto cursor_file = platf::appdata() / "telemetry" / "wer_cursor";
+        std::int64_t since = 0;
+        if (std::ifstream in { cursor_file }) in >> since;
+        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        if (since <= 0) since = now_ms - 24LL * 3600 * 1000;
+        std::int64_t newest = since;
+        for (const auto &fault : read_vdd_faults(since, 3)) {
+          service->emit(kind_e::error, "wer_event", wer_props(fault), "host", {}, 0);
+          newest = std::max(newest, fault.time_ms);
+        }
+        std::ofstream { cursor_file, std::ios::trunc } << std::max<std::int64_t>(newest, now_ms) << '\n';
+      }
+      catch (...) {
+      }
+#endif
       runner = std::make_unique<runner_t>(std::move(service));
     }
     catch (...) {
@@ -331,10 +675,17 @@ namespace telemetry {
   stop() {
     std::lock_guard lifecycle { lifecycle_mutex };
     if (!runner) return;
+    hooks::table().frame_encoded.store(nullptr, std::memory_order_release);
+    hooks::table().encode_ms.store(nullptr, std::memory_order_release);
+    hooks::table().capture_ms.store(nullptr, std::memory_order_release);
+    hooks::table().sample.store(nullptr, std::memory_order_release);
+    hooks::table().count.store(nullptr, std::memory_order_release);
+    hooks::table().frame_done.store(nullptr, std::memory_order_release);
     bool finished = true;
     try {
       if (const auto service = current()) {
         service->emit(kind_e::usage, "app_exit", json { { "uptime_s", std::chrono::duration_cast<std::chrono::seconds>(clock_t::now() - process_start).count() } });
+        service->end_run_marker();
         // events go to the disk queue (no network wait while the host is shutting down); the next start sends them
         finished = runner->stop();
         service->flush(true);
@@ -370,6 +721,8 @@ namespace telemetry {
     const bool cold = std::chrono::duration_cast<std::chrono::minutes>(clock_t::now().time_since_epoch()).count() < 10;
     service->emit(kind_e::usage, "app_start", json { { "cold", cold }, { "start_ms", start_ms } });
     service->emit(kind_e::experience, "startup", json { { "host_start_ms", start_ms } });
+    ready_wall_ms.store(wall_ms());
+    ready_steady_ms.store(steady_ms());
   }
 
   void
@@ -407,7 +760,10 @@ namespace telemetry {
     // A key that was not in the file before is either a change away from the default or a default written for the first time; the first save of a fresh install writes many of those at once, which is
     // not a change of anything. A few at a time are reported, a dump of many is not.
     if (first_writes.size() <= 3) changes.insert(changes.end(), first_writes.begin(), first_writes.end());
-    for (const auto &[k, bucket] : changes) service->emit(kind_e::usage, "setting_changed", json { { "key", k }, { "value", bucket } });
+    for (const auto &[k, bucket] : changes) {
+      service->emit(kind_e::usage, "setting_changed", json { { "key", k }, { "value", bucket } });
+      service->crumb(crumb_e::set, k + ":" + bucket);  // the key and the class of the new value, as in the event
+    }
   }
 
   bool
@@ -480,9 +836,23 @@ namespace telemetry {
   }
 
   std::size_t
-  ingest(std::string_view product, std::string_view version, const json &events) {
+  ingest(std::string_view product, std::string_view version, const json &events, ingest_report_t *report) {
     const auto service = current();
-    return service ? service->ingest(product, version, events) : 0;
+    if (!service) return 0;
+    // page_ready is the page telling when it was ready: the host judges it (limit and the install's own usual time) and sends startup_timing and, when slow, host_anomaly; the raw event is not passed on
+    if (events.is_array() && (product == "panel"sv || product == "web"sv)) {
+      json rest = json::array();
+      for (const auto &e : events) {
+        if (e.is_object() && e.value("name", "") == "page_ready") {
+          const auto shaped = shape_event(kind_e::experience, "page_ready", e.contains("props") ? e["props"] : json::object(), wall_ms());
+          if (shaped && shaped->props.value("page", "") == "home" && usage_enabled()) judge_and_emit_ready(*service, platf::appdata() / "telemetry", "page", shaped->props.value("ms", 0));
+          continue;
+        }
+        rest.push_back(e);
+      }
+      return service->ingest(product, version, rest, report);
+    }
+    return service->ingest(product, version, events, report);
   }
 
   int
@@ -505,7 +875,11 @@ namespace telemetry {
     // an application with a sparxie block is a Sparxie application however it is started (a direct start runs the game's own exe, not sparxie-launch)
     dims.app_kind = info.sparxie_app ? "sparxie" : classify_app_kind(info.app_name, info.app_cmd);
     dims.transport = transport_of(info.altp);
+    dims.encoder = info.encoder;
+    dims.capture_backend = info.capture_backend;
     if (info.sparxie_app) dims.sparxie_game = sparxie_game_id(info.sparxie_game);
+    service->crumb(crumb_e::stream, "start");
+    service->crumb(crumb_e::state, "codec:" + dims.codec);
     service->stream_begin(dims, info.session_id, info.client_uuid);
     if (info.hdr) feature_used("stream.hdr");
     if (info.mic) feature_used("stream.mic");
@@ -514,8 +888,31 @@ namespace telemetry {
   }
 
   void
-  stream_ended(std::uint32_t session_id, std::string_view stop_reason) {
-    if (const auto service = current()) service->stream_end(session_id, stop_reason);
+  stream_ended(std::uint32_t session_id, std::string_view stop_reason, std::string_view clip_offer, std::string_view clip_flow) {
+    if (const auto service = current()) {
+      service->crumb(crumb_e::stream, "stop");
+      service->stream_end(session_id, stop_reason, clip_offer, clip_flow);
+    }
+  }
+
+  void
+  set_encoder_resolver(std::function<std::string()> resolver) {
+    if (const auto service = current()) service->set_encoder_resolver(std::move(resolver));
+  }
+
+  void
+  stream_stage(std::string_view stage, std::int64_t ms) {
+    if (const auto service = current()) service->stream_stage(stage, ms);
+  }
+
+  void
+  stream_failed(std::string_view stage, std::string_view code) {
+    if (const auto service = current()) service->stream_failed(stage, code);
+  }
+
+  void
+  driver_failed(std::string_view driver, std::string_view op, std::string_view code) {
+    if (const auto service = current()) service->driver_failed(driver, op, code);
   }
 
   void
@@ -531,6 +928,46 @@ namespace telemetry {
   void
   capture_ms(std::uint32_t session_id, double ms) noexcept {
     if (const auto service = current()) service->record_capture_ms(session_id, ms);
+  }
+
+  void
+  crumb(crumb_e kind, std::string_view id) {
+    if (const auto service = current()) service->crumb(kind, id);
+  }
+
+  void
+  report_error(std::string_view code, std::string_view severity, bool with_stack, const std::source_location &where) {
+    const auto service = current();
+    if (!service) return;
+    try {
+      error_input_t e;
+      e.component = "host";
+      e.code = std::string { code };
+      e.severity = severity == "fatal" || severity == "warning" || severity == "info" ? std::string { severity } : "error";
+      e.loc = location_of(where);
+      if (!e.loc.empty()) e.frames.push_back(e.loc);
+      if (with_stack)
+        for (auto &f : capture_frames(2)) e.frames.push_back(std::move(f));
+      e.build = std::string { build_info::version() };
+      service->report_error(e);
+    }
+    catch (...) {
+    }
+  }
+
+  void
+  record_sample(std::uint32_t session_id, hooks::metric_e metric, double ms) noexcept {
+    if (const auto service = current()) service->record_sample(session_id, metric, ms);
+  }
+
+  void
+  record_count(std::uint32_t session_id, hooks::counter_e counter, std::uint64_t n) noexcept {
+    if (const auto service = current()) service->record_count(session_id, counter, n);
+  }
+
+  void
+  record_frame_done(std::uint32_t session_id, std::int64_t steady_ns) noexcept {
+    if (const auto service = current()) service->record_frame_done(session_id, steady_ns);
   }
 
   void

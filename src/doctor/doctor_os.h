@@ -67,6 +67,7 @@ namespace doctor::os {
     bool checked = false;
     std::string error;
     std::vector<audio_endpoint_t> render;  ///< active render endpoints
+    bool default_missing = false;  ///< the system said there is no default playback device (E_NOTFOUND); any other failure is `checked = false`
   };
 
   /** Active render endpoints (Windows); the POSIX build reports checked=false. */
@@ -84,6 +85,7 @@ namespace doctor::os {
     bool driver_checked = false;
     bool driver_found = false;
     std::string driver;  ///< service name found, "usbip2_ude"
+    bool externally_managed = false;
   };
 
   usbip_t

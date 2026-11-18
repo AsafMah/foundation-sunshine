@@ -16,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <queue>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -55,14 +56,14 @@ extern "C" {
 #endif
 
 #include "client_fingerprint.h"
-#include "crash/crash.h"
 #include "config.h"
-#include "file_handler.h"
+#include "crash/crash.h"
 #include "display_device/display_device.h"
 #include "display_device/parsed_config.h"
 #include "display_device/session.h"
 #include "ds5/control_extension.h"
 #include "ds5/haptics_wire.h"
+#include "file_handler.h"
 #include "globals.h"
 #include "haptics/authored_ir.h"
 #include "haptics/authored_ir_extended.h"
@@ -74,6 +75,7 @@ extern "C" {
 #include "network.h"
 #include "nvhttp.h"
 #include "rtsp.h"
+#include "src/log_text.h"
 #include "stream.h"
 #include "streaming/broadcast_telemetry.h"
 #include "streaming/dynamic_param_protocol.h"
@@ -96,9 +98,10 @@ extern "C" {
 #include "clipboard_bridge.h"
 #include "cursor_channel.h"
 #include "platform/common.h"
+#include "telemetry/hooks.h"
+#include "telemetry/telemetry.h"
 #include "text_context/bridge.h"
 #include "touch_keyboard_session.h"
-#include "telemetry/telemetry.h"
 
 /* Older client headers predate the optional absolute-actuator feedback flag.
  * The native Windows path still forwards the extension when advertised,
@@ -850,11 +853,31 @@ namespace stream {
   log_endpoint_refresh_summary(const session_t &session, std::string_view type,
                                const endpoint_refresh_stats_t &stats) {
     BOOST_LOG(info) << "endpoint_auto_refresh: " << type << " summary"
-                    << ", client=" << session.client_name
+                    << ", client=" << logging::quoted_name(session.client_name)
                     << ", session=" << session.launch_session_id
                     << ", probes_received=" << stats.valid_probes
                     << ", probe_sequence_gaps=" << stats.probe_sequence_gaps
                     << ", port_changes=" << stats.port_changes;
+  }
+
+  /**
+   * The sessions whose threads may still produce packets. The video and audio broadcast threads read the session behind the pointer a queued packet carries; the queues are shared by all
+   * sessions, so a packet of a session that has ended (and been freed) can still be in them: reading it hit a freed session (a null pointer, an invalid mutex of its FEC controller).
+   * The broadcast threads hold the lock for the packet they work on, `unregister_live_session()` waits for it.
+   */
+  std::shared_mutex live_sessions_mutex;
+  std::unordered_set<const session_t *> live_sessions;
+
+  void
+  register_live_session(const session_t *session) {
+    std::unique_lock lock(live_sessions_mutex);
+    live_sessions.insert(session);
+  }
+
+  void
+  unregister_live_session(const session_t *session) {
+    std::unique_lock lock(live_sessions_mutex);
+    live_sessions.erase(session);
   }
 
   namespace session {
@@ -1152,7 +1175,7 @@ namespace stream {
       boost::lock_guard<boost::mutex> session_lock(ctx.mic_session_mutex);
       boost::lock_guard<boost::mutex> socket_lock(ctx.mic_socket_mutex);
       if (!open_mic_socket_locked(ctx)) {
-        BOOST_LOG(error) << "Failed to open microphone socket for " << session.client_name;
+        BOOST_LOG(error) << "Failed to open microphone socket for " << logging::quoted_name(session.client_name);
         return;
       }
 
@@ -1163,7 +1186,7 @@ namespace stream {
         boost::memory_order_release);
     }
 
-    BOOST_LOG(info) << "Client " << session.client_name << ": Microphone encryption "
+    BOOST_LOG(info) << "Client " << logging::quoted_name(session.client_name) << ": Microphone encryption "
                     << (should_enable_mic_encryption ? "ENABLED" : "DISABLED")
                     << " (session " << session.launch_session_id
                     << " registered for multi-client mixing)";
@@ -1180,8 +1203,8 @@ namespace stream {
   request_total_bitrate(session_t &session, int bitrate_kbps) {
     const auto total = session.config.monitor.bitrate_budget->request(bitrate_kbps);
     if (total < bitrate_kbps) {
-      BOOST_LOG(info) << "Holding dynamic bitrate for client '" << session.client_name
-                      << "' from " << bitrate_kbps << " Kbps to host maximum " << total << " Kbps";
+      BOOST_LOG(info) << "Holding dynamic bitrate for client " << logging::quoted_name(session.client_name)
+                      << " from " << bitrate_kbps << " Kbps to host maximum " << total << " Kbps";
     }
     return total;
   }
@@ -2182,6 +2205,7 @@ namespace stream {
     server->map(packetTypes[IDX_REQUEST_IDR_FRAME], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_REQUEST_IDR_FRAME]"sv;
 
+      telemetry::hooks::count(session->launch_session_id, telemetry::hooks::counter_e::idr_requests);
       session->video.idr_events->raise(true);
     });
 
@@ -2457,7 +2481,7 @@ namespace stream {
 
         const float new_fps = read_dynamic_param_f32(payload, WIRE_WORD_SIZE);
 
-        if (new_fps <= 0.0f || new_fps > 1000.0f) {
+        if (!streaming::dynamic_fps_in_range(new_fps)) {
           BOOST_LOG(warning) << "Invalid FPS value: " << new_fps;
           return;
         }
@@ -2570,21 +2594,21 @@ namespace stream {
         << "firstFrame [" << firstFrame << ']' << std::endl
         << "lastFrame [" << lastFrame << ']';
 
+      telemetry::hooks::count(session->launch_session_id, telemetry::hooks::counter_e::rfi_requests);
       session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
     });
 
     server->map(packetTypes[IDX_CLIPBOARD], [](session_t *session, const std::string_view &payload) {
       // Forward opaque payload to the user-session GUI agent. Drop silently if
       // disabled by config or if the GUI is not currently subscribed.
-      if (!config::input.clipboard_sync) {
-        return;
-      }
       auto &bridge = clipboard_bridge::bridge_t::instance();
-      if (!bridge.gui_alive()) {
+      if (!config::input.clipboard_sync || !bridge.gui_alive()) {
+        bridge.note_inbound(session->launch_session_id, false);
         return;
       }
       clipboard_bridge::payload_t bytes(payload.begin(), payload.end());
-      bridge.on_inbound(session->launch_session_id, std::move(bytes));
+      const bool dispatched = bridge.on_inbound(session->launch_session_id, std::move(bytes));
+      bridge.note_inbound(session->launch_session_id, dispatched);
     });
 
     server->map(packetTypes[IDX_CURSOR], [](session_t *session, const std::string_view &payload) {
@@ -2913,7 +2937,9 @@ namespace stream {
               if (msg.target != clipboard_bridge::kBroadcast && s->launch_session_id != msg.target) {
                 continue;
               }
-              send_clipboard(s, msg.bytes);
+              if (send_clipboard(s, msg.bytes) == 0) {
+                clipboard_bridge::bridge_t::instance().note_outbound(s->launch_session_id);
+              }
             }
           }
         }
@@ -3859,6 +3885,10 @@ namespace stream {
 
     crash::watched_thread_t crash_watch("video-broadcast", 20000);
 
+    // stream health (upstream): full-queue clears only; the age queue (video_packet_queue.h) prunes instead and logs its own drops.
+    // How often the packet queue was cleared as a whole since the last frame (safe::queue_t::raise on a full queue)
+    auto [seen_queue_clears, seen_queue_dropped] = packets->clear_stats();
+
     stream::stall_telemetry::broadcast_telemetry_t stall_telemetry { std::chrono::steady_clock::now(), current_thread_cpu_time() };
     const auto timed_lock_wait = [&](auto &&fn) -> decltype(auto) {
       const auto begin = std::chrono::steady_clock::now();
@@ -3900,7 +3930,23 @@ namespace stream {
       frame_network_latency_logger.first_point_now();
 
       auto session = (session_t *) packet->channel_data;
+      // held until the packet is sent: the session cannot be freed under it
+      std::shared_lock live_lock(live_sessions_mutex);
+      if (!session || !live_sessions.count(session)) {
+        BOOST_LOG(debug) << "Dropping a video packet of a session that has ended"sv;
+        continue;
+      }
       session->last_video_activity_ms.store(steady_now_ms(), std::memory_order_relaxed);
+      {
+        // the queue is shared by all video sessions: a clear is counted for the session whose packet is handled next (exact with one stream, which is the usual case)
+        const auto [clears, dropped] = packets->clear_stats();
+        if (clears != seen_queue_clears) {
+          telemetry::hooks::count(session->launch_session_id, telemetry::hooks::counter_e::queue_flushes, clears - seen_queue_clears);
+          telemetry::hooks::count(session->launch_session_id, telemetry::hooks::counter_e::queue_frames_dropped, dropped - seen_queue_dropped);
+          seen_queue_clears = clears;
+          seen_queue_dropped = dropped;
+        }
+      }
       auto lowseq = session->video.lowseq;
       auto endpoint_refresh = session->video.endpoint_refresh.load(std::memory_order_acquire);
       if (endpoint_refresh) {
@@ -3982,6 +4028,7 @@ namespace stream {
         frame_header.frame_processing_latency = latency;
         frame_processing_latency_logger.collect_and_log(latency / 10.);
         timed_lock_wait([&] { perf::record_host_latency(session->launch_session_id, latency / 10., frame_dequeue_time); });
+        telemetry::hooks::sample(session->launch_session_id, telemetry::hooks::metric_e::host_ms, latency / 10.);
       }
       else {
         frame_header.frame_processing_latency = 0;
@@ -4081,6 +4128,7 @@ namespace stream {
         offset += bytes;
       }
 
+      const auto frame_send_begin = std::chrono::steady_clock::now();
       try {
         // Send less than 64K in a single batch.
         // On Windows, batches above 64K seem to bypass SO_SNDBUF regardless of its size,
@@ -4118,6 +4166,7 @@ namespace stream {
         const auto presentation_time = streaming::video_presentation_time(packet->frame_timestamp, video_pacer, pacing);
         const auto timestamp = video_rtp_timestamp(presentation_time, video_epoch);
 
+        std::size_t frame_sent_packets = 0;  // packets of this frame that reached the socket: a frame that could not be sent is not a sent frame
         auto blockIndex = 0;
         std::for_each(fec_blocks_begin, fec_blocks_end, [&](std::string_view &current_payload) {
           auto packets = (current_payload.size() + (blocksize - 1)) / blocksize;
@@ -4259,6 +4308,7 @@ namespace stream {
                   }
                 }
               }
+              frame_sent_packets += sent_packets;
               if (sent_packets != 0) {
                 note_measured_send(session, static_cast<std::uint64_t>(shards.prefixsize + shards.blocksize) * sent_packets);
                 if (!session->first_video_packet_logged.exchange(true)) {
@@ -4292,9 +4342,24 @@ namespace stream {
         });
 
         session->video.lowseq = lowseq;
+
+        // stream health: the time this frame took to send, and how long after its packet was ready the last byte left
+        {
+          const auto frame_send_end = std::chrono::steady_clock::now();
+          const auto ms_between = [](const auto &a, const auto &b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+          telemetry::hooks::sample(session->launch_session_id, telemetry::hooks::metric_e::send_ms, ms_between(frame_send_begin, frame_send_end));
+          if (packet->pipeline_trace && packet->pipeline_trace->packet_ready) {
+            telemetry::hooks::sample(session->launch_session_id, telemetry::hooks::metric_e::backlog_ms, ms_between(*packet->pipeline_trace->packet_ready, frame_send_end));
+          }
+          if (frame_sent_packets != 0) {
+            telemetry::hooks::count(session->launch_session_id, telemetry::hooks::counter_e::frames_sent);
+            telemetry::hooks::frame_done(session->launch_session_id, std::chrono::duration_cast<std::chrono::nanoseconds>(frame_send_end.time_since_epoch()).count());
+          }
+        }
       }
       catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
+        telemetry::report_error("E_VIDEO_BROADCAST", "error", true);
         std::this_thread::sleep_for(100ms);
       }
     }
@@ -4336,6 +4401,12 @@ namespace stream {
 
       TUPLE_2D_REF(channel_data, packet_data, *packet);
       auto session = (session_t *) channel_data;
+      // held until the packet is sent: the session cannot be freed under it
+      std::shared_lock live_lock(live_sessions_mutex);
+      if (!session || !live_sessions.count(session)) {
+        BOOST_LOG(debug) << "Dropping an audio packet of a session that has ended"sv;
+        continue;
+      }
       session->last_audio_activity_ms.store(steady_now_ms(), std::memory_order_relaxed);
       auto endpoint_refresh = session->audio.endpoint_refresh.load(std::memory_order_acquire);
       if (endpoint_refresh) {
@@ -4950,6 +5021,8 @@ namespace stream {
         session.videoThread.join();
         BOOST_LOG(debug) << "Waiting for audio to end..."sv;
         session.audioThread.join();
+        // the packets still queued for this session are dropped from here on, and the broadcast threads let go of it before it is freed
+        unregister_live_session(&session);
       }
       else {
         BOOST_LOG(debug) << "Control-only session: skipping video/audio thread join"sv;
@@ -5022,7 +5095,13 @@ namespace stream {
 
       session.nvidia_vsync_lease.reset();
       perf::end_session(session.launch_session_id);
-      telemetry::stream_ended(session.launch_session_id, stop_reason_name(session.lifecycle.snapshot().stop_reason));
+      {
+        // what the clipboard did in this session, as fixed words (counts and the offer decision only; never content)
+        const auto clipboard = clipboard_bridge::bridge_t::instance().take_note(session.launch_session_id);
+        const char *flow = clipboard.inbound_dropped > 0 ? "dropped" : (clipboard.inbound_forwarded > 0 || clipboard.outbound_sent > 0) ? "ok" : "none";
+        telemetry::stream_ended(session.launch_session_id, stop_reason_name(session.lifecycle.snapshot().stop_reason),
+          clipboard.offer == clipboard_bridge::offer_e::unknown ? std::string_view {} : std::string_view { clipboard_bridge::offer_name(clipboard.offer) }, flow);
+      }
 
       // Clean up ABR state for this client
       abr::cleanup(session.abr_session_token);
@@ -5165,6 +5244,7 @@ namespace stream {
 
       // 仅控制流会话不启动视频/音频线程
       if (!session.control_only) {
+        register_live_session(&session);
         session.audioThread = std::thread { audioThread, &session };
         session.videoThread = std::thread { videoThread, &session };
       }
@@ -5224,6 +5304,8 @@ namespace stream {
             info.sparxie_app = sparxie.is_sparxie;
             info.sparxie_game = sparxie.game;
           }
+          info.encoder = video::session_encoder_name();
+          info.capture_backend = ::config::video.capture.empty() ? "auto" : ::config::video.capture;
           info.altp = false;  // ALTP is not a stream transport on this branch line; when it is, this is the one place to set it
           telemetry::stream_started(info);
         }
@@ -5451,23 +5533,23 @@ namespace stream {
             // The param.value.int_value is the total bitrate (user-configured, including FEC)
             effective_param.value.int_value = request_total_bitrate(*session_p, effective_param.value.int_value);
             perf::update_session_bitrate(session_p->launch_session_id, effective_param.value.int_value);
-            BOOST_LOG(info) << "Updated session total bitrate for client '" << client_name
-                            << "': " << effective_param.value.int_value << " Kbps (including FEC)";
+            BOOST_LOG(info) << "Updated session total bitrate for client " << logging::quoted_name(client_name)
+                            << ": " << effective_param.value.int_value << " Kbps (including FEC)";
             if (!send_host_bitrate_update(session_p, effective_param.value.int_value)) {
-              BOOST_LOG(debug) << "Client '" << client_name
-                               << "' did not negotiate host bitrate callbacks; 0x5506 update omitted";
+              BOOST_LOG(debug) << "Client " << logging::quoted_name(client_name)
+                               << " did not negotiate host bitrate callbacks; 0x5506 update omitted";
             }
             return true;
           }
 
           session_p->video.dynamic_param_change_events->raise(effective_param);
-          BOOST_LOG(info) << "Sent dynamic parameter change event to client '" << client_name
-                          << "': type=" << (int) effective_param.type;
+          BOOST_LOG(info) << "Sent dynamic parameter change event to client " << logging::quoted_name(client_name)
+                          << ": type=" << (int) effective_param.type;
           return true;
         }
       }
 
-      BOOST_LOG(warning) << "No active session found for client: " << client_name;
+      BOOST_LOG(warning) << "No active session found for client: " << logging::quoted_name(client_name);
       return false;
     }
 
@@ -5490,9 +5572,9 @@ namespace stream {
         if (now == was) continue;
         perf::update_session_bitrate(session_p->launch_session_id, now);
         BOOST_LOG(info) << "Host bitrate ceiling " << (cap > 0 ? std::to_string(cap) + " Kbps" : std::string { "none" })
-                        << ": session of client '" << session_p->client_name << "' " << was << " -> " << now << " Kbps (including FEC)";
+                        << ": session of client " << logging::quoted_name(session_p->client_name) << " " << was << " -> " << now << " Kbps (including FEC)";
         if (!send_host_bitrate_update(session_p, now)) {
-          BOOST_LOG(debug) << "Client '" << session_p->client_name << "' did not negotiate host bitrate callbacks; 0x5506 update omitted";
+          BOOST_LOG(debug) << "Client " << logging::quoted_name(session_p->client_name) << " did not negotiate host bitrate callbacks; 0x5506 update omitted";
         }
         changed.push_back({ session_p->client_name, now, was });
       }
@@ -5518,11 +5600,11 @@ namespace stream {
         }
         session_p->host_audio_enabled->store(enabled, std::memory_order_release);
         session_p->config.audio.flags[audio::config_t::HOST_AUDIO] = enabled;
-        BOOST_LOG(info) << "Updated host audio playback for client '" << client_name
-                        << "': " << (enabled ? "enabled" : "disabled");
+        BOOST_LOG(info) << "Updated host audio playback for client " << logging::quoted_name(client_name)
+                        << ": " << (enabled ? "enabled" : "disabled");
         return true;
       }
-      BOOST_LOG(warning) << "No active session found for host audio update: " << client_name;
+      BOOST_LOG(warning) << "No active session found for host audio update: " << logging::quoted_name(client_name);
       return false;
     }
 

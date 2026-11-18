@@ -17,6 +17,8 @@
 #include "src/config.h"
 #include "bitrate.h"
 #include "src/ai/proxy.h"
+#include "src/config.h"
+#include "src/log_text.h"
 #include "src/logging.h"
 
 #include <algorithm>
@@ -618,7 +620,7 @@ namespace abr {
     apply_range(state, config::host_max_bitrate_kbps());
 
     BOOST_LOG(info) << "ABR enabled token_prefix=" << token_log_prefix(session_token)
-                    << " app=" << app_name
+                    << " app=" << logging::quoted_name(app_name)
                     << " mode=" << mode_to_string(cfg.mode)
                     << " bitrate=" << initial_bitrate_kbps
                     << " range=[" << state.config.min_bitrate_kbps
@@ -730,8 +732,8 @@ namespace abr {
         state.foreground_exe = fg.exe_name;
         state.last_fg_pid = fg.pid;
         state.app_changed = true;
-        BOOST_LOG(info) << "ABR: foreground changed to '" << fg.window_title
-                        << "' (" << fg.exe_name << ") pid=" << fg.pid;
+        BOOST_LOG(info) << "ABR: foreground changed to " << logging::quoted_name(fg.window_title)
+                        << " (" << fg.exe_name << ") pid=" << fg.pid;
       }
       else if (fg.pid == state.last_fg_pid && !fg.window_title.empty()) {
         state.foreground_title = fg.window_title;

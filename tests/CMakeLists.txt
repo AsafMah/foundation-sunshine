@@ -160,6 +160,29 @@ if (WIN32)
 endif ()
 add_test(NAME audio_devices_unit_tests COMMAND audio_devices_unit_tests)
 
+# Which virtual device carries a muted stream, the layout it is asked for and the order of its wave formats: no audio API.
+add_executable(audio_sink_plan_unit_tests
+        ${CMAKE_SOURCE_DIR}/src/audio_sink_plan.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_audio_sink_plan.cpp)
+target_include_directories(audio_sink_plan_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(audio_sink_plan_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
+set_target_properties(audio_sink_plan_unit_tests PROPERTIES CXX_STANDARD 23)
+if (WIN32)
+    set_target_properties(audio_sink_plan_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
+endif ()
+add_test(NAME audio_sink_plan_unit_tests COMMAND audio_sink_plan_unit_tests)
+
+# The wait while the system has no default playback device (one log line per reason and session, the wake-up, the sink read): no audio API.
+add_executable(audio_default_wait_unit_tests
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_audio_default_wait.cpp)
+target_include_directories(audio_default_wait_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(audio_default_wait_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
+set_target_properties(audio_default_wait_unit_tests PROPERTIES CXX_STANDARD 23)
+if (WIN32)
+    set_target_properties(audio_default_wait_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
+endif ()
+add_test(NAME audio_default_wait_unit_tests COMMAND audio_default_wait_unit_tests)
+
 # The VB-CABLE install and enable steps against a fake system: nothing is downloaded, installed or enabled.
 add_executable(audio_vb_cable_unit_tests
         ${CMAKE_SOURCE_DIR}/src/audio_vb_cable.cpp
@@ -198,6 +221,24 @@ target_include_directories(video_pacing_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}"
 target_link_libraries(video_pacing_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
 set_target_properties(video_pacing_unit_tests PROPERTIES CXX_STANDARD 23)
 add_test(NAME video_pacing_unit_tests COMMAND video_pacing_unit_tests)
+
+add_executable(cover_failure_backoff_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_cover_failure_backoff.cpp)
+target_include_directories(cover_failure_backoff_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(cover_failure_backoff_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
+set_target_properties(cover_failure_backoff_unit_tests PROPERTIES CXX_STANDARD 23)
+add_test(NAME cover_failure_backoff_unit_tests COMMAND cover_failure_backoff_unit_tests)
+
+add_executable(cover_download_outcome_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_cover_download_outcome.cpp)
+target_include_directories(cover_download_outcome_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(cover_download_outcome_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
+set_target_properties(cover_download_outcome_unit_tests PROPERTIES CXX_STANDARD 23)
+add_test(NAME cover_download_outcome_unit_tests COMMAND cover_download_outcome_unit_tests)
+
+add_executable(encoder_probe_guard_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_encoder_probe_guard.cpp)
+target_include_directories(encoder_probe_guard_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(encoder_probe_guard_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
+set_target_properties(encoder_probe_guard_unit_tests PROPERTIES CXX_STANDARD 23)
+add_test(NAME encoder_probe_guard_unit_tests COMMAND encoder_probe_guard_unit_tests)
 
 add_executable(poster_unit_tests
         ${CMAKE_SOURCE_DIR}/src/nvhttp/poster.cpp
@@ -296,6 +337,12 @@ target_link_libraries(display_scale_steps_unit_tests PRIVATE gtest_main sunshine
 set_target_properties(display_scale_steps_unit_tests PROPERTIES CXX_STANDARD 23)
 add_test(NAME display_scale_steps_unit_tests COMMAND display_scale_steps_unit_tests)
 
+add_executable(display_bounded_call_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_display_bounded_call.cpp)
+target_include_directories(display_bounded_call_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(display_bounded_call_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
+set_target_properties(display_bounded_call_unit_tests PROPERTIES CXX_STANDARD 23)
+add_test(NAME display_bounded_call_unit_tests COMMAND display_bounded_call_unit_tests)
+
 add_executable(vdd_mode_list_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_vdd_mode_list.cpp)
 target_include_directories(vdd_mode_list_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(vdd_mode_list_unit_tests PRIVATE gtest_main nlohmann_json::nlohmann_json
@@ -378,6 +425,26 @@ target_include_directories(ds5_arrival_policy_unit_tests PRIVATE "${CMAKE_SOURCE
 target_link_libraries(ds5_arrival_policy_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
 set_target_properties(ds5_arrival_policy_unit_tests PROPERTIES CXX_STANDARD 23)
 add_test(NAME ds5_arrival_policy_unit_tests COMMAND ds5_arrival_policy_unit_tests)
+
+add_executable(ds5_report_delta_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_ds5_report_delta.cpp)
+target_include_directories(ds5_report_delta_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(ds5_report_delta_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
+set_target_properties(ds5_report_delta_unit_tests PROPERTIES CXX_STANDARD 23)
+add_test(NAME ds5_report_delta_unit_tests COMMAND ds5_report_delta_unit_tests)
+
+add_executable(interrupt_pacing_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_interrupt_pacing.cpp)
+target_include_directories(interrupt_pacing_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(interrupt_pacing_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
+set_target_properties(interrupt_pacing_unit_tests PROPERTIES CXX_STANDARD 23)
+add_test(NAME interrupt_pacing_unit_tests COMMAND interrupt_pacing_unit_tests)
+
+if (WIN32)
+    add_executable(paced_reply_queue_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_paced_reply_queue.cpp)
+    target_include_directories(paced_reply_queue_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(paced_reply_queue_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
+    set_target_properties(paced_reply_queue_unit_tests PROPERTIES CXX_STANDARD 23)
+    add_test(NAME paced_reply_queue_unit_tests COMMAND paced_reply_queue_unit_tests)
+endif ()
 
 add_executable(ds5_haptics_wire_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_ds5_haptics_wire.cpp)
 target_include_directories(ds5_haptics_wire_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
@@ -485,7 +552,7 @@ add_executable(hdr_calibration_unit_tests
         ${CMAKE_SOURCE_DIR}/src/hdr/calibration.cpp
         ${CMAKE_SOURCE_DIR}/src/hdr/client_display_capabilities.cpp
         ${CMAKE_SOURCE_DIR}/src/display_device/color_profile.cpp
-        ${CMAKE_SOURCE_DIR}/src/doctor/doctor.cpp
+        ${CMAKE_SOURCE_DIR}/src/doctor/doctor.cpp ${CMAKE_SOURCE_DIR}/src/doctor/doctor_text.cpp
         ${CMAKE_SOURCE_DIR}/src/nat_discovery.cpp
         ${CMAKE_SOURCE_DIR}/src/public_address.cpp
         ${CMAKE_SOURCE_DIR}/src/network_reachability.cpp
@@ -518,7 +585,7 @@ set(CONFIG_RUNTIME_SUPPORT_SOURCES
         ${CMAKE_SOURCE_DIR}/src/hdr/calibration.cpp
         ${CMAKE_SOURCE_DIR}/src/hdr/client_display_capabilities.cpp
         ${CMAKE_SOURCE_DIR}/src/display_device/color_profile.cpp
-        ${CMAKE_SOURCE_DIR}/src/doctor/doctor.cpp
+        ${CMAKE_SOURCE_DIR}/src/doctor/doctor.cpp ${CMAKE_SOURCE_DIR}/src/doctor/doctor_text.cpp
         ${CMAKE_SOURCE_DIR}/src/public_address.cpp
         ${CMAKE_SOURCE_DIR}/src/nat_discovery.cpp
         ${CMAKE_SOURCE_DIR}/src/network_reachability.cpp
@@ -546,6 +613,28 @@ if (WIN32)
     target_link_libraries(config_runtime_unit_tests PRIVATE ws2_32)
 endif ()
 add_test(NAME config_runtime_unit_tests COMMAND config_runtime_unit_tests)
+
+# AMF rate-control derivation shared by both encoder paths (standalone and
+# avcodec-compatible). A regression here is what let the driver's soft-target
+# default run unconstrained and blow past the client's bitrate target.
+# Windows-only: the AMF headers staged with the AMF/ prefix exist on Windows
+# alone, and sunshine::host_headers does not carry them on other platforms.
+if (WIN32)
+    add_executable(amf_rate_control_unit_tests
+            ${CMAKE_SOURCE_DIR}/tests/unit/test_amf_rate_control.cpp
+            ${CMAKE_SOURCE_DIR}/tests/tools/amf_rate_control_test_stubs.cpp
+            ${CMAKE_SOURCE_DIR}/src/amf/amf_avcodec_compat.cpp)
+    target_include_directories(amf_rate_control_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+    target_link_libraries(amf_rate_control_unit_tests PRIVATE gtest_main Boost::boost Boost::log Boost::format
+            sunshine::host_headers sunshine_project_options sunshine_coverage)
+    set_target_properties(amf_rate_control_unit_tests PROPERTIES CXX_STANDARD 23)
+    target_compile_definitions(amf_rate_control_unit_tests PRIVATE ${SUNSHINE_DEFINITIONS})
+    set_target_properties(amf_rate_control_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
+    # windows.cmake stages AMF headers here for the host build; the compat
+    # adapter and the test both include them.
+    target_include_directories(amf_rate_control_unit_tests SYSTEM PRIVATE "${CMAKE_BINARY_DIR}/amf_include")
+    add_test(NAME amf_rate_control_unit_tests COMMAND amf_rate_control_unit_tests)
+endif ()
 
 # The configuration-upgrade suite runs on its own so the global defaults it
 # compares against are the ones a start-up has before any settings file is read.
@@ -768,10 +857,20 @@ add_test(NAME network_reachability_unit_tests COMMAND network_reachability_unit_
 
 # Telemetry v1: event shapes, scrubbing, consent, queue limits, retry and a fake stream session (no network, no host)
 add_executable(telemetry_unit_tests
+        ${CMAKE_SOURCE_DIR}/src/telemetry/device_facts.cpp
         ${CMAKE_SOURCE_DIR}/src/telemetry/events.cpp
+        ${CMAKE_SOURCE_DIR}/src/telemetry/install_journal.cpp
         ${CMAKE_SOURCE_DIR}/src/telemetry/queue.cpp
+        ${CMAKE_SOURCE_DIR}/src/telemetry/error_report.cpp
+        ${CMAKE_SOURCE_DIR}/src/telemetry/wer_event.cpp
+        ${CMAKE_SOURCE_DIR}/src/telemetry/self_baseline.cpp
+        ${CMAKE_SOURCE_DIR}/src/telemetry/opt_out.cpp
+        ${CMAKE_SOURCE_DIR}/src/telemetry/service_lifecycle.cpp
+        ${CMAKE_SOURCE_DIR}/src/telemetry/stream_health.cpp
         ${CMAKE_SOURCE_DIR}/src/telemetry/stream_stats.cpp
         ${CMAKE_SOURCE_DIR}/src/telemetry/service.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_error_report.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_stream_health.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_telemetry.cpp)
 target_include_directories(telemetry_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(telemetry_unit_tests PRIVATE gtest_main nlohmann_json::nlohmann_json
@@ -783,9 +882,33 @@ if (WIN32)
 endif ()
 add_test(NAME telemetry_unit_tests COMMAND telemetry_unit_tests)
 
+# 开启串流旅程: when the installer hands the Panel --start-guide (pure rules, no Windows headers)
+add_executable(installer_guide_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_installer_guide.cpp)
+target_include_directories(installer_guide_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(installer_guide_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
+target_compile_options(installer_guide_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>)
+set_target_properties(installer_guide_tests PROPERTIES CXX_STANDARD 23)
+add_test(NAME installer_guide_tests COMMAND installer_guide_tests)
+
+# WebView2 Runtime step of the install worker: installed / missing and downloaded / download fails, with fakes (pure rules, no Windows headers)
+add_executable(installer_webview2_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_installer_webview2.cpp)
+target_include_directories(installer_webview2_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(installer_webview2_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
+target_compile_options(installer_webview2_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>)
+set_target_properties(installer_webview2_tests PROPERTIES CXX_STANDARD 23)
+add_test(NAME installer_webview2_tests COMMAND installer_webview2_tests)
+
+# Error and fatal log lines carry file:line:function of the statement (src/logging_site.h); header only, Boost.Log
+add_executable(logging_site_unit_tests
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_logging_site.cpp)
+target_include_directories(logging_site_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(logging_site_unit_tests PRIVATE gtest_main Boost::boost Boost::log sunshine_project_options sunshine_coverage)
+set_target_properties(logging_site_unit_tests PROPERTIES CXX_STANDARD 23)
+add_test(NAME logging_site_unit_tests COMMAND logging_site_unit_tests)
+
 # 体检: the evaluators, the runner, the JSON and the read-only OS probes
 add_executable(doctor_unit_tests
-        ${CMAKE_SOURCE_DIR}/src/doctor/doctor.cpp
+        ${CMAKE_SOURCE_DIR}/src/doctor/doctor.cpp ${CMAKE_SOURCE_DIR}/src/doctor/doctor_text.cpp
         ${CMAKE_SOURCE_DIR}/src/doctor/doctor_os.cpp
         ${CMAKE_SOURCE_DIR}/src/network_reachability.cpp
         ${CMAKE_SOURCE_DIR}/src/public_address.cpp
@@ -806,7 +929,7 @@ endif ()
 target_compile_options(doctor_unit_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>)
 set_target_properties(doctor_unit_tests PROPERTIES CXX_STANDARD 23)
 add_test(NAME doctor_unit_tests COMMAND doctor_unit_tests)
-
+add_subdirectory(usbip)
 # 版本比较: the date part of a Foundation Sunshine version, against the table shared with the panel and the Web UI
 add_executable(version_compare_unit_tests
         ${CMAKE_SOURCE_DIR}/tests/unit/test_version_compare.cpp)
@@ -1343,14 +1466,19 @@ list(FILTER TEST_SOURCES EXCLUDE REGEX "/tests/sparxie/")
 list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_hdr_calibration.cpp)
 list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_authored_ir_extended.cpp)
 list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_audio_devices.cpp)
+list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_audio_sink_plan.cpp)
+list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_audio_default_wait.cpp)
 list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_audio_vb_cable.cpp)
 list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_telemetry.cpp)
 list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_host_bitrate_cap.cpp)
+list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_cover_failure_backoff.cpp)
+list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_cover_download_outcome.cpp)
+list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_encoder_probe_guard.cpp)
 # MAT harnesses have independent entrypoints and explicit test targets.
 list(FILTER TEST_SOURCES EXCLUDE REGEX "/tests/mat-live/")
 # These files already run in registered standalone suites. Keep one copy of
 # their assertions and isolate their fixtures from the aggregate host state.
-list(REMOVE_ITEM TEST_SOURCES
+list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/usbip/external_readonly_probe.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_ai_provider.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_build_info.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_version_compare.cpp
@@ -1390,6 +1518,9 @@ list(REMOVE_ITEM TEST_SOURCES
         ${CMAKE_SOURCE_DIR}/tests/unit/test_uac1_microphone.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_video_probe.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_virtual_touchscreen_device.cpp
+        # test_amf_rate_control pulls boost headers transitively via src/video.h;
+        # it runs in its own Windows-only target, not the aggregate.
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_amf_rate_control.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/pairing_pending_platform_stubs.cpp)
 
 set(ABR_TEST_STUB_SOURCE ${CMAKE_SOURCE_DIR}/tests/unit/abr_test_stubs.cpp)

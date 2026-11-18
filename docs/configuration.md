@@ -23,6 +23,16 @@ location by modifying the configuration file.
 Although it is recommended to use the configuration UI, it is possible manually configure Sunshine by
 editing the `conf` file in a text editor. Use the examples as reference.
 
+### Windows capture session
+
+The GUI independently selects the active interactive user, preferring the console and falling back
+to an active RDP user, and receives permission to read that user's local authentication token.
+
+Capture uses the console by default. Set `session_binding = 0` in `sunshine.conf` to use automatic
+selection, or `1` to explicitly select the console. Restart the Sunshine service after changing this
+setting. A console without a signed-in user may show the Windows sign-in screen and does not
+provide the desktop of a separate RDP session.
+
 ## [General](https://localhost:47990/config/#general)
 
 ### [locale](https://localhost:47990/config/#locale)

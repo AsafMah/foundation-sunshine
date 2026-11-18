@@ -11,7 +11,7 @@
 
 [简体中文](../../README.md) · [English](README.en.md) · [Deutsch](README.de.md) · Français · [日本語](README.ja.md)
 
-[Site officiel](https://www.alkaidlab.com/) · [Site (Chine)](https://www.alkaidlab.cn/) · [Communauté QQ (chinois)](https://qm.qq.com/cgi-bin/qm/qr?k=5qnkzSaLIrIaU4FvumftZH_6Hg7fUuLD&jump_from=webapi) · [Signaler un problème](https://github.com/AlkaidLab/foundation-sunshine/issues)
+[Site officiel](https://www.alkaidlab.com/) · [Site (Chine)](https://www.alkaidlab.cn/) · [Communauté QQ (chinois)](https://qm.qq.com/q/vIVhpjDMic) · [Signaler un problème](https://github.com/AlkaidLab/foundation-sunshine/issues)
 
 </div>
 
@@ -66,6 +66,22 @@ Du HDR dynamique et du calibrage d'écran à la capture à faible latence et à 
 <sub>Interface web · Aperçu</sub>
 </td>
 </tr>
+<tr>
+<td width="50%" align="center" valign="top">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../../assets/readme/panel-guide-dark.webp">
+  <img src="../../assets/readme/panel-guide.webp" alt="Panneau de contrôle : premier lancement">
+</picture><br>
+<sub>Panneau de contrôle · Premier lancement</sub>
+</td>
+<td width="50%" align="center" valign="top">
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../../assets/readme/web-clients-dark.webp">
+  <img src="../../assets/readme/web-clients.webp" alt="Interface web : clients et appairage">
+</picture><br>
+<sub>Interface web · Clients et appairage</sub>
+</td>
+</tr>
 </table>
 
 <p align="center"><a href="SCREENSHOTS.en.md">Plus de captures d'écran (anglais) →</a></p>
@@ -116,10 +132,13 @@ Sous macOS, [Moonlight V+ for PC](https://github.com/qiin2333/moonlight-qt/relea
 
 #### Clients partenaires
 
-- **VoidLink · iOS / iPadOS :** [Présentation](https://github.com/The-Fried-Fish/VoidLink-previously-moonlight-zwm#readme) · [App Store (Chine, Corée du Sud, Vietnam)](https://apps.apple.com/app/voidlink/id6747717070) · [App Store (autres régions)](https://apps.apple.com/app/voidlink-extreme/id6755103808) (distribution payante sur les stores)
-- **VoidLink TestFlight Beta · Apple TV :** [Rejoindre le TestFlight](https://testflight.apple.com/join/k7gs61mZ)
+- **VoidLink · iOS / iPadOS / Apple TV (recommandé) :** [Présentation](https://github.com/The-Fried-Fish/VoidLink-previously-moonlight-zwm#readme) · [App Store (Chine)](https://apps.apple.com/cn/app/voidlink/id6747717070) · [App Store (États-Unis)](https://apps.apple.com/us/app/voidlink-extreme/id6755103808) (distribution payante sur les stores)
 - **Crown Edition · Android :** [Téléchargement](https://github.com/WACrown/moonlight-android/releases) · [Présentation](https://github.com/WACrown/moonlight-android#readme)
 - **Baozi Edition · HarmonyOS :** [Projet et téléchargements](https://gitee.com/smdsbz/moonlight-ohos)
+
+#### Outils partenaires
+
+- **Natpierce (Jiaoyuelian) :** [Outil de tunnel réseau](https://docs.qq.com/aio/DRFVhWERDaFhKd1ZE)
 
 ## <picture><source media="(prefers-color-scheme: dark)" srcset="../../assets/readme/h-start-dark.webp"><img src="../../assets/readme/h-start.webp" height="50" alt=""></picture>&nbsp;Démarrage rapide
 
@@ -177,7 +196,7 @@ Sous macOS, [Moonlight V+ for PC](https://github.com/qiin2333/moonlight-qt/relea
 
 - [Documentation (anglais)](../en/README.md) : installation, fonctions, FAQ et développement, classés par tâche.
 - [FAQ (anglais)](../en/faq.md) : saccades, connexion et audio.
-- [Site officiel](https://www.alkaidlab.com/) · [Site (Chine)](https://www.alkaidlab.cn/) · [Communauté QQ (chinois)](https://qm.qq.com/cgi-bin/qm/qr?k=5qnkzSaLIrIaU4FvumftZH_6Hg7fUuLD&jump_from=webapi).
+- [Site officiel](https://www.alkaidlab.com/) · [Site (Chine)](https://www.alkaidlab.cn/) · [Communauté QQ (chinois)](https://qm.qq.com/q/vIVhpjDMic).
 - [Signaler un problème](https://github.com/AlkaidLab/foundation-sunshine/issues) · [Discussions](https://github.com/AlkaidLab/foundation-sunshine/discussions) · [Contribuer](../contributing.en.md).
 
 Merci à [LizardByte/Sunshine](https://github.com/LizardByte/Sunshine), [Moonlight](https://moonlight-stream.org/), [ZakoDisplay](https://github.com/qiin2333/zako-vdd) et à toutes les personnes qui contribuent. Licence [GPL-3.0](https://github.com/AlkaidLab/foundation-sunshine/blob/master/LICENSE).

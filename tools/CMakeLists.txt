@@ -4,6 +4,18 @@ cmake_minimum_required(VERSION 3.25)
 set(SUNSHINE_PARENT_VERSION "${PROJECT_VERSION}")
 project(sunshine_tools)
 
+# fs-tools-no-boost-separate-20261117: none of these tools uses Boost.Asio or Boost.Beast, so they do not take the separately compiled
+# copy that cmake/dependencies/boost_separate.cmake links into every other target (link_libraries is inherited by this directory).
+# That library is one object file. A tool only needs a libstdc++ symbol that the object also defines (a weak copy of
+# std::string::_M_replace), LLD loads the whole object for it, and the global initializers in it keep the Beast, Asio and OpenSSL
+# code alive: dxgi-info and audio-info grew from 1.1 MB to 7 MB with the Clang toolchain, while the linker option --gc-sections
+# was already on the command line. GNU ld does not load the object, so GCC builds never paid for it.
+if(TARGET sunshine_boost_separate)
+    get_directory_property(_sunshine_tools_link_libraries LINK_LIBRARIES)
+    list(REMOVE_ITEM _sunshine_tools_link_libraries sunshine_boost_separate)
+    set_directory_properties(PROPERTIES LINK_LIBRARIES "${_sunshine_tools_link_libraries}")
+endif()
+
 include_directories("${CMAKE_SOURCE_DIR}")
 
 if(WIN32)
@@ -18,6 +30,10 @@ if(WIN32)
             COMMAND "${CMAKE_COMMAND}" -E make_directory "${SPARXIE_LAUNCH_PUBLISH_DIR}"
             COMMAND "${SPARXIE_LAUNCH_DOTNET}" publish "${CMAKE_CURRENT_SOURCE_DIR}/sparxie-launch/Sparxie.Launch.csproj"
                     --configuration "$<CONFIG>" --output "${SPARXIE_LAUNCH_PUBLISH_DIR}"
+                    # MSBuild defaults bin/obj next to the csproj; redirect them into the build tree
+                    # so publishing does not drop build artifacts into the source checkout.
+                    -p:BaseOutputPath="${CMAKE_CURRENT_BINARY_DIR}/sparxie-launch-bin/"
+                    -p:BaseIntermediateOutputPath="${CMAKE_CURRENT_BINARY_DIR}/sparxie-launch-obj/"
                     --nologo --verbosity minimal
             DEPENDS
                 "${CMAKE_CURRENT_SOURCE_DIR}/sparxie-launch/Sparxie.Launch.csproj"
@@ -116,9 +132,12 @@ if(WIN32)
         installer_web.inc
         installer_json.h
         installer_d2d.h
+        installer_failure.h
+        installer_guide.h
         installer_state.h
         installer_maintenance.h
         installer_ui.h
+        installer_webview2.h
         installer_icon.inc)
     set_target_properties(sunshine-installer-shell PROPERTIES
         CXX_STANDARD 23
@@ -126,11 +145,14 @@ if(WIN32)
     target_compile_definitions(sunshine-installer-shell PRIVATE UNICODE _UNICODE)
     target_include_directories(sunshine-installer-shell PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
     target_link_libraries(sunshine-installer-shell
-        PRIVATE d2d1 dwrite windowscodecs dwmapi shell32 advapi32 user32 ole32 uuid)
+        PRIVATE d2d1 dwrite windowscodecs dwmapi shell32 advapi32 user32 ole32 uuid winhttp wintrust crypt32)
     target_compile_options(sunshine-installer-shell PRIVATE ${SUNSHINE_COMPILE_OPTIONS})
     if(MINGW)
         # static: the installer must start on a PC that has none of the MSYS2 runtime DLLs
         target_link_options(sunshine-installer-shell PRIVATE -municode -static)
+        # The shell is the elevated worker and the updater too. LLD defaults to a 1 MiB stack reserve (GNU ld: 2 MiB); the
+        # same 2 MiB as the other executables is the floor (scripts/ci/check-windows-release.py), 4 MiB here for headroom.
+        target_link_options(sunshine-installer-shell PRIVATE -Wl,--stack,4194304)
         # the shell is appended to the installer as it is built: -g1 (cmake/compile_definitions/windows.cmake) must not end up in the package
         target_link_options(sunshine-installer-shell PRIVATE -Wl,--strip-debug)
     endif()

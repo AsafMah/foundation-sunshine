@@ -21,7 +21,8 @@ on:
     branches:
       - master
   schedule:
-    # Nightly: a cold build with the latest toolchain packages, the full native tests, and a fresh compiler cache for master.
+    # Nightly: a cold build with the pinned toolchain packages (the weekly toolchain watch probes the newest ones when a
+    # major moves), the full native tests, and a fresh compiler cache for master.
     - cron: '17 20 * * *'
   workflow_dispatch:
     inputs:
@@ -41,6 +42,17 @@ on:
         description: 'Compile the objects on parallel runners first (what the nightly build and a build without any compiler cache do)'
         type: boolean
         default: false
+      toolchain_probe:
+        description: 'Build with the newest MSYS2 packages instead of the pinned ones (what the weekly toolchain watch dispatches to test a new major)'
+        type: boolean
+        default: false
+      toolchain:
+        description: 'Windows release compiler (Clang is used for releases; GCC remains the fallback)'
+        type: choice
+        default: clang
+        options:
+          - 'clang'
+          - 'gcc'
       rtx_hdr:
         description: 'RTX HDR support for development branches (official master always requires ON)'
         type: choice
@@ -68,6 +80,11 @@ concurrency:
 # Run it on Node.js 24 ahead of GitHub's fall 2026 Node.js 20 removal.
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+  # What is tested is what is shipped: pull requests, pushes, the nightly build and releases all build with Clang (the release
+  # compiler), so the compile, the native tests and the PE release gate run on the Clang binaries. GCC is the fallback: the
+  # CI_TOOLCHAIN repository variable or the manual input switch to it, and .github/workflows/gcc-fallback.yml builds and
+  # tests it in full every night and opens an issue when that fails.
+  TOOLCHAIN: ${{ inputs.toolchain || vars.CI_TOOLCHAIN || 'clang' }}
 
 jobs:
   changes:
@@ -131,6 +148,23 @@ jobs:
           persist-credentials: false
       - name: Check relative links and images
         run: python3 scripts/ci/check-doc-links.py --root .
+
+  third-party-licenses:
+    name: Third-party licenses
+    # Source: github-actions-workflow-syntax-20261117.
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # A driver download without a reviewed license text, a version pin that
+      # moved away from the reviewed tag, or a package path that stops copying
+      # licenses/ fails here and at Windows configure time.
+      - name: Every fetched driver has a reviewed license
+        run: python3 scripts/ci/check-third-party-licenses.py --root .
 
   workflow-lint:
     name: Workflow lint
@@ -486,6 +520,12 @@ jobs:
           & .\src_assets\windows\misc\vdd\smoke-test-vdd-device-helper.ps1
           & .\src_assets\windows\misc\vdd\smoke-test-install-vdd-selection.ps1
 
+      - name: Run USB/IP package and root-hub guard regressions
+        shell: pwsh
+        run: |
+          & .\scripts\packaging\test-usbip-root.ps1
+          & .\src_assets\windows\misc\usbip\smoke-test-usbip-package.ps1
+          & .\src_assets\windows\misc\usbip\smoke-test-usbip-roothub-guard.ps1
   mat_smoke:
     name: MAT software regressions
     needs: changes
@@ -534,15 +574,19 @@ jobs:
           persist-credentials: false
 
       # What decides whether an earlier compiler cache still hits: the CMake modules that set flags, build_win's configure step, the
-      # toolchain action and the MSYS2 package versions (scripts/ci/config-fingerprint.py). It is part of the cache key.
+      # toolchain action and the MSYS2 package pins (scripts/ci/config-fingerprint.py). It is part of the cache key; the
+      # suffix keeps the pinned toolchain and a probe build with the newest packages in separate cache lineages.
       - name: Configuration fingerprint
         id: fingerprint
+        env:
+          # TOOLCHAIN (the compiler: gcc or clang) comes from the workflow env and is read by config-fingerprint.py itself.
+          TOOLCHAIN_MODE: ${{ inputs.toolchain_probe == true && 'newest' || 'pinned' }}
         run: |
           set -euo pipefail
-          fingerprint="$(python3 scripts/ci/config-fingerprint.py --details 2> details.txt)"
+          fingerprint="$(python3 scripts/ci/config-fingerprint.py --details 2> details.txt)-$TOOLCHAIN_MODE"
           cat details.txt
           echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
-          { echo "### Compiler cache configuration"; echo "- fingerprint: \`$fingerprint\`"; grep -E '^    ' details.txt | sed 's/^    /- /'; } >> "$GITHUB_STEP_SUMMARY"
+          { echo "### Compiler cache configuration"; echo "- fingerprint: \`$fingerprint\`"; grep -E '^    ' details.txt | sed 's/^    /- /' || true; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Decide
         id: plan
@@ -622,8 +666,11 @@ jobs:
 
       - name: Toolchain
         uses: ./.github/actions/windows-toolchain
+        with:
+          unpinned: ${{ inputs.toolchain_probe == true }}
+          toolchain: ${{ env.TOOLCHAIN }}
 
-      # The same pinned Panel bundle and WebView2 bootstrapper build_win uses (scripts/installer-inputs.json), so the configure
+      # The same pinned Panel bundle build_win uses (scripts/installer-inputs.json), so the configure
       # downloads nothing ("latest") and needs no token. Nothing here reads a token: the configure step below must not see one.
       - name: Fetch pinned installer inputs
         shell: pwsh
@@ -661,6 +708,10 @@ jobs:
           if [[ -n "${GITHUB_TOKEN:-}" ]]; then echo "::error::the configure step must not have GITHUB_TOKEN"; exit 1; fi
           mkdir -p build
           ccache --zero-stats
+          compiler=(-DSUNSHINE_PRECOMPILED_HEADERS=ON)
+          if [[ "$TOOLCHAIN" == clang ]]; then
+            compiler=(-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld -DSUNSHINE_PRECOMPILED_HEADERS=ON)
+          fi
           gui_options=(-DFETCH_GUI=OFF)
           # Forks fetch no upstream GUI (fetch-installer-inputs.ps1 -NoGui); the shard compiles objects only.
           if [[ -n "${GUI_BUNDLE_DIR:-}" ]]; then gui_options+=("-DGUI_DIR=$GUI_BUNDLE_DIR"); else gui_options+=(-DSUNSHINE_REQUIRE_GUI_BUNDLE=OFF); fi
@@ -668,6 +719,7 @@ jobs:
             -B build \
             -G Ninja \
             -S . \
+            "${compiler[@]}" \
             "${gui_options[@]}" \
             -DBUILD_DOCS=OFF \
             -DSUNSHINE_RTX_HDR="$SUNSHINE_RTX_HDR" \
@@ -692,6 +744,10 @@ jobs:
           CCACHE_DIR: ${{ github.workspace }}\.ccache
           CCACHE_MAXSIZE: 2G
           CCACHE_COMPILERCHECK: content
+          CCACHE_SLOPPINESS: pch_defines,time_macros
+          # Depend mode takes the include list from the compiler's own -MD file instead of running the preprocessor a second
+          # time on a miss; hits cost the same. https://ccache.dev/manual/latest.html#_the_depend_mode
+          CCACHE_DEPEND: '1'
           CLAIM_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_RUN_ID: ${{ github.run_id }}
@@ -775,6 +831,9 @@ jobs:
 
       - name: Toolchain
         uses: ./.github/actions/windows-toolchain
+        with:
+          unpinned: ${{ inputs.toolchain_probe == true }}
+          toolchain: ${{ env.TOOLCHAIN }}
 
       - name: Cache compiler objects
         uses: actions/cache/restore@v6
@@ -798,6 +857,8 @@ jobs:
           CCACHE_DIR: ${{ github.workspace }}\.ccache
           CCACHE_MAXSIZE: 2G
           CCACHE_COMPILERCHECK: content
+          CCACHE_SLOPPINESS: pch_defines,time_macros
+          CCACHE_DEPEND: '1'
         run: |
           export PATH="$PATH:/c/Program Files/dotnet"
           gui_options=()
@@ -807,7 +868,12 @@ jobs:
             # Forks without a built GUI (no packaging in this job) never download the upstream one.
             gui_options=(-DFETCH_GUI=OFF -DSUNSHINE_REQUIRE_GUI_BUNDLE=OFF)
           fi
+          compiler=(-DSUNSHINE_PRECOMPILED_HEADERS=ON)
+          if [[ "$TOOLCHAIN" == clang ]]; then
+            compiler=(-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld -DSUNSHINE_PRECOMPILED_HEADERS=ON)
+          fi
           cmake -B build-adapter-config -G Ninja -S . "${gui_options[@]}" \
+            "${compiler[@]}" \
             -DBUILD_DOCS=OFF -DBUILD_TESTS=ON -DBUILD_TRAY_TESTS=ON -DBUILD_WEB_UI=OFF \
             -DSUNSHINE_RTX_HDR=OFF -DSUNSHINE_SIMULATE_ADAPTER_DEFINES=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -931,6 +997,9 @@ jobs:
       # MSYS2 UCRT64 with the build tools, Defender exclusions for the build directories, and a record of the runner CPU.
       - name: Toolchain
         uses: ./.github/actions/windows-toolchain
+        with:
+          unpinned: ${{ inputs.toolchain_probe == true }}
+          toolchain: ${{ env.TOOLCHAIN }}
 
       # Dependency drift canary (nightly only, informational): the installed package versions are kept as an artifact and
       # compared with the last successful nightly, so a red nightly can be tied to the packages that changed overnight.
@@ -1056,7 +1125,7 @@ jobs:
             echo "::warning title=A compile shard failed::this job compiles the objects that no shard cache has"
           fi
 
-      # The Panel bundle and the WebView2 bootstrapper, pinned by tag/sha256 in scripts/installer-inputs.json and verified (never
+      # The Panel bundle, pinned by tag/sha256 in scripts/installer-inputs.json and verified (never
       # "latest"). The pinned Panel commit must be the committed submodule. A manual run with gui_run_id replaces the GUI below.
       - name: Fetch pinned installer inputs
         shell: pwsh
@@ -1065,7 +1134,6 @@ jobs:
           $dest = "$env:RUNNER_TEMP/installer-inputs/pinned"
           ./scripts/fetch-installer-inputs.ps1 -Destination $dest -NoGui:$${{ github.repository != 'AlkaidLab/foundation-sunshine' }}
           if (Test-Path "$dest/gui") { "GUI_BUNDLE_DIR=$dest/gui" >> $env:GITHUB_ENV }
-          "WEBVIEW2_BOOTSTRAPPER=$dest/MicrosoftEdgeWebview2Setup.exe" >> $env:GITHUB_ENV
 
       - name: Fetch paired GUI artifact
         if: github.repository == 'AlkaidLab/foundation-sunshine' && github.event_name == 'workflow_dispatch' && inputs.gui_run_id != ''
@@ -1121,6 +1189,7 @@ jobs:
           # Hashing the compiler binary instead of its mtime keeps the cache
           # valid across runs that did not actually change gcc.
           CCACHE_COMPILERCHECK: content
+          CCACHE_SLOPPINESS: pch_defines,time_macros
           # Fork PRs still try every public dependency. Keep the build usable
           # when a release asset is temporarily unavailable; official builds
           # continue to require the complete driver set.
@@ -1138,10 +1207,15 @@ jobs:
             # Forks without a built GUI (no packaging in this job) never download the upstream one.
             gui_options=(-DFETCH_GUI=OFF)
           fi
+          compiler=(-DSUNSHINE_PRECOMPILED_HEADERS=ON)
+          if [[ "$TOOLCHAIN" == clang ]]; then
+            compiler=(-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld -DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld -DSUNSHINE_PRECOMPILED_HEADERS=ON)
+          fi
           cmake \
             -B build \
             -G Ninja \
             -S . \
+            "${compiler[@]}" \
             "${gui_options[@]}" \
             -DBUILD_DOCS=OFF \
             -DSUNSHINE_RTX_HDR="$SUNSHINE_RTX_HDR" \
@@ -1167,6 +1241,10 @@ jobs:
           CCACHE_DIR: ${{ github.workspace }}\.ccache
           CCACHE_MAXSIZE: 2G
           CCACHE_COMPILERCHECK: content
+          CCACHE_SLOPPINESS: pch_defines,time_macros
+          # Depend mode takes the include list from the compiler's own -MD file instead of running the preprocessor a second
+          # time on a miss; hits cost the same. https://ccache.dev/manual/latest.html#_the_depend_mode
+          CCACHE_DEPEND: '1'
         run: |
           # After a sharded cold build every object is in the merged cache: count only this step's lookups (the configure
           # step's CMake checks are never cached) and say so when the shards and this configure have drifted apart.
@@ -1180,6 +1258,46 @@ jobs:
               echo "::warning title=Shards drifted::$misses of $((hits + misses)) compiles were not in the shard caches; keep the shard job's configure in step with Configure Windows"
             fi
           fi
+
+      - name: Compiler cache size
+        if: always()
+        shell: msys2 {0}
+        env:
+          CCACHE_DIR: ${{ github.workspace }}\.ccache
+        run: |
+          # Where the cache bytes are: the precompiled headers (one per target) or the object files, and how many entries of each.
+          {
+            echo "### Compiler cache ($TOOLCHAIN)"
+            echo "- total: $(du -sm .ccache | cut -f1) MB, $(find .ccache -type f | wc -l) files"
+            find .ccache -type f -size +5M -printf '%s\n' | awk '{n++; s+=$1} END {printf "- entries over 5 MB (precompiled headers): %d, %d MB\n", n, s/1048576}'
+            find .ccache -type f -size -5M -printf '%s\n' | awk '{n++; s+=$1} END {printf "- other entries: %d, %d MB\n", n, s/1048576}'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Check Windows release executable
+        shell: msys2 {0}
+        run: python scripts/ci/check-windows-release.py build/sunshine.exe
+
+      # The display and audio helpers are about 1 MB of code with either compiler. A build that links the wrong library into
+      # them (Clang/LLD once loaded the Asio/Beast/OpenSSL object: 5 MB of code) is caught here, not by a reader of the package size.
+      - name: Check helper executable sizes
+        shell: msys2 {0}
+        run: |
+          for tool in dxgi-info audio-info sunshinesvc; do
+            python scripts/ci/check-windows-release.py "build/tools/$tool.exe" --max-code-bytes 1600000
+          done
+
+      # The installer shell is also the elevated worker and the updater. LLD gives an executable a 1 MiB stack by default, and the
+      # worker's inlined 1 MiB buffer overflowed it before the first event (issue #1326): the reserve is a release property.
+      - name: Check installer shell stack reserve
+        shell: msys2 {0}
+        run: python scripts/ci/check-windows-release.py build/tools/sunshine-installer-shell.exe --stack-only
+
+      - name: Run version without MSYS2 on PATH
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot;$env:SystemRoot\System32\Wbem"
+          & "$env:GITHUB_WORKSPACE\build\sunshine.exe" --version
+          if ($LASTEXITCODE -ne 0) { throw "sunshine.exe --version failed with exit code $LASTEXITCODE" }
 
       # The nightly build measures what the next split and the next header rule are built from: the compile time of every object file (the
       # shards' ninja logs) and the share of it behind each header. Download the two files and commit them when they have moved
@@ -1240,7 +1358,7 @@ jobs:
         # master lineage of the upstream repository to restore from, so there
         # the pull request runs save too (the next push of the same pull
         # request restores it).
-        if: always() && (github.ref == 'refs/heads/master' || github.repository != 'AlkaidLab/foundation-sunshine')
+        if: always() && env.TOOLCHAIN == (vars.CI_TOOLCHAIN || 'clang') && (github.ref == 'refs/heads/master' || github.repository != 'AlkaidLab/foundation-sunshine')
         id: ccache_save
         continue-on-error: true
         uses: actions/cache/save@v6
@@ -1269,12 +1387,13 @@ jobs:
         run: |
           $current = "ccache-windows-${{ needs.cold_plan.outputs.fingerprint }}-${{ github.run_id }}"
           # Both the fingerprinted keys (ccache-windows-<fingerprint>-<run>) and the older ones without a fingerprint
-          # (ccache-windows-<run>) are pruned, so the entries from before the fingerprint do not stay in the quota.
+          # (ccache-windows-<run>) are pruned (the fingerprint ends in -pinned or -newest; a pattern without that part matched
+          # none of the current keys and let every run's entry pile up in the quota), so the entries from before the fingerprint do not stay in the quota.
           # Page through the caches API instead of `gh cache list`: the
           # latter caps at --limit 100, and once this repo's other caches
           # (msys2, npm, ...) grow past that, stale ccache entries would
           # fall outside the window and never get pruned.
-          $all = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/actions/caches?per_page=100" --jq '.actions_caches[] | select(.key | test("^ccache-windows-([0-9a-f]{12}-)?[0-9]+$")) | [(.key | sub("^ccache-windows-([0-9a-f]{12}-)?";"") | tonumber), .id, .key] | @tsv' |
+          $all = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/actions/caches?per_page=100" --jq '.actions_caches[] | select(.key | test("^ccache-windows-([0-9a-f]{12}-(pinned|newest)-)?[0-9]+$")) | [(.key | sub("^ccache-windows-([0-9a-f]{12}-(pinned|newest)-)?";"") | tonumber), .id, .key] | @tsv' |
             Where-Object { $_ } |
             ForEach-Object {
               $parts = $_ -split "`t"
@@ -1361,6 +1480,14 @@ jobs:
           # Install into the staging directory first.
           cmake --install . --prefix ./inno_staging
 
+          # The driver licenses and the repository notices are part of the
+          # install tree that both packages read.
+          test -f ./inno_staging/NOTICE
+          test -f ./inno_staging/LICENSE
+          test -f ./inno_staging/licenses/vigembus/LICENSE
+          test -f ./inno_staging/licenses/usbip-win2/LICENSE
+          test -f ./inno_staging/licenses/zako-virtual-mouse/LICENSE
+
           # Symbols from the unstripped modules, then strip what ships: the packages carry no DWARF, the symbol zip does.
           # The key is the build-id GUID of each module, which stripping and signing keep.
           python3 ../scripts/ci/make-symbols.py --staging ./inno_staging --build . --dump-syms "$(cygpath -u "$DUMP_SYMS")" \
@@ -1385,7 +1512,12 @@ jobs:
           
           # Run the Inno Setup compiler and prove that it consumed only the
           # lightweight package manifest, not the self-contained runtime.
+          inno_start=$(date +%s.%N)
           "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" sunshine_installer.iss | tee inno-build.log
+          inno_end=$(date +%s.%N)
+          inno_seconds=$(python3 -c "print(f'{float(\"$inno_end\") - float(\"$inno_start\"):.3f}')")
+          inno_bytes=$(stat -c %s ./cpack_artifacts/Sunshine-engine.exe)
+          echo "Inno Setup: bytes=$inno_bytes seconds=$inno_seconds" | tee -a "$GITHUB_STEP_SUMMARY"
           if grep -Ei 'nvngx_(truehdr|dlssnr)\.dll' inno-build.log; then
             echo "NVIDIA enhancement runtimes must not be compiled into the installer"
             exit 1
@@ -1398,9 +1530,21 @@ jobs:
           if [[ "$RTX_VIDEO_ADAPTER_BUILT" == "true" ]]; then
             grep -F "foundation_rtx_video_adapter.dll" inno-build.log
           fi
+          grep -E 'licenses[/\\]vigembus[/\\]LICENSE' inno-build.log
+          grep -E 'licenses[/\\]usbip-win2[/\\]LICENSE' inno-build.log
+          grep -E 'licenses[/\\]zako-virtual-mouse[/\\]LICENSE' inno-build.log
           
-          # Generate the portable ZIP.
+          # Generate the portable ZIP. CPack's ZIP generator is the measured
+          # winner for this payload: it is smaller and faster than the
+          # per-entry alternative on the same Windows runner class
+          # (CMake Archive docs, read 2026-11-16:
+          # cmake-cpack-archive-20261116).
+          portable_start=$(date +%s.%N)
           cpack -G ZIP --config ./CPackConfig.cmake -D CPACK_STRIP_FILES=ON --verbose
+          portable_end=$(date +%s.%N)
+          portable_seconds=$(python3 -c "print(f'{float(\"$portable_end\") - float(\"$portable_start\"):.3f}')")
+          portable_bytes=$(stat -c %s ./cpack_artifacts/Sunshine.zip)
+          echo "Portable ZIP: bytes=$portable_bytes seconds=$portable_seconds" | tee -a "$GITHUB_STEP_SUMMARY"
           cmake -E tar tf ./cpack_artifacts/Sunshine.zip | tr '\\' '/' > portable-files.txt
           if [[ "$RTX_VIDEO_ADAPTER_BUILT" == "true" ]]; then
             grep -F "Sunshine/tools/hdr_enhanced/nvidia_rtx_video/foundation_rtx_video_adapter.dll" portable-files.txt
@@ -1416,11 +1560,15 @@ jobs:
           fi
 
           # The engine is not the download: "Assemble installer" wraps it in the shell.
+          grep -F "Sunshine/NOTICE" portable-files.txt
+          grep -F "Sunshine/licenses/vigembus/LICENSE" portable-files.txt
+          grep -F "Sunshine/licenses/usbip-win2/LICENSE" portable-files.txt
+          grep -F "Sunshine/licenses/zako-virtual-mouse/LICENSE" portable-files.txt
           test -f ./cpack_artifacts/Sunshine-engine.exe
           mv ./cpack_artifacts/Sunshine.zip ../artifacts/sunshine-windows-portable.zip
 
       # The user-facing installer, the same package tools/append_installer_payload.py makes for a local build
-      # (cmake/packaging/windows_innosetup.cmake): [shell][setup UI][WebView2 bootstrapper][Inno engine][footer].
+      # (cmake/packaging/windows_innosetup.cmake): [shell][setup UI][Inno engine][footer]; no WebView2 bootstrapper, the worker downloads it when needed.
       - name: Assemble installer
         if: needs.changes.outputs.package == 'true'
         shell: pwsh
@@ -1429,16 +1577,72 @@ jobs:
           $shell = 'build/tools/sunshine-installer-shell.exe'
           $engine = 'build/cpack_artifacts/Sunshine-engine.exe'
           $output = 'artifacts/sunshine-windows-installer.exe'
-          python tools/append_installer_payload.py $shell $engine $output --ui $env:SETUP_UI_EXE --wv2 $env:WEBVIEW2_BOOTSTRAPPER
+          python tools/append_installer_payload.py $shell $engine $output --ui $env:SETUP_UI_EXE
           # Read the footer back: every section is present and carries the hash of the file it was made from.
           $bytes = [IO.File]::ReadAllBytes($output)
           $tail = [Text.Encoding]::ASCII.GetString($bytes, [Math]::Max(0, $bytes.Length - 2048), [Math]::Min(2048, $bytes.Length))
           $footer = $tail.Substring($tail.LastIndexOf("ALKAID-SHELL-PAYLOAD-V1"))
-          foreach ($section in @(@('', $engine), @('ui-', $env:SETUP_UI_EXE), @('wv2-', $env:WEBVIEW2_BOOTSTRAPPER))) {
+          foreach ($section in @(@('', $engine), @('ui-', $env:SETUP_UI_EXE))) {
             $hash = (Get-FileHash -LiteralPath $section[1] -Algorithm SHA256).Hash.ToLowerInvariant()
             if ($footer -notmatch "(?m)^$($section[0])sha256=$hash\r?$") { throw "Installer footer lacks $($section[0])sha256=$hash" }
           }
+          if ($footer -match '(?m)^wv2-') { throw 'The installer must not carry the WebView2 bootstrapper' }
           Write-Output $footer
+
+      # The CI never ran the installer, which is how a stack overflow in its first step shipped. The package is run here as the
+      # worker would be: the entry, the run directory, the events file and the extraction of the engine from the payload
+      # (--selftest-worker, no install, no engine), under a time limit.
+      - name: Run the installer worker (smoke test)
+        if: needs.changes.outputs.package == 'true'
+        shell: pwsh
+        run: |
+          $installer = (Resolve-Path 'artifacts/sunshine-windows-installer.exe').Path
+          $dir = Join-Path $env:RUNNER_TEMP 'installer-worker-smoke'
+          if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
+          $process = Start-Process -FilePath $installer -ArgumentList '--selftest-worker', $dir -PassThru
+          if (-not $process.WaitForExit(120000)) { $process.Kill(); throw 'installer worker did not finish in 120 s' }
+          $process.Refresh()
+          Get-ChildItem $dir -ErrorAction SilentlyContinue | Format-Table Name, Length
+          if ($process.ExitCode -ne 0) { throw ('installer worker exited with 0x{0:X8}' -f $process.ExitCode) }
+          $engine = Join-Path $dir 'sunshine-engine.exe'
+          $expected = (Get-FileHash -LiteralPath 'build/cpack_artifacts/Sunshine-engine.exe' -Algorithm SHA256).Hash
+          if (-not (Test-Path $engine) -or (Get-FileHash -LiteralPath $engine -Algorithm SHA256).Hash -ne $expected) { throw 'the extracted engine differs from the packaged one' }
+          if (-not (Select-String -Path (Join-Path $dir 'events.jsonl') -Pattern 'WorkerStarted' -Quiet)) { throw 'the worker wrote no first event' }
+
+      # 体积门禁：安装器超过 scripts/ci/size-budget.json 的上限就失败，超过上限的 90% 打印警告。便携包、sunshine.exe、
+      # sunshine-gui.exe 只记录大小，写进 job summary，方便看趋势。上限由车主批准后才能改。
+      - name: Installer size budget
+        if: needs.changes.outputs.package == 'true'
+        shell: pwsh
+        run: |
+          $env:PYTHONUTF8 = '1'
+          python scripts/ci/check-size-budget.py --installer artifacts/sunshine-windows-installer.exe `
+            --measure "便携包 sunshine-windows-portable.zip=artifacts/sunshine-windows-portable.zip" `
+            --measure-zip "sunshine.exe（便携包内，解压后）=artifacts/sunshine-windows-portable.zip::Sunshine/sunshine.exe" `
+            --measure-zip "sunshine-gui.exe（便携包内，解压后）=artifacts/sunshine-windows-portable.zip::Sunshine/assets/gui/sunshine-gui.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check unattended install and uninstall
+        if: needs.changes.outputs.package == 'true'
+        timeout-minutes: 12
+        uses: ./.github/actions/test-installer-silent
+
+      # The WebView2 step of the worker against Microsoft's real link: the bootstrapper downloads, its signature is Microsoft
+      # Corporation's, and an unsigned file (this very installer) is refused. Nothing is installed or run. The decision itself
+      # (installed / missing and downloaded / download fails) is tests/unit/test_installer_webview2.cpp.
+      - name: Installer WebView2 download and signature check
+        if: needs.changes.outputs.package == 'true'
+        shell: pwsh
+        run: |
+          $installer = (Resolve-Path 'artifacts/sunshine-windows-installer.exe').Path
+          $dir = Join-Path $env:RUNNER_TEMP 'installer-webview2-smoke'
+          if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
+          $process = Start-Process -FilePath $installer -ArgumentList '--selftest-webview2', $dir -PassThru
+          if (-not $process.WaitForExit(180000)) { $process.Kill(); throw 'the WebView2 check did not finish in 180 s' }
+          $process.Refresh()
+          if (Test-Path (Join-Path $dir 'selftest-webview2.json')) { Get-Content (Join-Path $dir 'selftest-webview2.json') }
+          if ($process.ExitCode -ne 0) { throw ('the WebView2 check exited with {0} (20: download failed, 21: not signed by Microsoft, 22: an unsigned file passed)' -f $process.ExitCode) }
+          if (Get-ChildItem $dir -Filter '*.exe') { throw 'the downloaded bootstrapper was not removed' }
 
       - name: Rename release assets
         if: needs.changes.outputs.package == 'true'
@@ -1585,7 +1789,7 @@ jobs:
   ci-gate:
     name: CI gate
     if: always()
-    needs: [changes, docs-check, workflow-lint, webui, webui-docs, setup_release, vdd_smoke, mat_smoke, cold_plan, shard, adapter_config, setup_ui, build_win, publish, publish_fork_release]
+    needs: [changes, docs-check, third-party-licenses, workflow-lint, webui, webui-docs, setup_release, vdd_smoke, mat_smoke, cold_plan, shard, adapter_config, setup_ui, build_win, publish, publish_fork_release]
     runs-on: ubuntu-slim
     timeout-minutes: 5
     permissions: {}

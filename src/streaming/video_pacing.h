@@ -65,11 +65,24 @@ namespace streaming {
     return std::max(sustained_bps, static_cast<std::uint64_t>(needed + 0.5L));
   }
 
+  /// The frame rates a client may ask for while a stream runs (control message and HTTP API).
+  inline constexpr double dynamic_fps_min = 1.0;
+  inline constexpr double dynamic_fps_max = 1000.0;
+
+  /// True for a finite frame rate inside [dynamic_fps_min, dynamic_fps_max]; NaN and infinity are out.
+  inline bool
+  dynamic_fps_in_range(double frames_per_second) noexcept {
+    return frames_per_second >= dynamic_fps_min && frames_per_second <= dynamic_fps_max;
+  }
+
   /// The capture interval of a stream at the given frame rate; zero when the rate is unusable, which disables pacing.
   inline std::chrono::nanoseconds
   video_frame_interval(double frames_per_second) noexcept {
     if (!(frames_per_second > 0.0)) return {};
-    return std::chrono::nanoseconds { static_cast<std::int64_t>(1e9 / frames_per_second) };
+    const double interval_ns = 1e9 / frames_per_second;
+    // A rate so small that the interval no longer fits the counter would be undefined behaviour in the conversion.
+    if (!(interval_ns < 9.0e18)) return {};
+    return std::chrono::nanoseconds { static_cast<std::int64_t>(interval_ns) };
   }
 
   /**
@@ -96,12 +109,40 @@ namespace streaming {
 
   // fs-rfc8085-udp-20261112 section 3.1.6 recommends regulating UDP bursts. A slot is the
   // elapsed time at which packet_index may be submitted at rate_bps.
+  //
+  // The result is floor(packet_index * packet_bytes * 8e9 / rate_bps) in whole nanoseconds, computed in integers so
+  // the value is exact and the same on every compiler. It used to go through long double, which on x86 means x87:
+  // Clang switches the x87 rounding mode around every float-to-integer conversion, and that made this function
+  // 3x slower than under GCC. Every frame a stream sends (well under 2 GB on the wire) takes one 64-bit multiply and
+  // one 64-bit divide; a divide estimated through a double was slower than the divide itself on a 13th-generation Core
+  // under both compilers, and Clang's build of it was 40% slower than GCC's. Larger inputs use 128-bit integers where
+  // the compiler has them, and the result saturates at the largest nanosecond count instead of wrapping.
   inline std::chrono::nanoseconds
   video_packet_slot(std::size_t packet_index, std::size_t packet_bytes, std::uint64_t rate_bps) noexcept {
     if (rate_bps == 0 || packet_bytes == 0 || packet_index == 0) return {};
-    const auto bits = static_cast<long double>(packet_index) * static_cast<long double>(packet_bytes) * 8.0L;
-    const auto seconds = bits / static_cast<long double>(rate_bps);
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<long double> { seconds });
+    constexpr std::uint64_t ns_per_byte_second = 8ull * 1'000'000'000ull;
+    constexpr auto max_ns = static_cast<std::uint64_t>(INT64_MAX);
+#if defined(__SIZEOF_INT128__) && !defined(SUNSHINE_VIDEO_PACING_NO_INT128)
+    const auto bytes = static_cast<unsigned __int128>(packet_index) * packet_bytes;
+    if (bytes <= UINT64_MAX / ns_per_byte_second) {
+      return std::chrono::nanoseconds { static_cast<std::int64_t>(std::min(static_cast<std::uint64_t>(bytes) * ns_per_byte_second / rate_bps, max_ns)) };
+    }
+    // floor((q * rate + r) * k / rate) = q * k + floor(r * k / rate), with r < rate <= 2^64 so r * k fits in 128 bits.
+    const auto whole = bytes / rate_bps;
+    const auto rest = bytes % rate_bps;
+    if (whole > max_ns / ns_per_byte_second) return std::chrono::nanoseconds { INT64_MAX };
+    const auto ns = static_cast<std::uint64_t>(whole) * ns_per_byte_second + static_cast<std::uint64_t>(rest * ns_per_byte_second / rate_bps);
+    return std::chrono::nanoseconds { static_cast<std::int64_t>(std::min(ns, max_ns)) };
+#else
+    // No 128-bit integer (32-bit targets, MSVC). The 64-bit path is exact while the product below fits in 64 bits,
+    // which holds for every frame a stream sends; beyond it a double is accurate to far under a nanosecond per slot.
+    if (static_cast<std::uint64_t>(packet_index) <= UINT64_MAX / ns_per_byte_second / packet_bytes) {
+      const auto ns = static_cast<std::uint64_t>(packet_index) * packet_bytes * ns_per_byte_second / rate_bps;
+      return std::chrono::nanoseconds { static_cast<std::int64_t>(std::min(ns, max_ns)) };
+    }
+    const double ns = static_cast<double>(packet_index) * static_cast<double>(packet_bytes) * 8e9 / static_cast<double>(rate_bps);
+    return std::chrono::nanoseconds { ns >= 9.2e18 ? INT64_MAX : static_cast<std::int64_t>(ns) };
+#endif
   }
 
   /**

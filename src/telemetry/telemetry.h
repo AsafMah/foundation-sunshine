@@ -21,6 +21,10 @@
 #include <nlohmann/json.hpp>
 
 #include "events.h"
+#include <source_location>
+
+#include "error_report.h"
+#include "hooks.h"
 #include "stream_stats.h"
 
 namespace telemetry {
@@ -63,9 +67,17 @@ namespace telemetry {
   /** The events waiting in memory for the next batch, exactly as they would be sent (GET /api/telemetry/preview). */
   nlohmann::json preview();
   /** The Panel and the Web UI hand their events to the host (POST /api/telemetry/events): shaped against the page allow-list, consent applied, sent by this sender. -> events kept. */
-  std::size_t ingest(std::string_view product, std::string_view version, const nlohmann::json &events);
+  std::size_t ingest(std::string_view product, std::string_view version, const nlohmann::json &events, ingest_report_t *report = nullptr);
   /** One blocking POST to `endpoint() + path` (for /v1/crash). -> HTTP status, 0 when nothing answered. Never call from a streaming thread. */
   int post_to(std::string_view path, std::string_view content_type, const std::string &body);
+
+  // ---- errors and the user's last actions ----
+  /** Remember an action or a state change of the user (page, button or tile id, setting key and value class, stream start, device): a bounded ring that is attached to every error report. No free text. */
+  void
+  crumb(crumb_e kind, std::string_view id);
+  /** An error with its place (the caller's source location) and, when `with_stack`, the stack of the calling thread. Rate-limited per fingerprint; follows the error-reports choice. */
+  void
+  report_error(std::string_view code, std::string_view severity = "error", bool with_stack = false, const std::source_location &where = std::source_location::current());
 
   // ---- streams (called from the stream code) ----
   struct stream_info_t {
@@ -85,13 +97,28 @@ namespace telemetry {
     std::string app_cmd;
     bool sparxie_app = false;  ///< the apps.json entry has a sparxie block (sparxie_app_of_apps)
     std::string sparxie_game;  ///< its game as a catalogue id; empty for any other app
+    std::string encoder;  ///< the encoder family (nvenc, quicksync, amdvce, vaapi, videotoolbox, software); lower-case word
+    std::string capture_backend;  ///< the configured capture method (wgc, ddx, dxgi, ...), "auto" when none is configured
     bool altp = false;  ///< the session runs over ALTP (no such flag on this branch line yet: the stream code passes false)
   };
   void stream_started(const stream_info_t &info);
-  void stream_ended(std::uint32_t session_id, std::string_view stop_reason);
+  /** `clip_offer` and `clip_flow` are the clipboard words of the session (clipboard_bridge::offer_name and none | ok | dropped); empty leaves them out. */
+  void stream_ended(std::uint32_t session_id, std::string_view stop_reason, std::string_view clip_offer = {}, std::string_view clip_flow = {});
+  /** The host's encoder family now (video::active_encoder_name), asked for by the sender for a stream that began before the encoder was known. Set once after start(). */
+  void set_encoder_resolver(std::function<std::string()> resolver);
+  /** A stage of a stream start took `ms` (reported only when slow), a start failed at `stage` with a stable error code, a driver operation failed. All fixed words; no text. */
+  void stream_stage(std::string_view stage, std::int64_t ms);
+  void stream_failed(std::string_view stage, std::string_view code);
+  void driver_failed(std::string_view driver, std::string_view op, std::string_view code = {});
   void frame_encoded(std::uint32_t session_id) noexcept;
   void encode_ms(std::uint32_t session_id, double ms) noexcept;
   void capture_ms(std::uint32_t session_id, double ms) noexcept;
+  void
+  record_sample(std::uint32_t session_id, hooks::metric_e metric, double ms) noexcept;
+  void
+  record_count(std::uint32_t session_id, hooks::counter_e counter, std::uint64_t n) noexcept;
+  void
+  record_frame_done(std::uint32_t session_id, std::int64_t steady_ns) noexcept;
   /** What the host knows about the live sessions (loss, round trip, bitrate), read once per tick by the sender thread. */
   void set_session_probe(std::function<std::vector<session_probe_t>()> probe);
 

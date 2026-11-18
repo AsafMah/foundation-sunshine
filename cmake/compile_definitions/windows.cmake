@@ -19,9 +19,8 @@ endif()
 # gcc complains about misleading indentation in some mingw includes
 list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-misleading-indentation)
 
-# gcc15 complains about non-template type 'coroutine_handle' used as a template in Windows.Foundation.h
-# can remove after https://gcc.gnu.org/bugzilla/show_bug.cgi?id=120495 is available in mingw-w64
-list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-template-body)
+# gcc15 complains about non-template type 'coroutine_handle' used as a template in Windows.Foundation.h.
+# This is added only for GNU below because Clang diagnoses the option itself as unknown.
 
 # Template-heavy translation units (confighttp.cpp in particular) exceed the
 # 32767-section COFF limit. Without big-obj the assembler silently writes a
@@ -166,6 +165,7 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/system_load_win.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/misc.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/misc.cpp"
+        "${CMAKE_SOURCE_DIR}/src/telemetry/wer_event_win.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/gui_agent_supervisor.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/text_encoding.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/win_dark_mode.h"
@@ -276,6 +276,7 @@ list(PREPEND PLATFORM_LIBRARIES
         nlohmann_json::nlohmann_json
         ntdll
         ole32
+        wevtapi
         pdh
         PowrProf
         setupapi

@@ -7,6 +7,10 @@
 #include <filesystem>
 #include <string_view>
 
+#ifdef _WIN32
+  #include "token_user_session.h"
+#endif
+
 namespace confighttp::local_auth_token {
   // The token is deliberately a separate header from browser cookies.  It is
   // sent only by the local Panel process after it reads the ACL-protected file.
@@ -24,7 +28,7 @@ namespace confighttp::local_auth_token {
   bool
   write_restricted_file(const std::filesystem::path &path, std::string_view contents);
 
-  /** Refresh the Windows file ACL when the active console user changes. */
+  /** Refresh the Windows file ACL when the active user session changes. */
   void
   start_monitor();
 
@@ -35,4 +39,10 @@ namespace confighttp::local_auth_token {
   /** Compare an already parsed header with the current in-memory credential. */
   bool
   matches(std::string_view candidate);
+
+#ifdef _WIN32
+  /** Tests: replace the Windows session view the SYSTEM path checks upstream's choice against (nullopt: the real WTS). */
+  void
+  set_session_view_for_testing(std::optional<token_user_session::wts_view_t> view);
+#endif
 }  // namespace confighttp::local_auth_token

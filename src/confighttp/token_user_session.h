@@ -51,4 +51,16 @@ namespace confighttp::token_user_session {
     }
     return found;
   }
+
+  /**
+   * The session whose user may read the credential, given the session upstream's platf::retrieve_interactive_users_token chose
+   * (its token's TokenSessionId, nullopt when it returned none): only when that is also pick()'s single allowed session.
+   * Upstream takes the first active RDP session when several users are active; that is ambiguous here and grants nobody.
+   */
+  inline std::optional<std::uint32_t>
+  grant(const wts_view_t &wts, std::optional<std::uint32_t> upstream_session) {
+    const auto allowed = pick(wts);
+    if (!allowed || !upstream_session || *allowed != *upstream_session) return std::nullopt;
+    return allowed;
+  }
 }  // namespace confighttp::token_user_session

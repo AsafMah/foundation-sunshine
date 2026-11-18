@@ -13,7 +13,9 @@
 #include <wtsapi32.h>
 
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -21,12 +23,23 @@
 #include "src/streaming/restart_intent.h"
 #include "sunshinesvc_log.h"
 #include "src/crash/crash.h"
+#include "src/config_session_binding.h"
+#include "sunshinesvc_lifecycle.h"
+#include "sunshinesvc_log.h"
 #include "sunshinesvc_state.h"
 
 // PROC_THREAD_ATTRIBUTE_JOB_LIST is currently missing from MinGW headers
 #ifndef PROC_THREAD_ATTRIBUTE_JOB_LIST
   #define PROC_THREAD_ATTRIBUTE_JOB_LIST ProcThreadAttributeValue(13, FALSE, TRUE, FALSE)
 #endif
+
+constexpr DWORD invalid_session_id = 0xFFFFFFFF;
+constexpr ULONGLONG session_reselect_delay_ms = 1000;
+
+struct user_session_selection_t {
+  DWORD session_id = invalid_session_id;
+  bool query_failed = false;
+};
 
 SERVICE_STATUS_HANDLE service_status_handle;
 SERVICE_STATUS service_status;
@@ -42,10 +55,23 @@ HandlerEx(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, LPVOID lpConte
       return NO_ERROR;
 
     case SERVICE_CONTROL_SESSIONCHANGE:
-      // If a new session connects to the console, restart Sunshine
-      // to allow it to spawn inside the new console session.
-      if (dwEventType == WTS_CONSOLE_CONNECT) {
-        SetEvent(session_change_event);
+      // Re-evaluate the interactive user session whenever the console or an
+      // RDP session changes.  The physical console session is not necessarily
+      // the session containing the signed-in user (for example, RDP can be
+      // active while the console session is only Conn).
+      switch (dwEventType) {
+        case WTS_CONSOLE_CONNECT:
+        case WTS_CONSOLE_DISCONNECT:
+        case WTS_REMOTE_CONNECT:
+        case WTS_REMOTE_DISCONNECT:
+        case WTS_SESSION_LOGON:
+        case WTS_SESSION_LOGOFF:
+        case WTS_SESSION_LOCK:
+        case WTS_SESSION_UNLOCK:
+          SetEvent(session_change_event);
+          break;
+        default:
+          break;
       }
       return NO_ERROR;
 
@@ -93,7 +119,7 @@ CreateJobObjectForChildProcess() {
 }
 
 HANDLE
-DuplicateTokenForSession(DWORD console_session_id) {
+DuplicateTokenForSession(DWORD session_id) {
   HANDLE current_token;
   if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE, &current_token)) {
     return NULL;
@@ -109,12 +135,129 @@ DuplicateTokenForSession(DWORD console_session_id) {
   CloseHandle(current_token);
 
   // Change the duplicated token to the console session ID
-  if (!SetTokenInformation(new_token, TokenSessionId, &console_session_id, sizeof(console_session_id))) {
+  if (!SetTokenInformation(new_token, TokenSessionId, &session_id, sizeof(session_id))) {
     CloseHandle(new_token);
     return NULL;
   }
 
   return new_token;
+}
+
+user_session_selection_t
+FindActiveUserSessionId() {
+  const auto console_session_id = WTSGetActiveConsoleSessionId();
+
+  PWTS_SESSION_INFOW session_info = nullptr;
+  DWORD session_count = 0;
+  if (!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &session_info, &session_count)) {
+    return { invalid_session_id, true };
+  }
+
+  DWORD active_rdp_session_id = invalid_session_id;
+  DWORD active_user_session_id = invalid_session_id;
+  for (DWORD index = 0; index < session_count; ++index) {
+    const auto &session = session_info[index];
+    if (session.State != WTSActive) {
+      continue;
+    }
+
+    LPWSTR username = nullptr;
+    DWORD bytes_returned = 0;
+    const bool user_query_succeeded = WTSQuerySessionInformationW(
+      WTS_CURRENT_SERVER_HANDLE,
+      session.SessionId,
+      WTSUserName,
+      &username,
+      &bytes_returned);
+    const bool has_user = user_query_succeeded &&
+                          username != nullptr &&
+                          username[0] != L'\0';
+    if (username != nullptr) {
+      WTSFreeMemory(username);
+    }
+    if (!user_query_succeeded) {
+      WTSFreeMemory(session_info);
+      return { invalid_session_id, true };
+    }
+    if (!has_user) {
+      continue;
+    }
+
+    // If the physical console itself has an active user, keep preferring it.
+    if (session.SessionId == console_session_id) {
+      const auto selected_session_id = session.SessionId;
+      WTSFreeMemory(session_info);
+      return { selected_session_id, false };
+    }
+
+    LPWSTR protocol = nullptr;
+    bytes_returned = 0;
+    USHORT protocol_type = 0;
+    if (WTSQuerySessionInformationW(
+          WTS_CURRENT_SERVER_HANDLE,
+          session.SessionId,
+          WTSClientProtocolType,
+          &protocol,
+          &bytes_returned)) {
+      if (protocol != nullptr && bytes_returned >= sizeof(protocol_type)) {
+        protocol_type = *reinterpret_cast<USHORT *>(protocol);
+      }
+      if (protocol != nullptr) {
+        WTSFreeMemory(protocol);
+      }
+    }
+
+    if (protocol_type == 2 && active_rdp_session_id == invalid_session_id) {
+      active_rdp_session_id = session.SessionId;
+    }
+    if (active_user_session_id == invalid_session_id) {
+      active_user_session_id = session.SessionId;
+    }
+  }
+
+  WTSFreeMemory(session_info);
+  if (active_rdp_session_id != invalid_session_id) {
+    return { active_rdp_session_id, false };
+  }
+  return { active_user_session_id, false };
+}
+
+// Capture uses the console by default. `session_binding = 0` follows the
+// active interactive user instead; GUI selection is independent.
+std::wstring
+InstallDirectory();
+
+config_session_binding::mode_e
+session_binding_mode() {
+  const std::filesystem::path config_path = std::filesystem::path(InstallDirectory()) / L"config" / L"sunshine.conf";
+  std::ifstream conf_file(config_path);
+  if (!conf_file.is_open()) {
+    return config_session_binding::default_mode;
+  }
+  std::string line;
+  while (std::getline(conf_file, line)) {
+    const auto comment = line.find('#');
+    if (comment != std::string::npos) {
+      line.resize(comment);
+    }
+    const auto separator = line.find('=');
+    if (separator == std::string::npos) {
+      continue;
+    }
+    const auto trim = [](std::string &text) {
+      const auto not_space = [](unsigned char ch) { return std::isspace(ch) == 0; };
+      text.erase(text.begin(), std::find_if_not(text.begin(), text.end(), not_space));
+      text.erase(std::find_if_not(text.rbegin(), text.rend(), not_space).base(), text.end());
+    };
+    std::string key = line.substr(0, separator);
+    std::string value = line.substr(separator + 1);
+    trim(key);
+    trim(value);
+    if (key == config_session_binding::key) {
+      return config_session_binding::parse_or_default(value);
+    }
+  }
+  return config_session_binding::default_mode;
 }
 
 struct GuiAgentProcess {
@@ -446,23 +589,183 @@ OpenInstallCores(const std::wstring &core_path) {
   return found;
 }
 
-// Keep the first and end the others. A second Sunshine.exe is what leaves the health check
-// unable to finish: both hold sockets and the graphics driver.
+// Whether the named per-process event of a core exists and is signaled. A core of an older build, or one that has not
+// created it yet, has none.
+bool
+CoreEventSignaled(sunshinesvc::core_event_e kind, DWORD process_id) {
+  const auto event = OpenEventW(SYNCHRONIZE, FALSE, sunshinesvc::core_event_name(kind, process_id).c_str());
+  if (event == NULL) {
+    return false;
+  }
+  const auto signaled = WaitForSingleObject(event, 0) == WAIT_OBJECT_0;
+  CloseHandle(event);
+  return signaled;
+}
+
+std::string
+DescribeCore(const CoreProcess &core, const sunshinesvc::core_state_t &state) {
+  DWORD session = 0;
+  const auto session_text = ProcessIdToSessionId(core.process_id, &session) ? std::to_string(session) : std::string { "?" };
+  FILETIME created, exited, kernel, user;
+  std::string age = "?";
+  if (GetProcessTimes(core.handle, &created, &exited, &kernel, &user)) {
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    const auto to_u64 = [](const FILETIME &t) { return (static_cast<ULONGLONG>(t.dwHighDateTime) << 32) | t.dwLowDateTime; };
+    const auto elapsed = to_u64(now) > to_u64(created) ? to_u64(now) - to_u64(created) : 0;
+    age = std::to_string(elapsed / 10000000ull) + " s";
+  }
+  return "Sunshine.exe PID " + std::to_string(core.process_id) + " (session " + session_text + ", running " + age +
+         ", ready=" + (state.ready ? "yes" : "no") + ", stopping=" + (state.stopping ? "yes" : "no") + ")";
+}
+
+// Ask one process to close by posting WM_CLOSE to the top-level windows it owns. Unlike a console control event, this reaches that
+// process only: a core and a command-line Sunshine.exe may share one console, and the event would stop both.
+bool
+RequestCoreClose(DWORD pid) {
+  struct Search {
+    DWORD pid;
+    bool posted;
+  } search { pid, false };
+  EnumWindows(
+    [](HWND window, LPARAM parameter) -> BOOL {
+      auto *found = reinterpret_cast<Search *>(parameter);
+      DWORD owner = 0;
+      GetWindowThreadProcessId(window, &owner);
+      if (owner == found->pid && PostMessageW(window, WM_CLOSE, 0, 0)) {
+        found->posted = true;
+      }
+      return TRUE;
+    },
+    reinterpret_cast<LPARAM>(&search));
+  return search.posted;
+}
+
+// Decide which of the cores found for this install to supervise, and make the others leave. A core is kept only when it
+// has said it is ready and has not said it is stopping: one on its way out would exit a moment after it was adopted and
+// leave the service without a core (the adopted process that ends after a fixed wait and is then restarted). The others
+// are given a short, bounded time and then ended, so a fresh core never competes with them for the ports and the GPU.
+// Every handle in `cores` is closed, except the one returned.
+CoreProcess
+ResolveCores(std::vector<CoreProcess> &cores, DWORD expected_session_id, HANDLE log_file) {
+  std::vector<sunshinesvc::core_state_t> states;
+  for (const auto &core : cores) {
+    auto ready = CoreEventSignaled(sunshinesvc::core_event_e::ready, core.process_id);
+    const auto stopping = CoreEventSignaled(sunshinesvc::core_event_e::stopping, core.process_id);
+    if (ready) {
+      DWORD core_session_id = invalid_session_id;
+      if (!ProcessIdToSessionId(core.process_id, &core_session_id) ||
+          core_session_id != expected_session_id) {
+        ready = false;
+      }
+    }
+    states.push_back({ ready, stopping });
+  }
+  const auto plan = sunshinesvc::plan_cores(states);
+
+  CoreProcess kept;
+  for (std::size_t index = 0; index < cores.size(); ++index) {
+    auto &core = cores[index];
+    const auto description = DescribeCore(core, states[index]);
+    switch (plan.actions[index]) {
+      case sunshinesvc::core_action_e::keep:
+        kept = core;
+        core.handle = NULL;
+        continue;
+      case sunshinesvc::core_action_e::wait_for_exit: {
+        WriteServiceLog(log_file, description + " is shutting down; not adopting it, waiting for it to exit");
+        if (WaitForSingleObject(core.handle, sunshinesvc::core_stopping_wait_ms) != WAIT_OBJECT_0) {
+          TerminateProcess(core.handle, ERROR_PROCESS_ABORTED);
+          const auto ended = WaitForSingleObject(core.handle, sunshinesvc::core_end_wait_ms) == WAIT_OBJECT_0;
+          WriteServiceLog(log_file, description + (ended ? " did not finish its shutdown in time and was ended" : " did not exit within the wait after force termination"));
+        }
+        break;
+      }
+      case sunshinesvc::core_action_e::end: {
+        WriteServiceLog(log_file, description + " is not known to be healthy; not adopting it, ending it before starting a fresh core");
+        const auto asked = RequestCoreClose(core.process_id);
+        if (!asked || WaitForSingleObject(core.handle, sunshinesvc::core_end_wait_ms) != WAIT_OBJECT_0) {
+          TerminateProcess(core.handle, ERROR_PROCESS_ABORTED);
+          const auto ended = WaitForSingleObject(core.handle, sunshinesvc::core_end_wait_ms) == WAIT_OBJECT_0;
+          WriteServiceLog(log_file, description + (ended ? " was ended" : " did not exit within the wait after force termination"));
+        }
+        break;
+      }
+    }
+    CloseHandle(core.handle);
+    core.handle = NULL;
+  }
+  cores.clear();
+
+  // The others took time to leave: check the candidate again against what it says now, not against what it said at the start.
+  if (kept.handle != NULL) {
+    const bool alive = WaitForSingleObject(kept.handle, 0) == WAIT_TIMEOUT;
+    const bool ready = alive && CoreEventSignaled(sunshinesvc::core_event_e::ready, kept.process_id);
+    const bool stopping = alive && CoreEventSignaled(sunshinesvc::core_event_e::stopping, kept.process_id);
+    if (!alive || !ready || stopping) {
+      WriteServiceLog(log_file,
+        "Sunshine.exe PID " + std::to_string(kept.process_id) +
+          (alive ? " is no longer ready and running; not adopting it" : " has exited; not adopting it"));
+      if (alive && WaitForSingleObject(kept.handle, sunshinesvc::core_stopping_wait_ms) != WAIT_OBJECT_0) {
+        TerminateProcess(kept.handle, ERROR_PROCESS_ABORTED);
+        WaitForSingleObject(kept.handle, sunshinesvc::core_end_wait_ms);
+      }
+      CloseHandle(kept.handle);
+      kept = CoreProcess {};
+    }
+  }
+  if (kept.handle != NULL) {
+    WriteServiceLog(log_file, "Adopting Sunshine.exe PID " + std::to_string(kept.process_id) + ": it is ready and not shutting down");
+  }
+  return kept;
+}
+
+// The lifecycle facts of the core, for the host to report at its next start (tools/sunshinesvc_lifecycle.h). Writing them never changes what the service does.
+std::filesystem::path
+LifecycleFile() {
+  const auto install = InstallDirectory();
+  if (install.empty()) {
+    return {};
+  }
+  return std::filesystem::path(install) / L"config" / L"telemetry" / L"service_lifecycle.jsonl";
+}
+
 void
-EndExtraCores(std::vector<CoreProcess> &cores, HANDLE log_file) {
-  for (std::size_t index = 1; index < cores.size(); ++index) {
-    auto &extra = cores[index];
-    const auto ended = TerminateProcess(extra.handle, 1);
-    const auto waited = WaitForSingleObject(extra.handle, 5000);
-    WriteServiceLog(log_file,
-      "Ended extra Sunshine.exe PID " + std::to_string(extra.process_id) +
-        (ended && waited == WAIT_OBJECT_0 ? " before starting the core" : "; it did not exit within 5 s"));
-    CloseHandle(extra.handle);
-    extra.handle = NULL;
+NoteLifecycle(const std::string &line) {
+  const auto file = LifecycleFile();
+  if (!file.empty()) {
+    sunshinesvc::lifecycle::append(file, line);
   }
-  if (!cores.empty()) {
-    cores.resize(1);
+}
+
+ULONGLONG
+FileTimeToMs(const FILETIME &time) {
+  ULARGE_INTEGER value;
+  value.LowPart = time.dwLowDateTime;
+  value.HighPart = time.dwHighDateTime;
+  return value.QuadPart / 10000;
+}
+
+// How long the process has been running (its creation time to now) and how long it ran (creation to exit, for a process that ended).
+long long
+ProcessAgeMs(HANDLE process) {
+  FILETIME created, exited, kernel, user, now;
+  if (!GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+    return 0;
   }
+  GetSystemTimeAsFileTime(&now);
+  const auto start = FileTimeToMs(created), end = FileTimeToMs(now);
+  return end > start ? static_cast<long long>(end - start) : 0;
+}
+
+long long
+ProcessLifeMs(HANDLE process) {
+  FILETIME created, exited, kernel, user;
+  if (!GetProcessTimes(process, &created, &exited, &kernel, &user)) {
+    return -1;
+  }
+  const auto start = FileTimeToMs(created), end = FileTimeToMs(exited);
+  return end > start ? static_cast<long long>(end - start) : 0;
 }
 
 VOID WINAPI
@@ -533,9 +836,10 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
   service_status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PRESHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE;
   service_status.dwCurrentState = SERVICE_RUNNING;
   SetServiceStatus(service_status_handle, &service_status);
+  NoteLifecycle(sunshinesvc::lifecycle::svc_start_line(sunshinesvc::lifecycle::unix_ms()));
 
   GuiAgentProcess gui_agent;
-  DWORD gui_agent_session_id = 0xFFFFFFFF;
+  DWORD gui_agent_session_id = invalid_session_id;
   DWORD gui_agent_last_error = ERROR_SUCCESS;
   ULONGLONG gui_agent_retry_at_ms = 0;
   sunshinesvc::GuiRestartBackoff gui_agent_backoff;
@@ -543,6 +847,10 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
   sunshinesvc::GuiAgentCrashLogLimiter gui_agent_log_limiter;
 
   const auto acquire_gui_agent = [&]() {
+    if (gui_agent_session_id == invalid_session_id) {
+      gui_agent_retry_at_ms = GetTickCount64() + sunshinesvc::GUI_REATTACH_POLL_MS;
+      return;
+    }
     bool attached_to_existing = false;
     const auto error = AcquireGuiAgent(gui_agent_session_id, gui_agent, attached_to_existing);
     if (error == ERROR_SUCCESS) {
@@ -571,6 +879,10 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
   };
 
   const auto reattach_gui_agent = [&]() {
+    if (gui_agent_session_id == invalid_session_id) {
+      gui_agent_retry_at_ms = GetTickCount64() + sunshinesvc::GUI_REATTACH_POLL_MS;
+      return;
+    }
     std::wstring gui_directory;
     std::wstring gui_path;
     auto existing_process = FindExistingGuiAgent(gui_agent_session_id, gui_directory, gui_path);
@@ -684,33 +996,76 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
     }
   };
 
+  const auto select_gui_session = [&](DWORD next_session_id) {
+    if (gui_agent_session_id == next_session_id) {
+      return;
+    }
+    // Closing the supervision handle does not terminate an agent in the old
+    // session. It can be reattached if that user session becomes active again.
+    CloseGuiAgentHandle(gui_agent);
+    gui_agent_session_id = next_session_id;
+    gui_agent_last_error = ERROR_SUCCESS;
+    gui_agent_retry_at_ms = 0;
+    if (next_session_id == invalid_session_id) {
+      gui_agent_retry_at_ms = GetTickCount64() + sunshinesvc::GUI_REATTACH_POLL_MS;
+    }
+    gui_agent_backoff.reset();
+    gui_agent_restart_policy.resume_supervision();
+    gui_agent_log_limiter.reset();
+  };
+
   // Loop every 3 seconds until the stop event is set or Sunshine.exe is running. The first pass is at once: the loop used to wait 3 s before it tried at all, and
-  // every start of the service (every boot) lost them (service 12:53:00, Sunshine.exe 12:53:04). A console session that is not there yet is picked up at the next pass.
+  // every start of the service (every boot) lost them (service 12:53:00, Sunshine.exe 12:53:04). A user session that is not there yet is picked up at the next pass.
   DWORD loop_wait_ms = 0;
+  // why the next core is started: the first one is the boot; later ones follow an end of the core the service did not ask for, a change of the interactive user session, or a start that failed
+  const char *next_core_cause = "boot";
+  // repeated failures of the core's start are not retried at the pace of the pass interval (sunshinesvc_state.h)
+  sunshinesvc::CoreRestartBackoff core_restart_backoff;
+  // not before this tick (GetTickCount64): only the start of the core waits; the pass interval, the GUI agent's supervision and the stop event go on as before
+  ULONGLONG core_restart_not_before_tick = 0;
   while (WaitForSingleObject(stop_event, std::exchange(loop_wait_ms, 3000)) != WAIT_OBJECT_0) {
-    auto console_session_id = WTSGetActiveConsoleSessionId();
-    if (console_session_id == 0xFFFFFFFF) {
-      // No console session yet
+    const auto binding_mode = session_binding_mode();
+    const auto selection = FindActiveUserSessionId();
+    auto interactive_session_id = selection.session_id;
+    if (selection.query_failed) {
+      interactive_session_id = gui_agent_session_id;
+    }
+    const auto targets = config_session_binding::select_sessions(
+      binding_mode, WTSGetActiveConsoleSessionId(), interactive_session_id);
+    if (!selection.query_failed) {
+      select_gui_session(targets.gui);
+    }
+
+    // GUI availability does not depend on the capture core's session or on a
+    // successful core start. A token lookup failure is retried without reviving
+    // a GUI that the user deliberately quit.
+    if (gui_agent.handle != NULL && WaitForSingleObject(gui_agent.handle, 0) == WAIT_OBJECT_0) {
+      handle_gui_agent_exit();
+    }
+    if (gui_agent.handle == NULL && RetryWaitTimeout(gui_agent_retry_at_ms) == 0) {
+      if (gui_agent_restart_policy.launch_allowed()) {
+        acquire_gui_agent();
+      }
+      else {
+        reattach_gui_agent();
+      }
+    }
+
+    if ((selection.query_failed && binding_mode == config_session_binding::mode_e::automatic) ||
+        targets.capture == invalid_session_id) {
+      // No capture session yet, or automatic selection could not be queried.
       continue;
     }
+    const DWORD session_id = targets.capture;
 
-    if (gui_agent_session_id != console_session_id) {
-      CloseGuiAgentHandle(gui_agent);
-      gui_agent_session_id = console_session_id;
-      gui_agent_last_error = ERROR_SUCCESS;
-      gui_agent_retry_at_ms = 0;
-      gui_agent_backoff.reset();
-      gui_agent_restart_policy.resume_supervision();
-      gui_agent_log_limiter.reset();
-    }
-
-    auto console_token = DuplicateTokenForSession(console_session_id);
+    auto console_token = DuplicateTokenForSession(session_id);
     if (console_token == NULL) {
       continue;
     }
 
     // One core per install. A leftover from the previous run (the service child that did not
-    // exit, or a user-mode Sunshine.exe) is supervised instead of joined by a second process.
+    // exit, or a user-mode Sunshine.exe) is supervised instead of joined by a second process, when it
+    // is ready and not shutting down; otherwise it is ended and a fresh core is started.
     const auto core_path = InstallDirectory() + L"\\Sunshine.exe";
     auto cores = OpenInstallCores(core_path);
     HANDLE job_handle = NULL;
@@ -720,22 +1075,38 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
     sunshinesvc::service_control::generation_events control_events;
     sunshinesvc::service_control::process_attributes attributes;
     bool control_bridged = false;
-    if (sunshinesvc::core_start_decision(!cores.empty()) == sunshinesvc::core_start_e::adopt) {
-      if (cores.size() > 1) {
-        EndExtraCores(cores, log_file_handle);
+    bool core_adopted = false;
+    ULONGLONG adopted_at_tick = 0;
+    const auto found_cores = static_cast<int>(cores.size());
+    const auto adopted_core = ResolveCores(cores, session_id, log_file_handle);
+    if (sunshinesvc::core_start_decision(adopted_core.handle != NULL) == sunshinesvc::core_start_e::adopt) {
+      if (found_cores > 1) {
+        NoteLifecycle(sunshinesvc::lifecycle::extra_ended_line(sunshinesvc::lifecycle::unix_ms(), found_cores - 1));
       }
-      process_info.hProcess = cores[0].handle;
-      process_info.dwProcessId = cores[0].process_id;
+      process_info.hProcess = adopted_core.handle;
+      process_info.dwProcessId = adopted_core.process_id;
       process_info.hThread = NULL;
       WriteServiceLog(log_file_handle,
         "Sunshine.exe PID " + std::to_string(process_info.dwProcessId) +
           " is already running; supervising it instead of starting another (no restart-intent bridge)");
+      core_adopted = true;
+      adopted_at_tick = GetTickCount64();
+      NoteLifecycle(sunshinesvc::lifecycle::core_start_line(sunshinesvc::lifecycle::unix_ms(), true, process_info.dwProcessId, ProcessAgeMs(process_info.hProcess), next_core_cause));
     }
     else {
+      if (GetTickCount64() < core_restart_not_before_tick) {
+        // the core's start is held back after repeated failures (CoreRestartBackoff): the GUI agent is still looked after in this pass
+        CloseHandle(console_token);
+        if (gui_agent.handle != NULL && WaitForSingleObject(gui_agent.handle, 0) == WAIT_OBJECT_0) {
+          handle_gui_agent_exit();
+        }
+        continue;
+      }
       const auto bridge_error = control_events.create(stop_event);
       if (bridge_error != ERROR_SUCCESS) {
         WriteServiceLog(log_file_handle, "Core event bridge creation failed (Win32 error " + std::to_string(bridge_error) + ")");
         CloseHandle(console_token);
+        next_core_cause = "start_failed";
         continue;
       }
       const HANDLE inherited_handles[] = { log_file_handle, control_events.child_restart(), control_events.child_stop() };
@@ -745,6 +1116,7 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
       job_handle = CreateJobObjectForChildProcess();
       if (job_handle == NULL) {
         CloseHandle(console_token);
+        next_core_cause = "start_failed";
         continue;
       }
 
@@ -753,6 +1125,7 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
         WriteServiceLog(log_file_handle, "Core process attribute setup failed (Win32 error " + std::to_string(attribute_error) + ")");
         CloseHandle(job_handle);
         CloseHandle(console_token);
+        next_core_cause = "start_failed";
         continue;
       }
 
@@ -770,9 +1143,11 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
             &process_info)) {
         CloseHandle(console_token);
         CloseHandle(job_handle);
+        next_core_cause = "start_failed";
         continue;
       }
       control_bridged = true;
+      NoteLifecycle(sunshinesvc::lifecycle::core_start_line(sunshinesvc::lifecycle::unix_ms(), false, process_info.dwProcessId, 0, next_core_cause));
     }
 
     // The GUI may have exited after the previous Core stopped, while no inner
@@ -793,13 +1168,30 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
     }
 
     bool still_running;
+    // whether the service itself asked the core to end (service stop, change of the console session), and whether it was the session change
+    bool exit_requested = false;
+    bool exit_for_session_change = false;
+    bool session_reselect_pending = selection.query_failed;
+    ULONGLONG session_reselect_at_ms = 0;
+    if (selection.query_failed) {
+      session_reselect_at_ms = GetTickCount64() + session_reselect_delay_ms;
+    }
     do {
       // Wait on the exact GUI process while it is managed. After a clean exit,
       // only a low-frequency lookup runs so externally launched replacements
       // can be reattached without allowing the service to revive the GUI.
       const HANDLE wait_objects[] = { stop_event, process_info.hProcess, session_change_event, gui_agent.handle };
       const DWORD wait_object_count = gui_agent.handle == NULL ? 3 : 4;
-      const DWORD wait_timeout = gui_agent.handle == NULL ? RetryWaitTimeout(gui_agent_retry_at_ms) : INFINITE;
+      DWORD wait_timeout = INFINITE;
+      if (gui_agent.handle == NULL) {
+        wait_timeout = RetryWaitTimeout(gui_agent_retry_at_ms);
+      }
+      if (session_reselect_pending) {
+        const auto reselect_timeout = RetryWaitTimeout(session_reselect_at_ms);
+        if (wait_timeout == INFINITE || reselect_timeout < wait_timeout) {
+          wait_timeout = reselect_timeout;
+        }
+      }
       const auto wait_result = WaitForMultipleObjects(wait_object_count, wait_objects, FALSE, wait_timeout);
       switch (wait_result) {
         case WAIT_TIMEOUT:
@@ -811,6 +1203,22 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
             still_running = true;
             break;
           }
+          if (session_reselect_pending && RetryWaitTimeout(session_reselect_at_ms) == 0) {
+            session_reselect_pending = false;
+            SetEvent(session_change_event);
+            still_running = true;
+            break;
+          }
+          if (gui_agent_session_id == invalid_session_id) {
+            const auto gui_selection = FindActiveUserSessionId();
+            if (!gui_selection.query_failed && gui_selection.session_id != invalid_session_id) {
+              // Re-evaluate both targets: automatic capture may also need to
+              // move when a user becomes active without a delivered event.
+              SetEvent(session_change_event);
+              still_running = true;
+              break;
+            }
+          }
           if (gui_agent_restart_policy.launch_allowed()) {
             acquire_gui_agent();
           }
@@ -821,26 +1229,34 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
           break;
 
         case WAIT_OBJECT_0 + 2: {
-          namespace ri = streaming::restart_intent;
-          auto action = ri::classify_console_change(console_session_id, WTSGetActiveConsoleSessionId(),
-            WaitForSingleObject(stop_event, 0) == WAIT_OBJECT_0);
-          while (action == ri::console_action::requery) {
-            const bool stopping = WaitForSingleObject(stop_event, 100) == WAIT_OBJECT_0;
-            if (WaitForSingleObject(process_info.hProcess, 0) == WAIT_OBJECT_0) {
-              break;
-            }
-            action = ri::classify_console_change(console_session_id, WTSGetActiveConsoleSessionId(), stopping);
+          const auto next_user = FindActiveUserSessionId();
+          const auto update = config_session_binding::update_sessions(
+            binding_mode, session_id, gui_agent_session_id, WTSGetActiveConsoleSessionId(),
+            next_user.session_id, next_user.query_failed);
+          if (update.update_gui) {
+            select_gui_session(update.targets.gui);
           }
-          if (WaitForSingleObject(process_info.hProcess, 0) == WAIT_OBJECT_0) {
-            still_running = false;
-            break;
+          if (update.retry) {
+            session_reselect_pending = true;
+            session_reselect_at_ms = GetTickCount64() + session_reselect_delay_ms;
           }
-          if (action == ri::console_action::keep) {
-            // The active console session didn't actually change. Let Sunshine keep running.
+          else {
+            session_reselect_pending = false;
+          }
+          if (!update.restart_capture) {
+            // GUI-only changes and transient lookup failures must not
+            // interrupt capture. A failed lookup is retried above.
             still_running = true;
             continue;
           }
-          if (action == ri::console_action::migrate && control_bridged) {
+          if (WaitForSingleObject(process_info.hProcess, 0) == WAIT_OBJECT_0) {
+            // The core already ended: the outer loop starts it in the new session.
+            still_running = false;
+            break;
+          }
+          // The capture session moves: a core this generation started is asked to restart through its restart-intent bridge (the
+          // client keeps its stream: restart_intent); an adopted core is ended and started again.
+          if (control_bridged) {
             WriteServiceLog(log_file_handle, "Core console-session migration requested");
             const auto outcome = sunshinesvc::service_control::finish_migration(
               [&] {
@@ -868,12 +1284,16 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
             if (outcome == sunshinesvc::service_control::migration_exit::incomplete) {
               WriteServiceLog(log_file_handle, "Core did not exit after forced migration termination");
             }
+            exit_for_session_change = true;
             still_running = false;
             break;
           }
+          // Fall-through to terminate Sunshine.exe and start it again.
+          exit_for_session_change = true;
           [[fallthrough]];
         }
         case WAIT_OBJECT_0:
+          exit_requested = true;
           // The service is shutting down, so try to gracefully terminate Sunshine.exe.
           // If it doesn't terminate in 20 seconds, we will forcefully terminate it.
           if (!RunTerminationHelper(console_token, process_info.dwProcessId) ||
@@ -915,6 +1335,32 @@ ServiceMain(DWORD dwArgc, LPTSTR *lpszArgv) {
           break;
       }
     } while (still_running);
+
+    // what the end of this core looked like: with the exit code, how long it had run, how long since the service took it over, and whether the service asked for it
+    {
+      DWORD ended_with = 0;
+      if (WaitForSingleObject(process_info.hProcess, 0) == WAIT_OBJECT_0 && GetExitCodeProcess(process_info.hProcess, &ended_with)) {
+        const auto exit_ms = sunshinesvc::lifecycle::unix_ms();
+        // a restart the core asked for itself (Panel, a saved setting) leaves a marker and exits with code 0; it is not an exit nobody asked for
+        bool core_restart = false;
+        std::string restart_word;
+        if (const auto file = LifecycleFile(); !file.empty()) {
+          core_restart = sunshinesvc::lifecycle::take_restart_request(file.parent_path(), exit_ms, process_info.dwProcessId, sunshinesvc::lifecycle::process_start_unix_ms(process_info.hProcess), &restart_word) && !exit_requested && ended_with == 0;
+        }
+        NoteLifecycle(sunshinesvc::lifecycle::core_exit_line(exit_ms, ended_with, ProcessLifeMs(process_info.hProcess),
+          core_adopted ? static_cast<long long>(GetTickCount64() - adopted_at_tick) : -1,
+          exit_requested || ended_with == ERROR_SHUTDOWN_IN_PROGRESS, core_restart, core_restart ? restart_word : std::string {}));  // ERROR_SHUTDOWN_IN_PROGRESS: the core asked the service to stop (quit from the tray, the Panel)
+        const bool asked_for_exit = exit_requested || exit_for_session_change || ended_with == ERROR_SHUTDOWN_IN_PROGRESS || core_restart;
+        const auto restart_wait = sunshinesvc::core_restart_wait(core_restart_backoff, static_cast<std::uint64_t>(ProcessLifeMs(process_info.hProcess)), asked_for_exit, GetTickCount64());
+        // the deadline moves for every end of a core, a zero wait included: the deadline of earlier failures never holds back the start that follows an adopted or asked-for end
+        core_restart_not_before_tick = restart_wait.not_before_tick;
+        if (restart_wait.delay_ms > 0) {
+          WriteServiceLog(log_file_handle,
+            "Sunshine.exe ended with code " + std::to_string(ended_with) + " shortly after it started; starting it again in " + std::to_string(restart_wait.delay_ms) + " ms");
+        }
+      }
+      next_core_cause = exit_for_session_change ? "session_change" : "core_exit";
+    }
 
     if (process_info.hThread != NULL) {
       CloseHandle(process_info.hThread);
@@ -980,9 +1426,9 @@ main(int argc, char *argv[]) {
   // A crash of the service wrapper itself leaves a report next to the host's own (the host uploads it; this process has no uploader)
   {
     crash::options_t crash_options;
-  #ifdef SUNSHINESVC_VERSION
+#ifdef SUNSHINESVC_VERSION
     crash_options.version = SUNSHINESVC_VERSION;
-  #endif
+#endif
     crash_options.os_version = "Windows";
     crash_options.config_dir = std::filesystem::path(module_path) / L"config";
     crash::install(crash_options);

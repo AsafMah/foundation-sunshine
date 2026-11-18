@@ -3,6 +3,7 @@
  * @brief Miscellaneous definitions for Windows.
  */
 #include <csignal>
+#include <cstdint>
 #include <filesystem>
 #include <iomanip>
 #include <limits>
@@ -43,12 +44,15 @@
 
 #include "misc.h"
 
+#include "src/config.h"
 #include "src/entry_handler.h"
 #include "src/globals.h"
 #include "src/logging.h"
 #include "src/platform/common.h"
 #include "src/platform/run_command.h"
+#include "src/restart_reason.h"
 #include "src/utility.h"
+#include "tools/sunshinesvc_lifecycle.h"
 #include <iterator>
 
 #include "nvprefs/nvprefs_interface.h"
@@ -78,6 +82,20 @@ NtSetTimerResolution(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG Curr
 namespace {
 
   std::atomic<bool> used_nt_set_timer_resolution = false;
+  std::atomic<std::int64_t> last_no_active_user_session_log_ms { 0 };
+  constexpr std::int64_t no_active_user_session_log_interval_ms = 30'000;
+
+  void
+  log_no_active_user_session() {
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+    auto last_log_ms = last_no_active_user_session_log_ms.load(std::memory_order_relaxed);
+    if ((last_log_ms == 0 || now_ms - last_log_ms >= no_active_user_session_log_interval_ms) &&
+        last_no_active_user_session_log_ms.compare_exchange_strong(last_log_ms, now_ms)) {
+      BOOST_LOG(debug) << "There isn't an active user session, therefore it is not possible to execute commands under the user's profile.";
+    }
+  }
 
   bool
   nt_set_timer_resolution_max() {
@@ -263,27 +281,132 @@ namespace platf {
   }
 
   /**
-   * @brief Obtain the current sessions user's primary token with elevated privileges.
-   * @return The user's token. If user has admin capability it will be elevated, otherwise it will be a limited token. On error, `nullptr`.
+   * @brief Find the interactive session of the signed-in user.
+   * @return The session ID, or `0xFFFFFFFF` when no active user session exists.
+   * The physical console is preferred while it has a signed-in user; when it
+   * does not (for example while the user works over RDP), the first active RDP
+   * session and then any active session with a user is used, mirroring the
+   * session choice of the sunshinesvc launcher.
    */
-  HANDLE
-  retrieve_users_token(bool elevated) {
-    DWORD consoleSessionId;
+  struct user_session_selection_t {
+    DWORD session_id;
+    bool query_failed;
+  };
+
+  user_session_selection_t
+  find_active_user_session_id() {
+    constexpr DWORD invalid_session_id = 0xFFFFFFFF;
+    const auto console_session_id = WTSGetActiveConsoleSessionId();
+
+    PWTS_SESSION_INFOW session_info = nullptr;
+    DWORD session_count = 0;
+    if (!WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &session_info, &session_count)) {
+      return { invalid_session_id, true };
+    }
+
+    DWORD active_rdp_session_id = invalid_session_id;
+    DWORD active_user_session_id = invalid_session_id;
+    for (DWORD index = 0; index < session_count; ++index) {
+      const auto &session = session_info[index];
+      if (session.State != WTSActive) {
+        continue;
+      }
+
+      LPWSTR username = nullptr;
+      DWORD bytes_returned = 0;
+      const bool user_query_succeeded = WTSQuerySessionInformationW(
+        WTS_CURRENT_SERVER_HANDLE,
+        session.SessionId,
+        WTSUserName,
+        &username,
+        &bytes_returned);
+      const bool has_user = user_query_succeeded &&
+                            username != nullptr &&
+                            username[0] != L'\0';
+      if (username != nullptr) {
+        WTSFreeMemory(username);
+      }
+      if (!user_query_succeeded) {
+        WTSFreeMemory(session_info);
+        return { invalid_session_id, true };
+      }
+      if (!has_user) {
+        continue;
+      }
+
+      // If the physical console itself has an active user, keep preferring it.
+      if (session.SessionId == console_session_id) {
+        const auto selected_session_id = session.SessionId;
+        WTSFreeMemory(session_info);
+        return { selected_session_id, false };
+      }
+
+      LPWSTR protocol = nullptr;
+      bytes_returned = 0;
+      USHORT protocol_type = 0;
+      if (WTSQuerySessionInformationW(
+            WTS_CURRENT_SERVER_HANDLE,
+            session.SessionId,
+            WTSClientProtocolType,
+            &protocol,
+            &bytes_returned)) {
+        if (protocol != nullptr && bytes_returned >= sizeof(protocol_type)) {
+          protocol_type = *reinterpret_cast<USHORT *>(protocol);
+        }
+        if (protocol != nullptr) {
+          WTSFreeMemory(protocol);
+        }
+      }
+
+      if (protocol_type == 2 && active_rdp_session_id == invalid_session_id) {
+        active_rdp_session_id = session.SessionId;
+      }
+      if (active_user_session_id == invalid_session_id) {
+        active_user_session_id = session.SessionId;
+      }
+    }
+
+    WTSFreeMemory(session_info);
+    if (active_rdp_session_id != invalid_session_id) {
+      return { active_rdp_session_id, false };
+    }
+    return { active_user_session_id, false };
+  }
+
+  static HANDLE
+  retrieve_user_token(bool elevated, config_session_binding::user_token_purpose_e purpose) {
+    constexpr DWORD invalid_session_id = 0xFFFFFFFF;
     HANDLE userToken;
     TOKEN_ELEVATION_TYPE elevationType;
     DWORD dwSize;
 
-    // Get the session ID of the active console session
-    consoleSessionId = WTSGetActiveConsoleSessionId();
-    if (0xFFFFFFFF == consoleSessionId) {
-      // If there is no active console session, log a warning and return null
-      BOOST_LOG(warning) << "There isn't an active user session, therefore it is not possible to execute commands under the users profile.";
+    // The capture policy applies to launched applications. The GUI credential
+    // instead follows the active interactive user, even when Core is in the
+    // physical console session.
+    DWORD session_id = invalid_session_id;
+    if (purpose == config_session_binding::user_token_purpose_e::capture &&
+        config::sunshine.session_binding == config_session_binding::mode_e::console) {
+      session_id = config_session_binding::user_token_session(purpose, config::sunshine.session_binding,
+        WTSGetActiveConsoleSessionId(), invalid_session_id);
+    }
+    else {
+      const auto selection = find_active_user_session_id();
+      if (selection.query_failed) {
+        return nullptr;
+      }
+      session_id = config_session_binding::user_token_session(purpose, config::sunshine.session_binding,
+        WTSGetActiveConsoleSessionId(), selection.session_id);
+    }
+    if (invalid_session_id == session_id) {
+      // No active user session is expected while Windows is at the sign-in
+      // screen. Keep the diagnostic useful without logging every retry.
+      log_no_active_user_session();
       return nullptr;
     }
 
-    // Get the user token for the active console session
-    if (!WTSQueryUserToken(consoleSessionId, &userToken)) {
-      BOOST_LOG(debug) << "QueryUserToken failed, this would prevent commands from launching under the users profile.";
+    // Get the user token for the active user session
+    if (!WTSQueryUserToken(session_id, &userToken)) {
+      BOOST_LOG(debug) << "QueryUserToken failed for session " << session_id << ", this would prevent commands from launching under the users profile.";
       return nullptr;
     }
 
@@ -326,6 +449,16 @@ namespace platf {
 
     // We don't need to do anything for TokenElevationTypeFull users here, because they're already elevated.
     return userToken;
+  }
+
+  HANDLE
+  retrieve_users_token(bool elevated) {
+    return retrieve_user_token(elevated, config_session_binding::user_token_purpose_e::capture);
+  }
+
+  HANDLE
+  retrieve_interactive_users_token(bool elevated) {
+    return retrieve_user_token(elevated, config_session_binding::user_token_purpose_e::gui);
   }
 
   bool
@@ -519,23 +652,23 @@ namespace platf {
 
     size += 1 /* L'\0' */;
 
-    wchar_t env_block[size];
+    std::vector<wchar_t> env_block(size);
     int offset = 0;
     for (const auto &entry : env) {
       auto name = entry.get_name();
       auto value = entry.to_string();
 
       // Construct the NAME=VAL\0 string
-      append_string_to_environment_block(env_block, offset, from_utf8(name));
+      append_string_to_environment_block(env_block.data(), offset, from_utf8(name));
       env_block[offset++] = L'=';
-      append_string_to_environment_block(env_block, offset, from_utf8(value));
+      append_string_to_environment_block(env_block.data(), offset, from_utf8(value));
       env_block[offset++] = L'\0';
     }
 
     // Append a final null terminator
     env_block[offset++] = L'\0';
 
-    return std::wstring(env_block, offset);
+    return std::wstring(env_block.data(), offset);
   }
 
   LPPROC_THREAD_ATTRIBUTE_LIST
@@ -1692,7 +1825,13 @@ namespace platf {
   }
 
   void
-  restart() {
+  restart(std::string_view reason) {
+    // Under the service the core exits with code 0 and the service starts it again: leave a note so the service knows the exit was asked for (it reports restarts that nobody asked for).
+    // The note names this process (id and start time), so only the exit of this very core takes it.
+    {
+      const std::string word { restart_reason::normalize(reason) };
+      sunshinesvc::lifecycle::note_restart_request(appdata() / "telemetry", sunshinesvc::lifecycle::unix_ms(), word.c_str(), GetCurrentProcessId(), sunshinesvc::lifecycle::process_start_unix_ms(GetCurrentProcess()));
+    }
     // If we're running standalone, we have to respawn ourselves via CreateProcess().
     // If we're running from the service, we should just exit and let it respawn us.
     if (GetConsoleWindow() != NULL) {
@@ -1973,7 +2112,9 @@ namespace platf {
 
     auto const max_bufs_per_msg = send_info.payload_buffers.size() + (send_info.headers ? 1 : 0);
 
-    WSABUF bufs[(send_info.headers ? send_info.block_count : 1) * max_bufs_per_msg];
+    // One buffer list per sending thread, reused by every batch: no allocation per send once it has grown.
+    static thread_local std::vector<WSABUF> bufs;
+    bufs.resize((send_info.headers ? send_info.block_count : 1) * max_bufs_per_msg);
     DWORD bufcount = 0;
     if (send_info.headers) {
       // Interleave buffers for headers and payloads
@@ -2000,7 +2141,7 @@ namespace platf {
       }
     }
 
-    msg.lpBuffers = bufs;
+    msg.lpBuffers = bufs.data();
     msg.dwBufferCount = bufcount;
     msg.dwFlags = 0;
 
@@ -2485,7 +2626,7 @@ namespace platf {
   query_session_locked() {
     PWSTR buffer = nullptr;
     DWORD size = 0;
-    if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTSGetActiveConsoleSessionId(),
+    if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION,
           WTSSessionInfoEx, &buffer, &size)) {
       return std::nullopt;
     }

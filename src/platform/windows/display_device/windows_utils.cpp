@@ -248,7 +248,7 @@ namespace display_device::w_utils {
         // ERROR_FILE_NOT_FOUND (2) is expected for some displays (virtual, RDP, etc.)
         // Code has fallback mechanism, so this is not a critical error
         if (status == ERROR_FILE_NOT_FOUND) {
-          BOOST_LOG(debug) << get_error_string(status) << " \"RegQueryValueExW\" failed when getting size (EDID not found, using fallback).";
+          BOOST_LOG(verbose) << get_error_string(status) << " \"RegQueryValueExW\" failed when getting size (EDID not found, using fallback).";
         }
         else {
           BOOST_LOG(warning) << get_error_string(status) << " \"RegQueryValueExW\" failed when getting size.";
@@ -260,12 +260,9 @@ namespace display_device::w_utils {
 
       status = RegQueryValueExW(reg_key, L"EDID", nullptr, nullptr, edid.data(), &required_size_in_bytes);
       if (status != ERROR_SUCCESS) {
-        // ERROR_FILE_NOT_FOUND (2) is expected for some displays (virtual, RDP, etc.)
-        // Code has fallback mechanism, so this is not a critical error
-        if (status == ERROR_FILE_NOT_FOUND) {
-          BOOST_LOG(debug) << get_error_string(status) << " \"RegQueryValueExW\" failed when getting size (EDID not found, using fallback).";
-        }
-        else {
+        // ERROR_FILE_NOT_FOUND is expected for some displays (virtual, RDP,
+        // etc.). The caller uses the device path fallback in that case.
+        if (status != ERROR_FILE_NOT_FOUND) {
           BOOST_LOG(warning) << get_error_string(status) << " \"RegQueryValueExW\" failed when getting size.";
         }
         return false;
@@ -416,6 +413,8 @@ namespace display_device::w_utils {
           break;
         }
 
+        // friendlyNameFromEdid describes the name source, not EDID availability.
+        // Keep the registry lookup and device-path fallback so saved IDs remain valid.
         if (!get_device_edid(dev_info_handle, dev_info_data, device_id_data)) {
           // Error already logged
           break;
@@ -1029,51 +1028,23 @@ namespace display_device::w_utils {
     SetupDiDestroyDeviceInfoList(deviceInfoSet);
     return true;
   }
-  
-  // 检测RDP会话
-  bool is_any_rdp_session_active() {
-    PWTS_SESSION_INFO pSessionInfo = nullptr;
-    DWORD sessionCount = 0;
 
-    if (!WTSEnumerateSessions(WTS_CURRENT_SERVER_HANDLE, 0, 1, &pSessionInfo, &sessionCount)) {
-      BOOST_LOG(warning) << "[Check_RDP_Session] WTSEnumerateSessions failed: " << GetLastError();
-      return false; // 异常默认返回false
+  bool
+  is_current_session_rdp() {
+    LPWSTR buffer = nullptr;
+    DWORD bytes_returned = 0;
+    if (!WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION,
+          WTSClientProtocolType, &buffer, &bytes_returned)) {
+      BOOST_LOG(warning) << "[Check_RDP_Session] Could not query the capture session: " << GetLastError();
+      return false;
     }
-    
-    BOOST_LOG(debug) << "[Check_RDP_Session] Checking " << sessionCount << " sessions";
-    
-    // 遍历所有会话，检测是否有rdp会话
-    for (DWORD i = 0; i < sessionCount; ++i) {
-      WTS_SESSION_INFO si = pSessionInfo[i];
 
-      if (si.State != WTSActive){
-        continue;
-      }
-
-      LPTSTR buffer = nullptr;
-      DWORD bytesReturned = 0;
-
-      if (WTSQuerySessionInformation(WTS_CURRENT_SERVER_HANDLE, si.SessionId, WTSClientProtocolType, &buffer, &bytesReturned)) {
-        USHORT protocolType = *(USHORT*)buffer;
-        WTSFreeMemory(buffer);
-        
-        BOOST_LOG(debug) << "[Check_RDP_Session] Session " << si.SessionId 
-                         << " - State: " << si.State 
-                         << ", Protocol: " << protocolType 
-                         << " (Console=0, RDP=2)";
-        
-        if (protocolType == 2) { // RDP 协议
-          BOOST_LOG(info) << "[Check_RDP_Session] Active RDP session detected, session ID = " << si.SessionId;
-          WTSFreeMemory(pSessionInfo);
-          return true;
-        }
-      } else {
-        BOOST_LOG(warning) << "[Check_RDP_Session] WTSQuerySessionInformation failed for session " << si.SessionId << ", error = " << GetLastError();
-      }
+    const bool is_rdp = buffer != nullptr && bytes_returned >= sizeof(USHORT) &&
+                        *reinterpret_cast<const USHORT *>(buffer) == 2;
+    if (buffer != nullptr) {
+      WTSFreeMemory(buffer);
     }
-    WTSFreeMemory(pSessionInfo);
-    BOOST_LOG(debug) << "[Check_RDP_Session] No active RDP session found.";
-    return false;
+    return is_rdp;
   }
 
   bool

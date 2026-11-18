@@ -3,12 +3,16 @@
  * @brief Telemetry v1 event shapes, scrubbing and the batch envelope.
  */
 #include "events.h"
+#include "error_report.h"
+#include "stream_health.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cctype>
 #include <functional>
+#include <map>
+#include <set>
 #include <regex>
 
 using json = nlohmann::json;
@@ -42,6 +46,37 @@ namespace telemetry {
     return kind == kind_e::error ? consent_e::error_reports : consent_e::usage_statistics;
   }
 
+  int
+  event_priority(const event_t &e) {
+    if (e.priority >= 0 && e.priority <= 2) return e.priority;
+    const auto severe = [&] { return e.props.is_object() && e.props.value("severe", false); };
+    if (e.name == "user_report" || e.name == "stream_health") return 0;
+    if (e.name == "error_report") return 0;  // the first report of an error; the aggregates of known errors are marked 1 by the sender
+    if (e.name == "stream_anomaly") return severe() ? 0 : 1;
+    if (e.name == "stream_regress" || e.name == "log_summary") return 1;
+    // installs and updates: a failed step, and a run that failed or never finished, are never sampled away; the successes are the denominator of a failure rate
+    if (e.name == "install_result" || e.name == "update_result") return e.props.is_object() && e.props.value("result", "") == "failed" ? 0 : 1;
+    if (e.name == "install_summary") {
+      const auto result = e.props.is_object() ? e.props.value("result", "") : std::string {};
+      return result == "failed" || result == "incomplete" ? 0 : 1;
+    }
+    if (e.name == "device_facts") return 1;
+    // a start that failed, a driver that failed and a run that ended badly are what the developers look for: never sampled away. A slow stage and the clipboard record are comparisons: priority 1
+    if (e.name == "stream_failed" || e.name == "driver_event" || e.name == "session_abnormal") return 0;
+    if (e.name == "stream_stage" || e.name == "clipboard_health") return 1;
+    // the service and start-up facts: an anomaly that repeats (or follows an adoption) is never sampled away, the counts and the timings are priority 1
+    if (e.name == "host_anomaly") return severe() ? 0 : 1;
+    if (e.name == "svc_lifecycle" || e.name == "startup_timing") return 1;
+    if (e.name == "error") return e.props.is_object() && e.props.value("severity", "") == "fatal" ? 0 : 1;
+    return 2;
+  }
+
+  bool
+  stage_is_slow(std::string_view stage, std::int64_t ms) {
+    const std::int64_t bound = stage == "app_launch"sv || stage == "first_frame"sv ? 5000 : 3000;
+    return ms > bound;
+  }
+
   bool
   known_product(std::string_view product) {
     return product == "host"sv || product == "panel"sv || product == "web"sv || product == "sparxie-launch"sv;
@@ -52,8 +87,11 @@ namespace telemetry {
     if (product != "panel"sv && product != "web"sv && product != "sparxie-launch"sv) return false;
     if (kind == kind_e::usage) return name == "app_start"sv || name == "app_exit"sv || name == "feature_used"sv || name == "setting_changed"sv;
     // "user_report" is a report the person wrote in the error dialog; it is kind error and follows the error-report choice like every error event
-    if (kind == kind_e::error) return name == "error"sv || name == "user_report"sv;
-    return name == "panel_page"sv || name == "startup"sv;
+    // the result of an update step is the page's to report (it runs the update sheet); install results and device facts are the host's own, read from the installer's journal and the system inventory
+    if (kind == kind_e::error) return name == "error"sv || name == "user_report"sv || name == "error_report"sv || name == "update_result"sv;
+    // the sketches of a page (page_vitals) and the latency of its calls to the host (api_latency)
+    // page_ready: the page says when it was ready; the host judges it (service_lifecycle.h) and does not pass the raw event on
+    return name == "panel_page"sv || name == "startup"sv || name == "page_vitals"sv || name == "api_latency"sv || name == "page_ready"sv || (product == "panel"sv && name == "clipboard_health"sv);
   }
 
   // ---------------------------------------------------------------------------------------------------------------------
@@ -129,11 +167,19 @@ namespace telemetry {
 
     bool
     valid_ipv6(const std::string &s) {
-      // eight groups, or a compressed form with one "::"; only hex groups of at most four digits; at least one decimal digit (so std::vector style text is not an address)
+      // eight groups, or a compressed form with one "::"; only hex groups of at most four digits. To tell an address from text such as `ab::cd` it needs a decimal digit (fe80::1) or a group of
+      // at least three hex digits (fdab::cafe): a short word between colons is not an address, a long one is
       if (s.find(":::") != std::string::npos) return false;
       bool digit = false;
       for (char c : s) digit = digit || (c >= '0' && c <= '9');
-      if (!digit) return false;
+      if (!digit) {
+        std::size_t longest = 0, run = 0;
+        for (char c : s) {
+          run = c == ':' ? 0 : run + 1;
+          longest = std::max(longest, run);
+        }
+        if (longest < 3) return false;
+      }
       const auto dbl = s.find("::");
       if (dbl != std::string::npos && s.find("::", dbl + 1) != std::string::npos) return false;
       std::size_t groups = 0, start = 0;
@@ -220,19 +266,72 @@ namespace telemetry {
 
   std::string
   scrub_log_message(std::string_view input, std::size_t max) {
-    // A log line names things the person chose (a device, an application, a game) between quotes or brackets: what stands between them is not part of the message.
-    std::string text { input.substr(0, max * 4) };
-    // a double-quoted, bracketed or braced span; a single-quoted one only when the quote opens a word (not an apostrophe: "Couldn't")
-    static const std::regex quoted(R"(("[^"]*")|(\[[^\]]*\])|(\{[^}]*\})|((^|[\s(=:,])'[^\n]*?'(?=$|[\s).,;:!?\]])))");
+    // A log line names things the person chose (a device, an application, a game, a window title) between quotes or brackets: what stands between them is not part of the message.
+    // A quote or bracket that has no partner is not trusted: the rest of the line goes, because the name may run on past where a closing mark seems to be.
+    const std::string text { input.substr(0, max * 4) };
+    const auto n = text.size();
+    constexpr std::string_view omitted = "<…>";
+    // an apostrophe inside a word ("Couldn't") stays; a single quote opens a name only at the start of a word
+    const auto opens_word = [&](std::size_t p) {
+      return p == 0 || std::isspace(static_cast<unsigned char>(text[p - 1])) || text[p - 1] == '(' || text[p - 1] == '=' || text[p - 1] == ':' || text[p - 1] == ',';
+    };
+    const auto may_close = [&](std::size_t p) {
+      return p + 1 == n || std::isspace(static_cast<unsigned char>(text[p + 1])) || std::string_view { ").,;:!?]" }.find(text[p + 1]) != std::string_view::npos;
+    };
     // keep a bracket that only holds numbers or a short upper-case tag (a code, a count), drop the rest
-    text = replace_fn(text, quoted, [](const std::smatch &m) {
-      const auto s = m.str(0);
-      if (m[4].matched) return m.str(5) + "<…>";
-      const auto inner = s.substr(1, s.size() - 2);
-      static const std::regex plain(R"(^[A-Z0-9_ .:=,-]{0,24}$)");
-      return (s.front() == '[' && std::regex_match(inner, plain)) ? s : std::string { "<…>" };
-    });
-    return scrub_text(text, max);
+    static const std::regex plain(R"(^[A-Z0-9_ .:=,-]{0,24}$)");
+    std::string out;
+    out.reserve(n);
+    std::size_t i = 0;
+    while (i < n) {
+      const char c = text[i];
+      if (c == '"' || c == '[' || c == '{') {
+        std::size_t j = std::string::npos;
+        if (c == '"') {
+          j = text.find('"', i + 1);
+        }
+        else {
+          // a bracket may hold brackets ("[Project [draft] Budget.xlsx]"): the name ends where the outermost one closes
+          int depth = 0;
+          for (std::size_t k = i; k < n; ++k) {
+            if (text[k] == '[' || text[k] == '{') {
+              ++depth;
+            }
+            else if ((text[k] == ']' || text[k] == '}') && --depth == 0) {
+              j = k;
+              break;
+            }
+          }
+        }
+        if (j == std::string::npos) {
+          out += omitted;
+          break;
+        }
+        const auto inner = text.substr(i + 1, j - i - 1);
+        if (c == '[' && std::regex_match(inner, plain)) {
+          out.append(text, i, j - i + 1);
+        }
+        else {
+          out += omitted;
+        }
+        i = j + 1;
+        continue;
+      }
+      if (c == '\'' && opens_word(i)) {
+        // the name ends at the last quote that could close it: a title can hold a quote followed by a space
+        std::size_t last = std::string::npos;
+        for (std::size_t k = i + 1; k < n; ++k) {
+          if (text[k] == '\'' && may_close(k)) last = k;
+        }
+        out += omitted;
+        if (last == std::string::npos) break;
+        i = last + 1;
+        continue;
+      }
+      out.push_back(c);
+      ++i;
+    }
+    return scrub_text(out, max);
   }
 
   std::string
@@ -250,7 +349,24 @@ namespace telemetry {
   // allow-list per event name
 
   namespace {
-    enum class type_e { boolean, integer, number, choice, catalogue, code, attachment, log_ref, text };
+    enum class type_e { boolean,
+      integer,
+      number,
+      choice,
+      catalogue,
+      code,
+      attachment,
+      log_ref,
+      shot_ref,
+      text,
+      contact,
+      histograms,
+      counts,
+      frames,
+      crumbs,
+      log_lines,
+      frame,
+      vector8 };  // exactly 8 non-negative integers: the fixed buckets of a page sketch
 
     struct prop_spec_t {
       std::string_view key;
@@ -275,7 +391,35 @@ namespace telemetry {
     const std::vector<std::string_view> result_choices { "normal", "error", "timeout", "kicked" };
     const std::vector<std::string_view> severity_choices { "info", "warning", "error", "fatal" };
     const std::vector<std::string_view> report_category_choices { "bug", "performance", "compat", "suggestion", "other" };
-    const std::vector<std::string_view> update_source_choices { "mirror", "github", "other" };
+    const std::vector<std::string_view> opt_out_choices { "usage", "errors" };
+    // why a feedback report went without its screenshot (src/telemetry/service.cpp, ingest): the words are the Worker's, `uploaded` is the one that has a shot_ref
+    const std::vector<std::string_view> shot_state_choices { "none", "too_large", "rejected", "unreachable", "refused", "bad_answer", "unavailable", "uploaded" };
+    const std::vector<std::string_view> log_state_choices { "no_log", "pack_failed", "refused", "unreachable", "bad_answer", "errors_off", "uploaded" };
+    const std::vector<std::string_view> restart_reason_choices { "settings", "guide", "troubleshooting", "doctor", "home", "shell", "tray", "widget", "import", "api" };
+    const std::vector<std::string_view> update_source_choices { "mirror", "cnb", "github", "other" };
+    // why the chosen update source (Mirror酱) was not the one used in the last download
+    const std::vector<std::string_view> update_source_miss_choices { "version_lag", "cdk_invalid", "quota", "network", "no_cdk" };
+    const std::vector<std::string_view> update_result_source_choices { "mirror", "cnb", "github", "manual", "other" };
+    const std::vector<std::string_view> update_stage_choices { "check", "download", "verify", "apply", "restart" };
+    const std::vector<std::string_view> ok_failed_choices { "ok", "failed" };
+    const std::vector<std::string_view> run_result_choices { "ok", "failed", "cancelled", "incomplete" };
+    const std::vector<std::string_view> error_class_choices { "network", "http_4xx", "http_5xx", "hash_mismatch", "disk", "permission", "cancelled", "other" };
+    const std::vector<std::string_view> install_phase_choices { "install", "upgrade", "repair", "uninstall" };
+    const std::vector<std::string_view> ready_which_choices { "svc_core", "page", "core" };
+    const std::vector<std::string_view> host_anomaly_codes { "XP_SVC_CORE_RESTART", "XP_SLOW_READY" };
+    const std::vector<std::string_view> host_anomaly_causes { "soon_after_adopt", "repeat", "unexpected_exit", "above_limit", "above_baseline", "other" };
+    // stream_end: what the clipboard did in the session. `clip_offer` is the decision made when the session was set up (clipboard_bridge::offer_name), `clip_flow` what the host saw afterwards
+    const std::vector<std::string_view> clip_offer_choices { "offered", "off_config", "no_agent", "agent_stale", "unknown" };
+    const std::vector<std::string_view> clip_flow_choices { "none", "ok", "dropped" };
+    // the fixed stage words of a stream's start (the Worker's STREAM_STAGES)
+    const std::vector<std::string_view> stream_stage_choices { "launch_accept", "display_prepare", "vdd_create", "app_launch", "capture_init", "encoder_init", "rtsp_setup", "first_frame" };
+    const std::vector<std::string_view> driver_choices { "vdd", "gamepad", "microphone", "usbip", "other" };
+    const std::vector<std::string_view> driver_op_choices { "create", "remove", "start", "stop", "probe", "other" };
+    const std::vector<std::string_view> feedback_category_choices { "bug", "feature", "improvement", "other" };
+    const std::vector<std::string_view> clip_error_choices { "none", "connect_refused", "timeout", "tls", "http_401", "http_403", "http_5xx", "stream_ended", "credential_missing", "heartbeat", "other" };
+    const std::vector<std::string_view> clip_conn_choices { "lt50", "50_90", "gt90" };
+    const std::vector<std::string_view> nic_link_choices { "wired", "wireless", "other", "unknown" };
+    const std::vector<std::string_view> nic_speed_choices { "lt_1g", "1g", "2_5g", "5g", "10g", "gt_10g", "unknown" };
 
     std::vector<prop_spec_t>
     stream_dims() {
@@ -294,16 +438,35 @@ namespace telemetry {
       };
     }
 
+    // the dimensions of the stream-health events: no audio codec, app kind or game (the Worker takes the same list)
+    std::vector<prop_spec_t>
+    slim_dims() {
+      return {
+        { "client_kind", type_e::catalogue, 0, 40 },
+        { "client_os", type_e::choice, 0, 0, os_choices },
+        { "codec", type_e::choice, 0, 0, codec_choices },
+        { "width", type_e::integer, 0, 16384 },
+        { "height", type_e::integer, 0, 16384 },
+        { "fps", type_e::integer, 0, 1000 },
+        { "hdr", type_e::boolean },
+        { "transport", type_e::choice, 0, 0, transport_choices },
+      };
+    }
+
     const std::vector<event_spec_t> &
     specs() {
       static const std::vector<event_spec_t> table = [] {
         std::vector<event_spec_t> t;
-        t.push_back({ kind_e::usage, "app_start", { { "cold", type_e::boolean }, { "start_ms", type_e::integer, 0, 600000 }, { "update_source", type_e::choice, 0, 0, update_source_choices } } });
+        t.push_back({ kind_e::usage, "app_start", { { "cold", type_e::boolean }, { "start_ms", type_e::integer, 0, 600000 }, { "update_source", type_e::choice, 0, 0, update_source_choices }, { "update_source_miss", type_e::choice, 0, 0, update_source_miss_choices } } });
         t.push_back({ kind_e::usage, "app_exit", { { "uptime_s", type_e::integer, 0, 31536000 } } });
+        // the one record that a choice was turned off (opt_out.h): which choice, nothing else; the host sends it itself, a page cannot
+        t.push_back({ kind_e::usage, "opt_out", { { "choice", type_e::choice, 0, 0, opt_out_choices, true } } });
         t.push_back({ kind_e::usage, "stream_start", stream_dims() });
         auto end = stream_dims();
         end.push_back({ "duration_s", type_e::integer, 0, 604800 });
         end.push_back({ "result", type_e::choice, 0, 0, result_choices, true });
+        end.push_back({ "clip_offer", type_e::choice, 0, 0, clip_offer_choices });
+        end.push_back({ "clip_flow", type_e::choice, 0, 0, clip_flow_choices });
         t.push_back({ kind_e::usage, "stream_end", end });
         t.push_back({ kind_e::usage, "feature_used", { { "feature", type_e::catalogue, 0, 48, {}, true } } });
         t.push_back({ kind_e::usage, "setting_changed", { { "key", type_e::catalogue, 0, 48, {}, true }, { "value", type_e::catalogue, 0, 32, {}, true } } });
@@ -312,9 +475,10 @@ namespace telemetry {
                                                 { "code", type_e::code, 0, 64 },
                                                 { "severity", type_e::choice, 0, 0, severity_choices },
                                                 { "count", type_e::integer, 1, 1000000 },
+                                                { "build", type_e::catalogue, 0, 40 },
                                                 // no message: a line of the log or a text a page caught can carry what a person chose (a device, a game, a path). The code names the error; the one place for typed text is user_report.
                                               } });
-        // what the person wrote in the error dialog (spec "Worker additions"): a category, the component and page as tokens, an error code, the reference of an uploaded attachment and one scrubbed message of at most 2000 characters; no contact field
+        // what the person wrote in the error dialog (spec "Worker additions"): a category, the component and page as tokens, an error code, the reference of an uploaded attachment and one scrubbed message of at most 2000 characters, the screenshot's reference and the word for why it is missing; the contact when the person left one
         t.push_back({ kind_e::error, "user_report", {
                                                       { "category", type_e::choice, 0, 0, report_category_choices },
                                                       { "component", type_e::catalogue, 0, 32, {}, true },
@@ -322,8 +486,20 @@ namespace telemetry {
                                                       { "error_code", type_e::code, 0, 64 },
                                                       { "attachment", type_e::attachment },
                                                       { "log_ref", type_e::log_ref },
+                                                      { "log_state", type_e::choice, 0, 0, log_state_choices },
+                                                      { "shot_ref", type_e::shot_ref },
+                                                      { "shot_state", type_e::choice, 0, 0, shot_state_choices },
                                                       { "message", type_e::text, 0, static_cast<double>(MAX_USER_REPORT_CHARS), {}, true },
+                                                      { "contact", type_e::contact, 0, static_cast<double>(MAX_USER_CONTACT_CHARS) },
                                                     } });
+        // a fault of the virtual display driver that Windows Error Reporting wrote to the Application log: that it happened, which module, the exception code and the offset (wer_event.h); no stack exists
+        t.push_back({ kind_e::error, "wer_event", {
+                                                    { "event_id", type_e::choice, 0, 0, { "1000", "1001", "1002" }, true },
+                                                    { "kind", type_e::choice, 0, 0, { "crash", "hang" }, true },
+                                                    { "module", type_e::catalogue, 0, 96, {}, true },
+                                                    { "exception_code", type_e::code, 0, 64 },
+                                                    { "offset", type_e::code, 0, 64 },
+                                                  } });
         t.push_back({ kind_e::error, "log_summary", {
                                                       { "component", type_e::catalogue, 0, 32, {}, true },
                                                       { "fatal", type_e::integer, 0, 1000000 },
@@ -348,9 +524,208 @@ namespace telemetry {
                                                               { "codec", type_e::choice, 0, 0, codec_choices },
                                                               { "transport", type_e::choice, 0, 0, transport_choices },
                                                               { "duration_s", type_e::integer, 0, 604800 },
+                                                              { "encoder", type_e::catalogue, 0, 48 },
+                                                              { "capture_backend", type_e::catalogue, 0, 48 },
                                                             } });
+        // One chunk of stream-health windows (stream_health.h): fixed-bucket histograms of the per-window statistics, counters, and the stream's dimensions as fixed words.
+        {
+          std::vector<prop_spec_t> health {
+            { "h", type_e::histograms },
+            { "bad", type_e::counts },
+            { "windows", type_e::integer, 0, 100000 },
+            { "idle_windows", type_e::integer, 0, 100000 },
+            { "window_s", type_e::integer, 0, 8640000 },
+            { "frames", type_e::integer, 0, 100000000 },
+            { "captured", type_e::integer, 0, 100000000 },
+            { "submitted", type_e::integer, 0, 100000000 },
+            { "queue_flushes", type_e::integer, 0, 1000000 },
+            { "queue_frames_dropped", type_e::integer, 0, 100000000 },
+            { "idr_requests", type_e::integer, 0, 1000000 },
+            { "rfi_requests", type_e::integer, 0, 1000000 },
+            { "anomalies", type_e::integer, 0, 1000000 },
+            { "loss_pct_avg", type_e::number, 0, 100 },
+            { "loss_pct_max", type_e::number, 0, 100 },
+            { "rtt_ms_p50", type_e::number, 0, 60000 },
+            { "rtt_ms_p95", type_e::number, 0, 60000 },
+            { "fec_pct_avg", type_e::number, 0, 100 },
+            { "actual_kbps", type_e::integer, 0, 10000000 },
+            { "target_kbps", type_e::integer, 0, 10000000 },
+            { "bitrate_band", type_e::choice, 0, 0, { "0-8000", "8000-15000", "15000-30000", "30000-60000", "60000-100000", "100000-200000", "200000+" } },
+            { "encoder", type_e::catalogue, 0, 48 },
+            { "capture_backend", type_e::catalogue, 0, 48 },
+            { "gpu_driver", type_e::catalogue, 0, 24 },
+          };
+          for (auto &d : slim_dims()) health.push_back(d);
+          t.push_back({ kind_e::experience, "stream_health", std::move(health) });
+          // One anomaly of a window: the code and its numbers say what happened; `log` says an anonymized log excerpt was sent for it.
+          std::vector<prop_spec_t> anomaly {
+            { "code", type_e::code, 0, 32, {}, true },
+            { "severe", type_e::boolean },
+            { "value", type_e::number, 0, 10000000 },
+            { "threshold", type_e::number, 0, 10000000 },
+            { "count", type_e::integer, 0, 100000000 },
+            { "suppressed", type_e::integer, 0, 1000000 },
+            { "window_s", type_e::integer, 0, 3600 },
+            { "log", type_e::boolean },
+            { "bitrate_band", type_e::choice, 0, 0, { "0-8000", "8000-15000", "15000-30000", "30000-60000", "60000-100000", "100000-200000", "200000+" } },
+            { "encoder", type_e::catalogue, 0, 48 },
+            { "capture_backend", type_e::catalogue, 0, 48 },
+            { "gpu_driver", type_e::catalogue, 0, 24 },
+          };
+          for (auto &d : slim_dims()) anomaly.push_back(d);
+          t.push_back({ kind_e::experience, "stream_anomaly", std::move(anomaly) });
+          // an install found one of its own statistics clearly worse than its own baseline (self_baseline.h)
+          std::vector<prop_spec_t> regress {
+            { "metric", type_e::catalogue, 0, 24, {}, true },
+            { "baseline", type_e::number, 0, 100000 },
+            { "current", type_e::number, 0, 100000 },
+            { "delta", type_e::number, 0, 100000 },
+            { "windows", type_e::integer, 0, 100000 },
+            { "baseline_windows", type_e::integer, 0, 10000000 },
+            { "version_changed", type_e::boolean },
+            { "bitrate_band", type_e::choice, 0, 0, { "0-8000", "8000-15000", "15000-30000", "30000-60000", "60000-100000", "100000-200000", "200000+" } },
+            { "encoder", type_e::catalogue, 0, 48 },
+            { "capture_backend", type_e::catalogue, 0, 48 },
+            { "gpu_driver", type_e::catalogue, 0, 24 },
+          };
+          for (auto &d : slim_dims()) regress.push_back(d);
+          t.push_back({ kind_e::experience, "stream_regress", std::move(regress) });
+        }
+        // An error of any component: code, location, stack, fingerprint and the user's last actions (error_report.h); the Worker groups by component and fingerprint
+        t.push_back({ kind_e::error, "error_report", {
+                                                       { "component", type_e::catalogue, 0, 32, {}, true },
+                                                       { "lang", type_e::choice, 0, 0, { "cpp", "js", "rust", "dotnet", "installer", "driver" } },
+                                                       { "fingerprint", type_e::catalogue, 0, 64, {}, true },
+                                                       { "code", type_e::code, 0, 64, {}, true },
+                                                       { "severity", type_e::choice, 0, 0, severity_choices },
+                                                       { "loc", type_e::frame },
+                                                       { "build", type_e::catalogue, 0, 40 },
+                                                       { "page", type_e::catalogue, 0, 48 },
+                                                       { "count", type_e::integer, 1, 1000000 },
+                                                       { "frames", type_e::frames },
+                                                       { "crumbs", type_e::crumbs },
+                                                       { "log", type_e::log_lines },
+                                                     } });
         t.push_back({ kind_e::experience, "startup", { { "host_start_ms", type_e::integer, 0, 3600000 }, { "first_frame_ms", type_e::integer, 0, 3600000 } } });
         t.push_back({ kind_e::experience, "panel_page", { { "page", type_e::catalogue, 0, 40, {}, true }, { "time_to_content_ms", type_e::integer, 0, 600000, {}, true } } });
+        // Stage (b): the sketches of a page, one per route and send: eight bucket counts per metric (foundation-ui pageBuckets.js; the Worker has the same bounds) and a few counters. No trace, no text.
+        t.push_back({ kind_e::experience, "page_vitals", {
+                                                           { "page", type_e::catalogue, 0, 48, {}, true },
+                                                           { "visits", type_e::integer, 0, 100000 },
+                                                           { "lcp", type_e::vector8 },
+                                                           { "inp", type_e::vector8 },
+                                                           { "cls", type_e::vector8 },
+                                                           { "loaf", type_e::vector8 },
+                                                           { "fpaint", type_e::vector8 },
+                                                           { "tti", type_e::vector8 },
+                                                           { "heap", type_e::vector8 },
+                                                           { "loaf_n", type_e::integer, 0, 10000000 },
+                                                           { "loaf_block_ms", type_e::integer, 0, 100000000 },
+                                                           { "fr_a", type_e::integer, 0, 100000000 },
+                                                           { "fr_b", type_e::integer, 0, 100000000 },
+                                                           { "fr_c", type_e::integer, 0, 100000000 },
+                                                           { "fr_d", type_e::integer, 0, 100000000 },
+                                                           { "dwell_s", type_e::integer, 0, 8640000 },
+                                                         } });
+        // the latency of the page's calls to this host, per endpoint word: calls, failures, timeouts and eight latency buckets
+        t.push_back({ kind_e::experience, "api_latency", {
+                                                           { "endpoint", type_e::catalogue, 0, 32, {}, true },
+                                                           { "calls", type_e::integer, 0, 10000000 },
+                                                           { "errors", type_e::integer, 0, 10000000 },
+                                                           { "timeouts", type_e::integer, 0, 10000000 },
+                                                           { "lat", type_e::vector8 },
+                                                         } });
+        // Stage (c): the result of an update step (the page runs the update sheet), one component of an install run and the run itself (the host reads the installer's journal), and coarse device facts
+        t.push_back({ kind_e::error, "update_result", {
+                                                        { "source", type_e::choice, 0, 0, update_result_source_choices, true },
+                                                        { "stage", type_e::choice, 0, 0, update_stage_choices, true },
+                                                        { "result", type_e::choice, 0, 0, ok_failed_choices, true },
+                                                        { "error_class", type_e::choice, 0, 0, error_class_choices },
+                                                        { "from_version", type_e::catalogue, 0, 40 },
+                                                        { "to_version", type_e::catalogue, 0, 40 },
+                                                        { "dur_ms", type_e::integer, 0, 3600000 },
+                                                        { "reboot_needed", type_e::boolean },
+                                                      } });
+        t.push_back({ kind_e::error, "install_result", {
+                                                         { "result", type_e::choice, 0, 0, ok_failed_choices, true },
+                                                         { "error_class", type_e::choice, 0, 0, error_class_choices },
+                                                         { "phase", type_e::choice, 0, 0, install_phase_choices },
+                                                         { "component", type_e::catalogue, 0, 24 },
+                                                         { "step", type_e::catalogue, 0, 32 },
+                                                         { "exit_code", type_e::code, 0, 24 },
+                                                         { "reboot_needed", type_e::boolean },
+                                                         { "from_version", type_e::catalogue, 0, 40 },
+                                                         { "dur_ms", type_e::integer, 0, 7200000 },
+                                                       } });
+        t.push_back({ kind_e::error, "install_summary", {
+                                                          { "phase", type_e::choice, 0, 0, install_phase_choices },
+                                                          { "result", type_e::choice, 0, 0, run_result_choices, true },
+                                                          { "components", type_e::integer, 0, 64 },
+                                                          { "failed", type_e::integer, 0, 64 },
+                                                          { "reboot_needed", type_e::boolean },
+                                                          { "from_version", type_e::catalogue, 0, 40 },
+                                                          { "dur_ms", type_e::integer, 0, 7200000 },
+                                                        } });
+        // Service and start-up facts (service_lifecycle.h): the counts of what the service did with the core, the time to ready, and the anomalies XP_SVC_CORE_RESTART and XP_SLOW_READY
+        t.push_back({ kind_e::experience, "svc_lifecycle", {
+                                                             { "launched", type_e::integer, 0, 1000 },
+                                                             { "adopted", type_e::integer, 0, 1000 },
+                                                             { "extras_ended", type_e::integer, 0, 1000 },
+                                                             { "exits", type_e::integer, 0, 1000 },
+                                                             { "restarts_requested", type_e::integer, 0, 1000 },
+                                                             { "restart_reason", type_e::choice, 0, 0, restart_reason_choices },
+                                                             { "unexpected", type_e::integer, 0, 1000 },
+                                                             { "soon_after_adopt", type_e::integer, 0, 1000 },
+                                                             { "restarts_core_exit", type_e::integer, 0, 1000 },
+                                                             { "restarts_session", type_e::integer, 0, 1000 },
+                                                           } });
+        t.push_back({ kind_e::experience, "startup_timing", {
+                                                              { "which", type_e::choice, 0, 0, ready_which_choices, true },
+                                                              { "ms", type_e::integer, 0, 3600000, {}, true },
+                                                              { "slow", type_e::boolean },
+                                                            } });
+        t.push_back({ kind_e::experience, "host_anomaly", {
+                                                            { "code", type_e::choice, 0, 0, host_anomaly_codes, true },
+                                                            { "severe", type_e::boolean },
+                                                            { "value", type_e::number, 0, 3600000000.0 },
+                                                            { "threshold", type_e::number, 0, 3600000000.0 },
+                                                            { "count", type_e::integer, 1, 1000000 },
+                                                            { "cause", type_e::choice, 0, 0, host_anomaly_causes },
+                                                            { "which", type_e::choice, 0, 0, ready_which_choices },
+                                                            { "exit_code", type_e::code, 0, 24 },
+                                                          } });
+        t.push_back({ kind_e::experience, "page_ready", { { "page", type_e::catalogue, 0, 48, {}, true }, { "ms", type_e::integer, 0, 3600000, {}, true } } });
+        t.push_back({ kind_e::experience, "device_facts", {
+                                                            { "gpu_vendor", type_e::catalogue, 0, 24 },
+                                                            { "gpu_driver", type_e::catalogue, 0, 24 },
+                                                            { "os_build", type_e::catalogue, 0, 16 },
+                                                            { "displays", type_e::integer, 0, 16 },
+                                                            { "refresh_hz", type_e::integer, 0, 1000 },
+                                                            { "nic_link", type_e::choice, 0, 0, nic_link_choices },
+                                                            { "nic_speed", type_e::choice, 0, 0, nic_speed_choices },
+                                                          } });
+        // where a stream start was slow (only a start over the stage's bound is reported) and where it failed: fixed stage words, no free text (docs: the stream start stages of the Worker contract)
+        t.push_back({ kind_e::experience, "stream_stage", { { "stage", type_e::choice, 0, 0, stream_stage_choices, true }, { "ms", type_e::integer, 0, 3600000 } } });
+        t.push_back({ kind_e::experience, "stream_failed", { { "stage", type_e::choice, 0, 0, stream_stage_choices, true }, { "code", type_e::code, 0, 64, {}, true } } });
+        // a driver operation that failed (the successes are counted by the feature words): which driver, what was tried, the result code as digits and letters
+        t.push_back({ kind_e::error, "driver_event", { { "driver", type_e::choice, 0, 0, driver_choices, true }, { "op", type_e::choice, 0, 0, driver_op_choices, true }, { "result", type_e::choice, 0, 0, ok_failed_choices, true }, { "hresult", type_e::code, 0, 64 } } });
+        // the previous run of the host did not end by itself (sent with that run's session id): how it was told apart from a shutdown
+        t.push_back({ kind_e::error, "session_abnormal", { { "abnormal_mechanism", type_e::choice, 0, 0, { "hang", "wer_log", "shutdown", "unknown" }, true } } });
+        // a feedback report was sent (the counterpart of user_report that survives the daily limit of issues): the category in the Worker's words
+        t.push_back({ kind_e::error, "feedback_submit", { { "category", type_e::choice, 0, 0, feedback_category_choices, true } } });
+        // the Panel's clipboard agent, one record per run (and one per 24 hours of a long run): how the connection to the host behaved. Counts only, no content.
+        t.push_back({ kind_e::experience, "clipboard_health", {
+                                                                { "first_connect_ms", type_e::integer, 0, 3600000 },
+                                                                { "connected_pct", type_e::choice, 0, 0, clip_conn_choices },
+                                                                { "reconnects", type_e::integer, 0, 1000000 },
+                                                                { "heartbeat_fail", type_e::integer, 0, 1000000 },
+                                                                { "last_error", type_e::choice, 0, 0, clip_error_choices },
+                                                                { "apply_ok", type_e::integer, 0, 1000000 },
+                                                                { "apply_fail", type_e::integer, 0, 1000000 },
+                                                                { "post_ok", type_e::integer, 0, 1000000 },
+                                                                { "post_fail", type_e::integer, 0, 1000000 },
+                                                                { "runtime_s", type_e::integer, 0, 31536000 },
+                                                              } });
         return t;
       }();
       return table;
@@ -415,9 +790,118 @@ namespace telemetry {
           const auto text = value.get<std::string>();
           return std::regex_match(text, ref) ? std::optional<json> { json(text) } : std::nullopt;
         }
+        case type_e::shot_ref: {
+          // only the reference POST /v1/user-screenshot returns: crash-YYYY-MM[-n]/ur-shot-<24 hex>.<png|jpg|webp>
+          if (!value.is_string()) return std::nullopt;
+          static const std::regex ref(R"(^crash-\d{4}-\d{2}(-\d)?/ur-shot-[0-9a-f]{24}\.(png|jpg|webp)$)");
+          const auto text = value.get<std::string>();
+          return std::regex_match(text, ref) ? std::optional<json> { json(text) } : std::nullopt;
+        }
         case type_e::text: {
           if (!value.is_string()) return std::nullopt;
           return json(scrub_text(value.get<std::string>(), static_cast<std::size_t>(spec.max)));
+        }
+        case type_e::contact: {
+          // what a person left on purpose so the developers can answer: one line, cut, NOT scrubbed (an address they gave is what it is for); it shows only in the issue of that one report
+          if (!value.is_string()) return std::nullopt;
+          std::string line;
+          bool space = false;
+          for (const unsigned char c : value.get<std::string>()) {
+            if (c < 0x20 || c == 0x7f || c == ' ') {
+              space = !line.empty();
+              continue;
+            }
+            if (space) line += ' ';
+            space = false;
+            line += static_cast<char>(c);
+          }
+          line = cut_utf8(line, static_cast<std::size_t>(spec.max));
+          return line.empty() ? std::nullopt : std::optional<json> { json(line) };
+        }
+        case type_e::frame: {
+          if (!value.is_string()) return std::nullopt;
+          auto frame = clean_frame(value.get<std::string>());
+          if (frame.empty()) return std::nullopt;
+          return json(std::move(frame));
+        }
+        case type_e::frames: {
+          if (!value.is_array() || value.size() > MAX_FRAMES) return std::nullopt;
+          json out = json::array();
+          for (const auto &f : value) {
+            if (!f.is_string()) return std::nullopt;
+            auto frame = clean_frame(f.get<std::string>());
+            if (frame.empty()) return std::nullopt;
+            out.push_back(std::move(frame));
+          }
+          return out;
+        }
+        case type_e::crumbs: {
+          if (!value.is_array() || value.size() > MAX_BREADCRUMBS) return std::nullopt;
+          static const std::regex crumb(R"(^\d{1,5}\|(?:nav|act|set|stream|dev|state|net)\|[a-z0-9_.:+-]{1,48}$)");
+          json out = json::array();
+          for (const auto &c : value) {
+            if (!c.is_string() || !std::regex_match(c.get<std::string>(), crumb)) return std::nullopt;
+            out.push_back(c);
+          }
+          return out;
+        }
+        case type_e::log_lines: {
+          // The tail of a component's own log, already anonymised by the sender (Panel: log_scrub.rs). Scrubbed here once more with the host's text rules, so a sender that is old or wrong cannot let a path,
+          // an address or a key through; at most 40 lines of 200 characters.
+          if (!value.is_array() || value.size() > MAX_LOG_LINES) return std::nullopt;
+          json out = json::array();
+          for (const auto &line : value) {
+            if (!line.is_string()) return std::nullopt;
+            auto text = scrub_log_message(line.get<std::string>(), MAX_LOG_LINE_CHARS);
+            text.erase(std::remove_if(text.begin(), text.end(), [](unsigned char c) { return c < 0x20 || c == 0x7f; }), text.end());
+            if (!text.empty()) out.push_back(std::move(text));
+          }
+          return out;
+        }
+        case type_e::counts: {
+          if (!value.is_object()) return std::nullopt;
+          json out = json::object();
+          for (const auto &k : health::hist_keys()) {
+            const auto found = value.find(std::string { k.key });
+            if (found == value.end()) continue;
+            if (!found->is_number()) return std::nullopt;
+            const double v = found->get<double>();
+            if (!std::isfinite(v)) return std::nullopt;
+            out[std::string { k.key }] = static_cast<std::int64_t>(std::llround(std::clamp(v, 0.0, 100000.0)));
+          }
+          return out;
+        }
+        case type_e::vector8: {
+          // exactly 8 non-negative integers; anything else drops the whole prop
+          if (!value.is_array() || value.size() != 8) return std::nullopt;
+          json row = json::array();
+          for (const auto &n : value) {
+            if (!n.is_number()) return std::nullopt;
+            const double v = n.get<double>();
+            if (!std::isfinite(v) || v < 0) return std::nullopt;
+            row.push_back(static_cast<std::int64_t>(std::llround(std::clamp(v, 0.0, 10000000.0))));
+          }
+          return row;
+        }
+        case type_e::histograms: {
+          // only the keys of health::hist_keys(), each exactly BUCKET_COUNT non-negative integers; anything else drops the whole prop
+          if (!value.is_object()) return std::nullopt;
+          json out = json::object();
+          for (const auto &k : health::hist_keys()) {
+            const auto found = value.find(std::string { k.key });
+            if (found == value.end()) continue;
+            if (!found->is_array() || found->size() != health::BUCKET_COUNT) return std::nullopt;
+            json row = json::array();
+            for (const auto &n : *found) {
+              if (!n.is_number()) return std::nullopt;
+              const double v = n.get<double>();
+              if (!std::isfinite(v)) return std::nullopt;
+              row.push_back(static_cast<std::int64_t>(std::llround(std::clamp(v, 0.0, 10000000.0))));
+            }
+            out[std::string { k.key }] = std::move(row);
+          }
+          if (out.empty()) return std::nullopt;
+          return out;
         }
       }
       return std::nullopt;
@@ -567,6 +1051,7 @@ namespace telemetry {
       { "name", event.name },
       { "props", event.props },
     };
+    if (event.count > 1) j["count"] = event.count;
     return j;
   }
 
@@ -646,6 +1131,12 @@ namespace telemetry {
 
   std::vector<json>
   build_envelopes(const context_t &context, std::string_view product, const std::vector<event_t> &events) {
+    std::vector<std::vector<std::size_t>> members;
+    return build_envelopes(context, product, events, members);
+  }
+
+  std::vector<json>
+  build_envelopes(const context_t &context, std::string_view product, const std::vector<event_t> &events, std::vector<std::vector<std::size_t>> &members) {
     std::vector<json> out;
     // a product version on an event (panel and web run their own version) starts its own envelope: the version is a field of the envelope
     std::vector<std::string> versions;
@@ -656,20 +1147,101 @@ namespace telemetry {
     for (const auto &version : versions) {
       json current = envelope_head(context, product, version);
       std::size_t bytes = current.dump().size();
+      std::vector<std::size_t> current_members;
       const auto flush = [&] {
-        if (!current["events"].empty()) out.push_back(std::move(current));
+        if (!current["events"].empty()) {
+          out.push_back(std::move(current));
+          members.push_back(std::move(current_members));
+        }
         current = envelope_head(context, product, version);
         bytes = current.dump().size();
+        current_members.clear();
       };
-      for (const auto &e : events) {
+      for (std::size_t at = 0; at < events.size(); ++at) {
+        const auto &e = events[at];
         if ((e.version.empty() ? context.version : e.version) != version) continue;
         auto j = event_to_json(e);
         const auto size = j.dump().size() + 1;
         if (current["events"].size() >= MAX_BATCH_EVENTS || bytes + size > MAX_BATCH_BYTES) flush();
         current["events"].push_back(std::move(j));
+        current_members.push_back(at);
         bytes += size;
       }
       flush();
+    }
+    return out;
+  }
+
+  bool
+  high_volume_event(std::string_view name) {
+    static const std::array<std::string_view, 11> names {
+      "app_start", "app_exit", "feature_used", "setting_changed", "stream_start", "stream_end", "stream_quality", "startup", "panel_page", "page_vitals", "api_latency",
+    };
+    return std::find(names.begin(), names.end(), name) != names.end();
+  }
+
+  std::vector<event_t>
+  aggregate_events(const std::vector<event_t> &events, std::vector<std::vector<std::size_t>> &origin) {
+    struct acc_t {
+      std::size_t out_at;
+      std::map<std::string, double> sum;
+      std::map<std::string, std::uint64_t> seen;
+      std::set<std::string> fractional;
+    };
+    std::vector<event_t> out;
+    origin.clear();
+    std::map<std::string, acc_t> groups;
+    for (std::size_t i = 0; i < events.size(); ++i) {
+      const auto &e = events[i];
+      if (!high_volume_event(e.name) || !e.report_id.empty() || !e.report_install.empty() || !e.props.is_object()) {
+        out.push_back(e);
+        origin.push_back({ i });
+        continue;
+      }
+      const bool additive = e.name == "page_vitals" || e.name == "api_latency";
+      json dims = json::object();
+      for (auto it = e.props.begin(); it != e.props.end(); ++it)
+        if (!it.value().is_number() && !(additive && it.value().is_array())) dims[it.key()] = it.value();
+      const auto key = e.product + '\0' + e.name + '\0' + std::string { kind_name(e.kind) } + '\0' + e.version + '\0' + std::to_string(e.priority) + '\0' + dims.dump();
+      auto found = groups.find(key);
+      if (found == groups.end()) {
+        found = groups.emplace(key, acc_t { out.size(), {}, {}, {} }).first;
+        out.push_back(e);
+        origin.push_back({});
+        out.back().count = 0;
+      }
+      auto &a = found->second;
+      auto &target = out[a.out_at];
+      origin[a.out_at].push_back(i);
+      ++target.count;
+      target.t = std::max(target.t, e.t);
+      for (auto it = e.props.begin(); it != e.props.end(); ++it) {
+        const auto &v = it.value();
+        if (v.is_number()) {
+          a.sum[it.key()] += v.get<double>();
+          ++a.seen[it.key()];
+          if (!v.is_number_integer()) a.fractional.insert(it.key());
+        }
+        else if (additive && v.is_array() && origin[a.out_at].size() > 1) {
+          auto &dst = target.props[it.key()];
+          if (!dst.is_array())
+            dst = v;  // an optional bucket vector the first record did not carry
+          else if (dst.size() == v.size())
+            for (std::size_t k = 0; k < v.size(); ++k)
+              if (v[k].is_number() && dst[k].is_number()) dst[k] = dst[k].get<double>() + v[k].get<double>();
+        }
+      }
+    }
+    for (auto &[key, a] : groups) {
+      auto &target = out[a.out_at];
+      const bool additive = target.name == "page_vitals" || target.name == "api_latency";
+      for (const auto &[prop, total] : a.sum) {
+        const double value = additive ? total : total / static_cast<double>(a.seen[prop]);
+        if (a.fractional.count(prop))
+          target.props[prop] = value;
+        else
+          target.props[prop] = static_cast<std::int64_t>(std::llround(value));
+      }
     }
     return out;
   }

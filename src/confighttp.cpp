@@ -12,6 +12,7 @@
 #include "image_enhancement/api.h"
 #include "logging.h"
 #include "network.h"
+#include "sparxie/runtime.h"
 #include <atomic>
 #include <latch>
 #include <optional>
@@ -36,6 +37,7 @@ namespace confighttp {
 
     https_server_t server { config::nvhttp.cert, config::nvhttp.pkey };
     register_routes(server);
+    ::sparxie::note_host_started();
     server.config.reuse_address = true;
     server.config.address = net::get_bind_address(address_family);
     server.config.port = port_https;
@@ -95,6 +97,8 @@ namespace confighttp {
           BOOST_LOG(debug) << "Configuration UI listener ["sv << listener_name << "] ready at [https://"
                            << listener_address << ':' << port << "]"sv;
         });
+        // start() also returns, without a ready call, when shutdown stopped the server before it began: whoever waits for the start must not wait on.
+        signal_startup();
       }
       catch (boost::system::system_error &err) {
         signal_startup();
@@ -167,6 +171,7 @@ namespace confighttp {
     local_auth_token::stop_monitor();
     ai::http::shutdown_streams();
     image_enhancement::api::shutdown();
+    ::sparxie::stop_art_refresh();
     server.stop();
     if (loopback_server) {
       loopback_server->stop();

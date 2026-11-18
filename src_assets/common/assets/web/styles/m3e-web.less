@@ -112,7 +112,7 @@ html[data-bs-theme] {
 .pin-group + .pin-group { margin-top: 16px; }
 .pin-group__title { display: flex; align-items: baseline; gap: 8px; margin: 0 0 8px; padding: 0 4px; font: var(--m-title-small); color: var(--md-sys-color-primary-text); }
 .pin-count { font: var(--m-label-medium); color: color-mix(in srgb, var(--md-sys-color-on-surface-variant) 55%, var(--md-sys-color-on-surface)); }
-.pin-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 6px 12px; }
+.pin-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr)); gap: 6px 12px; }
 .pin-row { border-radius: 20px; background: var(--m-card); min-height: 0; }
 .pin-row .m-split-item__main { padding: 8px 12px; gap: 12px; }
 .pin-row .m-split-item__gear { width: 48px; }
@@ -132,13 +132,12 @@ html[data-bs-theme] {
 
 /* ---- Downloads ---- */
 .dl-page .m-page { --m-column: min(100%, 1040px); }
-.dl-page--all .m-page { --m-column: min(100%, 1200px); }
 .dl-links { display: flex; flex-wrap: wrap; gap: 8px; }
 .dl-links--project { padding: 0 4px; }
 .dl-grid--partners { grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
 .dl-partner { cursor: default; } .dl-partner:hover { background: var(--m-card); transform: none; }
 .dl-partner .dl-links { margin-top: 10px; }
-.dl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; }
+.dl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 12px; }
 .dl-card { position: relative; display: flex; flex-direction: column; align-items: stretch; gap: 8px; padding: 16px 16px 12px; border-radius: 28px; background: var(--m-card); color: var(--md-sys-color-on-surface); text-align: left; transition: transform var(--m-spring-fast-spatial-duration) var(--m-spring-fast-spatial), background-color 150ms linear; }
 .dl-card__main { all: unset; box-sizing: border-box; display: flex; flex-direction: column; align-items: flex-start; gap: 4px; cursor: pointer; border-radius: 16px; } .dl-card__main:focus-visible { outline: 2px solid var(--md-sys-color-primary); outline-offset: 4px; }
 .dl-card:hover { background: color-mix(in srgb, var(--md-sys-color-primary) 8%, var(--m-card)); transform: translateY(-2px); }
@@ -146,8 +145,8 @@ html[data-bs-theme] {
 .dl-card:focus-visible { outline: 2px solid var(--md-sys-color-primary); outline-offset: 2px; }
 .dl-card__mark { width: 64px; height: 64px; display: grid; place-items: center; margin-bottom: 10px; clip-path: var(--m-shape-cookie); background: var(--md-sys-color-primary-container); color: var(--md-sys-color-on-primary-container); font-size: 28px; }
 .dl-card__name { font: var(--m-title-medium-emphasized); }
-.dl-card__product { font: var(--m-body-medium); color: var(--md-sys-color-on-surface-variant); }
-/* the box reserves room for the tags of every card of a row (tagsReserve, min-height); the tags keep their own height and sit at the top: a wrapped flex line is stretched to fill the box otherwise, and a one-line tag (Windows · x64 / ARM64) became a tall pill */
+.dl-card__product { margin: 0; font: var(--m-body-medium); color: var(--md-sys-color-on-surface-variant); }
+/* Wrapped tags keep their own height instead of stretching across the row. */
 .dl-card__tags { display: flex; flex-wrap: wrap; align-items: flex-start; align-content: flex-start; gap: 6px; min-height: 22px; margin-top: 6px; }
 .dl-tag { padding: 2px 10px; border-radius: 9999px; font: var(--m-label-small); background: var(--md-sys-color-surface-container-high); color: var(--md-sys-color-on-surface-variant); }
 .dl-card__tags { max-width: 100%; }
@@ -256,8 +255,10 @@ html[data-bs-theme] {
 .dl-card__tags .m-ctag { margin-right: 2px; }
 
 /* the popup of a client card: title and content share one left column; a phone gets the full-width sheet of MDialog */
-.dl-dialog { max-width: min(720px, calc(100vw - 32px)); }
-.dl-dialog__body { display: flex; flex-direction: column; align-items: stretch; gap: 16px; text-align: left; }
+.dl-dialog { max-width: min(720px, calc(100vw - 32px)); max-height: calc(100dvh - 16px); }
+.dl-dialog .m-dialog__panel { max-height: calc(100dvh - 16px); padding: 20px; gap: 12px; }
+.dl-dialog .m-dialog__body { flex: 0 1 auto; }
+.dl-dialog__body { flex: none; display: flex; flex-direction: column; align-items: stretch; gap: 12px; text-align: left; }
 .dl-dialog__tags { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; } .dl-dialog__tags:empty { display: none; }
 .dl-dialog__group { display: flex; flex-direction: column; gap: 8px; }
 .dl-dialog__os { margin: 0; font: var(--m-title-small); color: var(--md-sys-color-on-surface-variant); }
@@ -268,6 +269,7 @@ html[data-bs-theme] {
 .dl-dialog .m-dialog__body ul { padding-left: 0; }
 .dl-dialog .m-footer { margin: 0; padding: 0; }
 .dl-dialog .m-dialog__body .m-assets { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.dl-dialog .m-assets__row { padding: 8px 12px; gap: 2px 12px; }
 .dl-dialog .m-dialog__body .dl-features { flex-direction: row; flex-wrap: wrap; gap: 8px; }
 @media (max-width: 600px) {
   .dl-dialog { max-width: 100vw; min-width: 0; width: 100vw; margin: auto 0 0; }
@@ -291,3 +293,28 @@ html[data-bs-theme] {
 @media (min-width: 900px) { .cover-pair { grid-template-columns: minmax(0, 380px) minmax(0, 1fr); align-items: start; } }
 /* the previews of an official Sparxie cover: the heights of the two frames are equal (2:3 and 16:9 widths are 3 : 8 once the card padding is counted: 29 : 71) */
 @media (min-width: 900px) { .cover-pair--preview { grid-template-columns: minmax(0, 29fr) minmax(0, 71fr); } }
+
+/* the clients page: no switch on a row; cancel pairing is a red icon button, a stopped device says so and is restored from its row */
+.pin-row__unpair { flex: none; align-self: center; display: grid; place-items: center; width: 44px; height: 44px; margin: 0 10px 0 4px; border: 0; border-radius: 50%; background: transparent; color: var(--md-sys-color-error); cursor: pointer; font-size: 22px; transition: background-color var(--m-spring-default-effects-duration, 200ms) var(--m-spring-default-effects, ease); }
+.pin-row__unpair:hover { background: color-mix(in srgb, var(--md-sys-color-error) 10%, transparent); }
+.pin-row__unpair:active { background: color-mix(in srgb, var(--md-sys-color-error) 16%, transparent); }
+.pin-row__unpair:focus-visible { outline: 2px solid var(--md-sys-color-error); outline-offset: 2px; }
+.pin-row__unpair:disabled { opacity: .38; cursor: not-allowed; }
+.pin-row__stopped { flex: none; align-self: center; display: flex; align-items: center; gap: 8px; margin-inline-end: 4px; }
+/* A stopped card has more actions: give the device name its own row instead of squeezing it between controls. */
+.pin-row--stopped { display: grid; grid-template-columns: minmax(0, 1fr) 44px 1px 48px; }
+.pin-row--stopped .pin-row__main { grid-column: 1 / -1; }
+.pin-row--stopped .pin-row__stopped { grid-column: 1; grid-row: 2; margin: 0 4px 8px 12px; min-width: 0; flex-wrap: wrap; }
+.pin-row--stopped .pin-row__unpair { grid-column: 2; grid-row: 2; margin: 0 0 8px; }
+.pin-row--stopped .m-split-item__divider { grid-column: 3; grid-row: 2; margin: 0 0 8px; }
+.pin-row--stopped .m-split-item__gear { grid-column: 4; grid-row: 2; min-height: 44px; margin-bottom: 8px; }
+.pin-badge { display: inline-flex; align-items: center; gap: 4px; height: 28px; padding: 0 10px 0 8px; border-radius: 9999px; background: var(--md-sys-color-error-container); color: var(--md-sys-color-on-error-container); font: var(--m-label-large); white-space: nowrap; }
+.pin-badge .m-icon { font-size: 16px; }
+.pin-row--stopped .m-item__title { color: var(--md-sys-color-on-surface-variant); }
+.pin-group--stopped .pin-group__title { color: var(--md-sys-color-error); }
+.pin-device__stopped { margin-bottom: 4px; }
+.pin-confirm__how { display: flex; gap: 10px; align-items: flex-start; margin: 12px 0 0; font: var(--m-body-medium); color: var(--md-sys-color-on-surface-variant); } .pin-confirm__how .m-icon { flex: none; font-size: 20px; }
+/* the danger zone of the device sheet: a labelled list, red icon and title */
+.pin-danger { display: flex; flex-direction: column; gap: 8px; }
+.pin-danger__label { margin: 0; padding: 0 4px; font: var(--m-title-small); color: var(--md-sys-color-error); }
+.pin-danger__item .m-item__title, .pin-danger__item .m-item__lead, .pin-danger__item .m-item__lead .m-icon { color: var(--md-sys-color-error); }

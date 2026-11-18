@@ -164,7 +164,7 @@ class ShardTest(unittest.TestCase):
         self.assertIn("cold_plan", self.jobs["adapter_config"]["needs"])
         prune = step(build, "Prune stale compiler cache entries")["run"]
         self.assertIn(f'$current = "ccache-windows-{fingerprint}-${{{{ github.run_id }}}}"', prune)
-        self.assertIn("^ccache-windows-([0-9a-f]{12}-)?[0-9]+$", prune)  # fingerprinted and older keys
+        self.assertIn("^ccache-windows-([0-9a-f]{12}-(pinned|newest)-)?[0-9]+$", prune)  # fingerprinted (with the toolchain mode) and older keys
 
     def test_the_cold_plan_shards_on_a_missing_fingerprint_cache_or_a_widely_included_header(self):
         plan = step(self.jobs["cold_plan"], "Decide")
@@ -227,6 +227,24 @@ class ShardTest(unittest.TestCase):
         self.assertEqual(self.gate(shard="cancelled"), 1)
         self.assertEqual(self.gate(build_win="failure"), 1)
         self.assertEqual(self.gate(adapter_config="failure"), 1)
+
+
+class SizeBudgetTest(unittest.TestCase):
+    def setUp(self):
+        self.build = load()["jobs"]["build_win"]
+
+    def test_the_size_budget_runs_on_the_finished_installer_before_the_assets_are_renamed(self):
+        names = [s.get("name") for s in self.build["steps"]]
+        gate = step(self.build, "Installer size budget")
+        self.assertEqual(gate["if"], "needs.changes.outputs.package == 'true'")
+        self.assertGreater(names.index("Installer size budget"), names.index("Run the installer worker (smoke test)"))
+        self.assertLess(names.index("Installer size budget"), names.index("Rename release assets"))
+        self.assertIn("scripts/ci/check-size-budget.py", gate["run"])
+        self.assertIn("artifacts/sunshine-windows-installer.exe", gate["run"])
+        for measured in ("sunshine-windows-portable.zip", "::Sunshine/sunshine.exe", "::Sunshine/assets/gui/sunshine-gui.exe"):
+            self.assertIn(measured, gate["run"])
+        # a failing script must fail the step: pwsh does not stop on a native exit code by itself
+        self.assertIn("exit $LASTEXITCODE", gate["run"])
 
 
 if __name__ == "__main__":

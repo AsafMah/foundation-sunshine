@@ -107,10 +107,26 @@ namespace crash {
 
   /**
    * The anonymised session log of the run that is going on, uploaded to POST <endpoint>/v1/user-log for a feedback report. Returns the reference to put into the
-   * report (prop log_ref), or nothing when error reports are off, there is no log, or the service does not take it (404, a limit): the report then goes without a log.
+   * report (prop log_ref), or nothing when there is no log or the service does not take it (404, a limit): the report then goes without a log.
+   * The error-report switch does not decide: the log is part of a feedback report, and pressing 发送 is the consent for it.
    */
   std::optional<std::string>
   upload_session_log(const std::string &endpoint, const std::string &install_id, const std::string &version);
+
+  /// Why the latest upload_session_log() gave no reference (a fixed word: uploaded | errors_off (no longer produced: the log of a feedback report is not held back by the switch) | no_log | pack_failed | refused | unreachable | bad_answer), so the report can say it.
+  const char *
+  session_log_state();
+
+  /**
+   * The screenshot of a feedback report, uploaded to POST <endpoint>/v1/user-screenshot (multipart: "meta" + "image"). `image` is PNG, JPEG or WebP bytes the caller has already checked. Returns the reference to put into the
+   * report (prop shot_ref), or nothing (a limit, a refusal, no network): the report then goes without its screenshot. The server checks the picture again and keeps it without its metadata.
+   */
+  std::optional<std::string>
+  upload_session_shot(const std::string &endpoint, const std::string &install_id, const std::string &version, const std::string &image);
+
+  /// Why the latest upload_session_shot() gave no reference (a fixed word: uploaded | none | too_large | rejected | unreachable | refused | bad_answer | unavailable).
+  const char *
+  session_shot_state();
 
   /// upload_session_log() for a given config directory, without the consent check (the caller has made it): the tests and tools.
   std::optional<std::string>

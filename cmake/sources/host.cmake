@@ -79,7 +79,9 @@ set(SUNSHINE_HOST_SOURCES
     src/input.cpp src/input.h
     src/input_activity.cpp src/input_activity.h
     src/audio.cpp src/audio.h
+    src/audio_default_wait.h
     src/audio_devices.cpp src/audio_devices.h
+    src/audio_sink_plan.cpp src/audio_sink_plan.h
     src/audio_vb_cable.cpp src/audio_vb_cable.h
     src/mic_mixer.cpp src/mic_mixer.h
     src/process.cpp src/process.h
@@ -174,12 +176,20 @@ set(SUNSHINE_HOST_SOURCES
     src/webhook/webhook.cpp src/webhook/webhook.h
 
     # src/telemetry
+    src/telemetry/device_facts.cpp src/telemetry/device_facts.h
     src/telemetry/events.cpp src/telemetry/events.h
+    src/telemetry/install_journal.cpp src/telemetry/install_journal.h
     src/telemetry/queue.cpp src/telemetry/queue.h
+    src/telemetry/error_report.cpp src/telemetry/error_report.h
+    src/telemetry/self_baseline.cpp src/telemetry/self_baseline.h
+    src/telemetry/opt_out.cpp src/telemetry/opt_out.h
+    src/telemetry/service_lifecycle.cpp src/telemetry/service_lifecycle.h
+    src/telemetry/stream_health.cpp src/telemetry/stream_health.h
     src/telemetry/stream_stats.cpp src/telemetry/stream_stats.h
     src/telemetry/service.cpp src/telemetry/service.h
     src/telemetry/transport.cpp src/telemetry/transport.h
     src/telemetry/telemetry.cpp src/telemetry/telemetry.h
+    src/telemetry/wer_event.cpp src/telemetry/wer_event.h
     src/telemetry/hooks.h
 
     # src/nvhttp
@@ -232,7 +242,7 @@ set(SUNSHINE_HOST_SOURCES
     src/confighttp/asset_paths.h
 
     # src/doctor
-    src/doctor/doctor.cpp src/doctor/doctor.h
+    src/doctor/doctor.cpp src/doctor/doctor_text.cpp src/doctor/doctor.h
     src/doctor/doctor_checks.cpp src/doctor/doctor_checks.h
     src/doctor/doctor_os.cpp src/doctor/doctor_os.h
 
@@ -271,7 +281,12 @@ set(SUNSHINE_HOST_SOURCES
     src/sparxie/svg_path.cpp src/sparxie/svg_path.h
     src/sparxie/host.cpp src/sparxie/host.h
     src/sparxie/host_refresh.cpp
+    src/sparxie/art_refresh_job.h
+    src/sparxie/art_path.h
+    src/sparxie/apps_file_lock.h
     src/sparxie/platform.cpp src/sparxie/platform.h
+    src/sparxie/http_body_reader.h
+    src/sparxie/webp_decode_policy.h
     src/sparxie/runtime.cpp src/sparxie/runtime.h
     src/sparxie/stream_display.cpp src/sparxie/stream_display.h
     src/sparxie/user_session.cpp src/sparxie/user_session.h

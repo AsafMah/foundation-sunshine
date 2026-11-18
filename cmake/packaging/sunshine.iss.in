@@ -37,19 +37,21 @@ OutputDir=@CPACK_PACKAGE_DIRECTORY@
 ; The Inno engine is embedded in the native shell after compilation.
 OutputBaseFilename=Sunshine-engine
 ; 压缩
-; Same method and dictionary as before (lzma2/ultra64, solid). Solid compression makes the whole payload one stream, and a
-; stream shorter than the default block (4 x the 64 MB dictionary) is compressed by a single thread. A 64 MB block with four
-; block threads compresses the ~165 MB payload in parallel: the installer grows by 0.4 %, the ISCC run takes about half the time
-; (4-core hosted runner, interleaved runs of three: 41.0 s -> 21.8 s, and 33.7 s -> 18.7 s for this template against the old one;
-; 71.15 MB -> 71.44 MB). Four ultra64 block threads need more
-; memory than the 32-bit compiler process has (measured: "Out of memory"), so the compressor runs in its own 64-bit process.
+; Same method and dictionary as before (lzma2/ultra64, solid). The payload is about 120 MB; with 64 MB blocks the compressor
+; started a new stream at every block, so a file in the second block could not match the first. One block (the largest the
+; directive allows, 256 MB) and the maximum fast-byte count remove that split: measured on the same build, installer
+; 44,918,301 -> 44,381,565 bytes (-1.2 %). Only the compressor changes: the installer unpacks the same 64 MB dictionary
+; sequentially either way, so installation time and memory do not change. The price is build time (the Package step 33 s -> 45 s
+; on a hosted runner), because one block is compressed by one thread. The compressor runs in its own 64-bit process (the
+; 32-bit compiler process ran out of memory with several ultra64 block threads).
 ; https://jrsoftware.org/ishelp/index.php?topic=setup_lzmanumblockthreads
 ; https://jrsoftware.org/ishelp/index.php?topic=setup_lzmablocksize
 ; https://jrsoftware.org/ishelp/index.php?topic=setup_lzmauseseparateprocess
 Compression=lzma2/ultra64
 SolidCompression=yes
-LZMANumBlockThreads=4
-LZMABlockSize=65536
+LZMANumBlockThreads=1
+LZMABlockSize=262144
+LZMANumFastBytes=273
 LZMAUseSeparateProcess=yes
 ; UI 设置
 SetupIconFile={#MyIconFile}
@@ -112,7 +114,7 @@ english.TypeCustom=Custom installation
 english.ComponentVDDDesc=Required for headless/remote streaming without a physical monitor. Enables HDR passthrough.
 english.ComponentFirewallDesc=Allows Moonlight clients to discover and connect to this PC over the network.
 english.ComponentAutostartDesc=Sunshine will start automatically when Windows boots. Recommended for always-on streaming.
-english.ComponentUsbipDesc=The USB/IP transport the native DualSense path needs. Also registers the ALKAIDUSB root device.
+english.ComponentUsbipDesc=The USB/IP transport the native DualSense path needs. Also registers the ALKAIDUSB root device. Not selected by default: it installs a filter on every USB root hub, and the installer rolls it back if a root hub fails.
 english.ComponentGamepadDesc=Emulates Xbox controller for games. Install only if you need gamepad input from the client.
 english.ComponentVmouseDesc=Provides smooth absolute mouse positioning. Install if cursor feels laggy.
 english.ComponentToolsDesc=dxgi-info, audio-info for troubleshooting display and audio issues.
@@ -159,7 +161,7 @@ chinesesimplified.TypeCustom=自定义安装
 chinesesimplified.ComponentVDDDesc=无头/远程串流必装。无需外接显示器即可串流，支持 HDR 直通。
 chinesesimplified.ComponentFirewallDesc=允许 Moonlight 客户端通过网络发现并连接本机。
 chinesesimplified.ComponentAutostartDesc=Windows 启动时自动运行 Sunshine。推荐常驻串流使用。
-chinesesimplified.ComponentUsbipDesc=原生 DualSense 需要的 USB/IP 传输，同时登记 ALKAIDUSB 根设备。
+chinesesimplified.ComponentUsbipDesc=原生 DualSense 需要的 USB/IP 传输，同时登记 ALKAIDUSB 根设备。默认不勾选：它会给每个 USB 根集线器加一个筛选驱动，安装后若根集线器异常会自动回滚。
 chinesesimplified.ComponentGamepadDesc=模拟 Xbox 手柄。仅需要从客户端传入手柄输入时安装。
 chinesesimplified.ComponentVmouseDesc=提供平滑的绝对定位鼠标。如鼠标延迟可尝试安装。
 chinesesimplified.ComponentToolsDesc=dxgi-info、audio-info 等，用于排查显示和音频问题。
@@ -204,7 +206,7 @@ Name: "vdd"; Description: "{cm:ComponentVDD} — {cm:ComponentVDDDesc}"; Types: 
 Name: "firewall"; Description: "{cm:ComponentFirewall} — {cm:ComponentFirewallDesc}"; Types: recommended full compact
 Name: "autostart"; Description: "{cm:ComponentAutostart} — {cm:ComponentAutostartDesc}"; Types: recommended full
 Name: "gamepad"; Description: "{cm:ComponentGamepad} — {cm:ComponentGamepadDesc}"; Types: recommended full
-Name: "usbip"; Description: "{cm:ComponentUsbip} — {cm:ComponentUsbipDesc}"; Types: recommended full; MinVersion: 10.0.18362
+Name: "usbip"; Description: "{cm:ComponentUsbip} — {cm:ComponentUsbipDesc}"; Types: full; MinVersion: 10.0.18362
 Name: "vmouse"; Description: "{cm:ComponentVmouse} — {cm:ComponentVmouseDesc}"; Types: full
 Name: "tools"; Description: "{cm:ComponentTools} — {cm:ComponentToolsDesc}"; Types: recommended full
 
@@ -225,6 +227,11 @@ Type: files; Name: "{app}\concrt140.dll"
 Type: filesandordirs; Name: "{app}\tools\sunshine-ds5-component"
 Type: files; Name: "{app}\tools\ds5-sidecar-package.json"
 Type: files; Name: "{app}\Sunshine.Ds5Sidecar.manifest.json"
+; These files now live in licenses\libwebp. Preserve any unrelated files.
+Type: files; Name: "{app}\tools\library\libwebp\LICENSE.txt"
+Type: files; Name: "{app}\tools\library\libwebp\PATENTS.txt"
+Type: dirifempty; Name: "{app}\tools\library\libwebp"
+Type: dirifempty; Name: "{app}\tools\library"
 
 [Files]
 ; Embedded only for PrepareToInstall; it is not part of the installed layout.
@@ -232,6 +239,10 @@ Source: "{#MySourceDir}\scripts\cleanup-legacy-ds5.ps1"; DestDir: "{tmp}"; Flags
 ; Main application
 Source: "{#MySourceDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion; Components: application
 Source: "{#MySourceDir}\zlib1.dll"; DestDir: "{app}"; Flags: ignoreversion; Components: application
+; Source: inno-setup-files-20261117.
+Source: "{#MySourceDir}\NOTICE"; DestDir: "{app}"; Flags: ignoreversion; Components: application
+Source: "{#MySourceDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion; Components: application
+Source: "{#MySourceDir}\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs; Components: application
 
 ; Mandatory tools
 Source: "{#MySourceDir}\tools\sunshinesvc.exe"; DestDir: "{app}\tools"; Flags: ignoreversion; Components: application
@@ -311,7 +322,10 @@ Source: "{#MySourceDir}\scripts\vdd-device-helper.ps1"; DestDir: "{app}\scripts"
 Source: "{#MySourceDir}\scripts\uninstall-vdd.bat"; DestDir: "{app}\scripts"; Flags: ignoreversion
 Source: "{#MySourceDir}\scripts\driver\*"; DestDir: "{app}\scripts\driver"; Flags: ignoreversion recursesubdirs
 
-; Gamepad scripts
+Source: "{#MySourceDir}\scripts\usbip-package*"; DestDir: "{app}\scripts"; Flags: ignoreversion; Components: assets
+Source: "{#MySourceDir}\scripts\usbip-roothub-guard.ps1"; DestDir: "{app}\scripts"; Flags: ignoreversion skipifsourcedoesntexist; Components: assets
+
+Source: "{#MySourceDir}\licenses\usbip-win2\*"; DestDir: "{app}\licenses\usbip-win2"; Flags: ignoreversion; Components: usbip
 Source: "{#MySourceDir}\scripts\install-usbip.bat"; DestDir: "{app}\scripts"; Flags: ignoreversion skipifsourcedoesntexist; Components: usbip
 Source: "{#MySourceDir}\scripts\usbip\*"; DestDir: "{app}\scripts\usbip"; Flags: ignoreversion recursesubdirs skipifsourcedoesntexist; Components: usbip
 Source: "{#MySourceDir}\scripts\install-gamepad.bat"; DestDir: "{app}\scripts"; Flags: ignoreversion
@@ -455,6 +469,28 @@ var
   GamepadResult, UsbipResult: Integer;
   RebootChecked: Boolean;
   RebootReasons: String;
+  // the journal the host reports at its next start (JournalWrite below)
+  JournalRun, PreviousVersion: String;
+
+function InstallerMessageBox(const Text: String; const Typ: TMsgBoxType;
+  const Buttons, DefaultAnswer: Integer): Integer;
+var
+  Silent: Boolean;
+begin
+  // Authority: installer-inno-suppressible-msgbox-20261118 (Description),
+  // installer-inno-silent-state-20261118, installer-inno-uninstall-state-20261118
+  // and installer-inno-is-uninstaller-20261118 (Description).
+  // /SILENT alone does not suppress script dialogs. Never require a desktop
+  // response in either silent mode; otherwise keep the original interactive UI.
+  if IsUninstaller then
+    Silent := UninstallSilent
+  else
+    Silent := WizardSilent;
+  if Silent then
+    Result := DefaultAnswer
+  else
+    Result := SuppressibleMsgBox(Text, Typ, Buttons, DefaultAnswer);
+end;
 
 function InstallerParameterValue(Name: String): String;
 // Authority: installer-inno-script-functions-20261107 (GetCmdTail,
@@ -490,6 +526,86 @@ begin
           ',"phase":"' + Phase + '","state":"' + State + '","result_code":' + IntToStr(ResultCode) +
           ',"message_key":"' + MessageKey + '"}' + #13#10;
   SaveStringToFile(AddBackslash(InstallRunDir) + 'events.jsonl', AnsiString(Line), True);
+end;
+
+// The journal the host reads at its next start and reports (src/telemetry/install_journal.h): one JSON line per step of this run in <app>\config\telemetry\install_journal.jsonl.
+// Only numbers and fixed words go in. Component and step names are literals of this script and the previous version is reduced to digits and dots; no path and no text of an error.
+procedure JournalWrite(Line: String);
+var
+  Dir: String;
+begin
+  Dir := ExpandConstant('{app}\config\telemetry');
+  if not ForceDirectories(Dir) then
+    Exit;
+  SaveStringToFile(AddBackslash(Dir) + 'install_journal.jsonl', AnsiString(Line + #13#10), True);
+end;
+
+function JournalRunId(): String;
+begin
+  if JournalRun = '' then
+    JournalRun := GetDateTimeString('yyyymmddhhnnss', #0, #0);
+  Result := JournalRun;
+end;
+
+function DigitsAndDots(Value: String): String;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 1 to Length(Value) do
+    if ((Value[I] >= '0') and (Value[I] <= '9')) or (Value[I] = '.') then
+      Result := Result + Value[I];
+end;
+
+procedure JournalStart();
+var
+  Phase: String;
+begin
+  if ExistingInnoInstall then
+    Phase := 'upgrade'
+  else
+    Phase := 'install';
+  JournalWrite('{"v":1,"kind":"start","run":"' + JournalRunId() + '","phase":"' + Phase + '","from":"' + DigitsAndDots(PreviousVersion) + '"}');
+end;
+
+procedure JournalComponent(Component, Step: String; ExitCode: Integer);
+begin
+  JournalWrite('{"v":1,"kind":"component","run":"' + JournalRunId() + '","component":"' + Component + '","step":"' + Step + '","exit":' + IntToStr(ExitCode) + '}');
+end;
+
+// The USB/IP wrapper records only fixed step names and numeric codes. When the component failed, read them before deleting the file so a failure in the
+// bundled installer is distinguishable from a guard failure, without copying any output. A component that worked adds nothing (one event per step would
+// only repeat "ok"). Source: installer-inno-script-functions-20261107.
+procedure JournalUsbipDetails(ComponentResult: Integer);
+var
+  Path, Line, Step, CodeText: String;
+  Lines: TArrayOfString;
+  I, EqualsAt, Code: Integer;
+begin
+  Path := ExpandConstant('{app}\scripts\result-usbip-steps.txt');
+  if not FileExists(Path) then
+    Exit;
+  if (ComponentResult <> 0) and (ComponentResult <> 3010) and LoadStringsFromFile(Path, Lines) then
+    for I := 0 to GetArrayLength(Lines) - 1 do
+    begin
+      Line := Trim(Lines[I]);
+      EqualsAt := Pos('=', Line);
+      if EqualsAt <= 1 then
+        Continue;
+      Step := Copy(Line, 1, EqualsAt - 1);
+      CodeText := Copy(Line, EqualsAt + 1, Length(Line));
+      if not ((Step = 'payload') or (Step = 'guard') or (Step = 'preflight') or (Step = 'snapshot') or
+        (Step = 'installer') or (Step = 'installer_retry') or (Step = 'verify')) then
+        Continue;
+      Code := StrToIntDef(CodeText, -1);
+      JournalComponent('usbip', Step, Code);
+    end;
+  DeleteFile(Path);
+end;
+
+procedure JournalFinish(ExitCode: Integer);
+begin
+  JournalWrite('{"v":1,"kind":"finish","run":"' + JournalRunId() + '","exit":' + IntToStr(ExitCode) + '}');
 end;
 
 // The steps this run takes, for the shell's overall progress (the 'plan' event; step ids as the shell names them).
@@ -566,12 +682,16 @@ procedure EvtGamepadDone();
 begin
   GamepadResult := TakeStepResult('gamepad');
   EmitStepResult('gamepad', 'StatusInstallGamepad', GamepadResult);
+  JournalComponent('gamepad', 'install', GamepadResult);
 end;
 
 procedure EvtUsbipDone();
 begin
   UsbipResult := TakeStepResult('usbip');
   EmitStepResult('usbip', 'StatusInstallUsbip', UsbipResult);
+  // 102 to 105 are the codes of the root-hub guard of the USB/IP component; -1: the helper left no result at all
+  JournalUsbipDetails(UsbipResult);
+  JournalComponent('usbip', 'install', UsbipResult);
 end;
 
 procedure EvtVmouse(); begin EmitInstallerEvent('vmouse', 'running', 'StatusInstallVmouse', 0); end;
@@ -585,13 +705,21 @@ begin
   Result := WizardIsComponentSelected('vdd');
 end;
 
+// install-usbip.bat exit codes 102..105: the root-hub guard rolled the install back, or refused it, or could not run (issue #1272).
+// The controller node is then not registered either: there is no driver for it to bind.
+function UsbipGuardTripped(): Boolean;
+begin
+  Result := (UsbipResult >= 102) and (UsbipResult <= 105);
+end;
+
 function ShouldRunUsbipRootInstall(): Boolean;
 begin
   // An existing install must migrate even when the user changes optional
   // component selection during an upgrade. New installs only create the node
   // when the USB/IP component (usbip-win2) is selected.
   // usbip-win2 needs Windows 10 1903 (18362): an older system never gets the node, migration or not.
-  Result := ((GetWindowsVersion and $FFFF) >= 18362) and (ExistingInnoInstall or WizardIsComponentSelected('usbip'));
+  Result := ((GetWindowsVersion and $FFFF) >= 18362) and (ExistingInnoInstall or WizardIsComponentSelected('usbip')) and
+            (not UsbipGuardTripped());
 end;
 
 // Authority: installer-inno-components-params-20261107; installer-inno-uninstall-regkey-20261107.
@@ -668,11 +796,14 @@ begin
     EmitInstallerEvent('install-vdd', 'failed', 'StatusInstallVDD', 101);
   end;
 
+  // the exit code of the helper itself (-1: it could not be started), not the 101 this script maps it to
+  JournalComponent('vdd', 'install', ResultCode);
+
   if (VDDResultCode = 101) and (not WizardSilent) then
   begin
     Detail := CustomMessage('MsgVDDInstallFailed') + #13#10 + #13#10 +
               'Exit code: ' + IntToStr(ResultCode);
-    MsgBox(Detail, mbError, MB_OK);
+    InstallerMessageBox(Detail, mbError, MB_OK, IDOK);
   end;
 end;
 
@@ -683,6 +814,9 @@ begin
   InstallRunDir := InstallerParameterValue('SUNSHINE_RUN_DIR');
   InstallRunId := InstallerParameterValue('SUNSHINE_RUN_ID');
   InstallEventSequence := 0;
+  PreviousVersion := '';
+  if not RegQueryStringValue(HKLM32, 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{B16E5C0D-7B8A-4E3B-9F1A-2D4C6E8F0A1B}_is1', 'DisplayVersion', PreviousVersion) then
+    PreviousVersion := '';
   EmitInstallerEvent('wizard', 'running', 'WizardStarted', 0);
   // ── Main form tweaks ──
   WizardForm.Color := $FAF6F2;
@@ -1065,13 +1199,12 @@ begin
   // The exit code still reports the failure — see GetCustomSetupExitCode().
   ServiceVerifyFailed := True;
   EmitInstallerEvent('service', 'failed', 'StatusInstallService', 100);
+  JournalComponent('service', 'verify', 100);
   Log('Service verification failed. ' + Detail);
-  // MsgBox() ignores /SILENT (only /SUPPRESSMSGBOXES auto-answers it), so an
-  // unattended install without that switch would sit here forever now that we
-  // no longer abort. The log line above carries the same information.
+  // Silent callers receive the failure through the exit code and log above.
   // CustomMessage() returns the string verbatim, so {app} needs ExpandConstant.
   if not WizardSilent then
-    MsgBox(ExpandConstant(CustomMessage('MsgServiceInstallFailed')) + #13#10 + #13#10 + Detail, mbError, MB_OK);
+    InstallerMessageBox(ExpandConstant(CustomMessage('MsgServiceInstallFailed')) + #13#10 + #13#10 + Detail, mbError, MB_OK, IDOK);
 end;
 
 // Report a nonzero exit code when the service could not be verified. Inno
@@ -1184,11 +1317,12 @@ begin
   // metadata. Offer to clean it up rather than blocking the install entirely.
   if (UninstallExe = '') or (not FileExists(UninstallExe)) then
   begin
-    if MsgBox(CustomMessage('MsgOldNSISStaleRegistry'), mbConfirmation, MB_YESNO) = IDYES then
+    // Without interactive consent, preserve old installation metadata and stop.
+    if InstallerMessageBox(CustomMessage('MsgOldNSISStaleRegistry'), mbConfirmation, MB_YESNO, IDNO) = IDYES then
     begin
       if not CleanupOldNSISRegistry() then
       begin
-        MsgBox(CustomMessage('MsgOldNSISCleanupFailed'), mbError, MB_OK);
+        InstallerMessageBox(CustomMessage('MsgOldNSISCleanupFailed'), mbError, MB_OK, IDOK);
         Result := False;
       end;
     end
@@ -1199,7 +1333,8 @@ begin
     Exit;
   end;
 
-  if MsgBox(CustomMessage('MsgOldNSISDetected'), mbConfirmation, MB_YESNO) <> IDYES then
+  // Do not silently run an older uninstaller that could remove user data.
+  if InstallerMessageBox(CustomMessage('MsgOldNSISDetected'), mbConfirmation, MB_YESNO, IDNO) <> IDYES then
   begin
     Result := False;
     Exit;
@@ -1234,18 +1369,18 @@ begin
   if (InstallDir = '') or (not DirExists(InstallDir)) or
      (not FileExists(UninstallExe)) then
   begin
-    if MsgBox(CustomMessage('MsgOldNSISStaleRegistry'), mbConfirmation, MB_YESNO) = IDYES then
+    if InstallerMessageBox(CustomMessage('MsgOldNSISStaleRegistry'), mbConfirmation, MB_YESNO, IDNO) = IDYES then
     begin
       if not CleanupOldNSISRegistry() then
       begin
-        MsgBox(CustomMessage('MsgOldNSISCleanupFailed'), mbError, MB_OK);
+        InstallerMessageBox(CustomMessage('MsgOldNSISCleanupFailed'), mbError, MB_OK, IDOK);
         Result := False;
       end;
       Exit;
     end;
   end;
 
-  MsgBox(CustomMessage('MsgOldNSISFailed'), mbError, MB_OK);
+  InstallerMessageBox(CustomMessage('MsgOldNSISFailed'), mbError, MB_OK, IDOK);
   Result := False;
 end;
 
@@ -1312,6 +1447,7 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssInstall then
   begin
+    JournalStart();
     EmitInstallerEvent('plan', 'running', PlannedInstallerSteps(), 0);
     InstallProgressPermille := -20;
     EmitInstallerEvent('install', 'running', 'InstallStarted', 0);
@@ -1326,6 +1462,10 @@ begin
     DeleteFile(ExpandConstant('{app}\install_portable.bat'));
     DeleteFile(ExpandConstant('{app}\uninstall_portable.bat'));
     EmitInstallerEvent('install', 'done', 'InstallFinished', GetCustomSetupExitCode());
+    // a service that was verified is reported as done (a failure was reported where it was found)
+    if not ServiceVerifyFailed then
+      JournalComponent('service', 'verify', 0);
+    JournalFinish(GetCustomSetupExitCode());
   end;
 end;
 
@@ -1342,8 +1482,8 @@ var
 begin
   if CurUninstallStep = usUninstall then
   begin
-    // Ask about virtual gamepad
-    if MsgBox(CustomMessage('MsgUninstallGamepad'), mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+    // The driver may be shared with other applications; silence must keep it.
+    if InstallerMessageBox(CustomMessage('MsgUninstallGamepad'), mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES then
     begin
       Exec(ExpandConstant('{app}\scripts\uninstall-gamepad.bat'), '', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     end;
@@ -1355,15 +1495,11 @@ begin
     // installation cannot lock future installs to a stale drive/path.
     DeleteInstallDirRegistry();
 
-    // Ask about data removal
-    if MsgBox(FmtMessage(CustomMessage('MsgUninstallData'), [ExpandConstant('{app}')]),
-      mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDNO then
+    // Only explicit consent may delete configuration, paired clients and covers.
+    // An unattended uninstall keeps user data, even without /SUPPRESSMSGBOXES.
+    if InstallerMessageBox(FmtMessage(CustomMessage('MsgUninstallData'), [ExpandConstant('{app}')]),
+      mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES then
     begin
-      // User chose to keep data, do nothing
-    end
-    else
-    begin
-      // Remove the installation directory
       DelTree(ExpandConstant('{app}'), True, True, True);
     end;
   end;

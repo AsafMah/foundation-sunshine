@@ -51,3 +51,20 @@ TEST(TokenUserSession, AnUnreadableSessionFailsClosed) {
   EXPECT_FALSE(tus::pick(view(5, { { 2, true, true }, { 5, true, false, false } })).has_value());
   EXPECT_FALSE(tus::pick(view(5, { { 2, true, true }, { 3, true, false, false }, { 5, true, false } })).has_value());
 }
+
+// Upstream #1328 chooses the session (platf::retrieve_interactive_users_token: the console user, else the first active RDP
+// session, else the first active user). The credential goes to it only when that is also the single session pick() allows.
+TEST(TokenUserSession, UpstreamChoiceIsGrantedWhenItIsTheOnlyOne) {
+  EXPECT_EQ(tus::grant(view(5, { { 2, true, true }, { 5, true, false } }), 2u), 2u);
+  EXPECT_EQ(tus::grant(view(1, { { 1, true, true }, { 3, true, true } }), 1u), 1u);
+}
+
+TEST(TokenUserSession, UpstreamFirstRdpPickAmongTwoUsersGrantsNobody) {
+  // Upstream would take the first active RDP session; with two signed-in users that is a guess, so nobody gets it.
+  EXPECT_FALSE(tus::grant(view(5, { { 2, true, true }, { 3, true, true }, { 5, true, false } }), 2u).has_value());
+}
+
+TEST(TokenUserSession, DisagreementOrNoUpstreamSessionGrantsNobody) {
+  EXPECT_FALSE(tus::grant(view(5, { { 2, true, true }, { 5, true, false } }), 3u).has_value());
+  EXPECT_FALSE(tus::grant(view(5, { { 2, true, true }, { 5, true, false } }), std::nullopt).has_value());
+}

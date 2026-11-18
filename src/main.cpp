@@ -22,6 +22,7 @@
 #include "client_fingerprint.h"
 #include "confighttp.h"
 #include "crash/crash.h"
+#include "crash/crash_context.h"
 #include "crash/crash_env.h"
 #include "default_apps.h"
 #include "display_device/session.h"
@@ -337,6 +338,10 @@ main(int argc, char *argv[]) {
     std::cerr << "Another Sunshine from this installation is already running; this process exits without opening ports or probing encoders." << std::endl;
     return 0;
   }
+  // The service adopts a running core only when this says it is ready and not stopping.
+  if (config::sunshine.cmd.name.empty()) {
+    lifetime::core_state_open();
+  }
 #endif
 
   auto log_deinit_guard = logging::init(config::sunshine.min_log_level, config::sunshine.log_file, config::sunshine.restore_log);
@@ -351,6 +356,8 @@ main(int argc, char *argv[]) {
 
   // Usage statistics, error counts and stream quality (docs/privacy_telemetry.md). Each kind is sent only while its own choice is on; nothing here can fail the start.
   telemetry::start();
+  // a stream that began while the encoder probe was running learns its encoder later
+  telemetry::set_encoder_resolver([] { return video::session_encoder_name(); });
   telemetry::set_session_probe([] {
     std::vector<telemetry::session_probe_t> probes;
     for (const auto &info : stream::session::get_all_sessions_info()) {
@@ -360,6 +367,7 @@ main(int argc, char *argv[]) {
       probe.loss_pct = info.packet_loss;
       probe.dropped_frames = info.dropped_frames;
       probe.measured_kbps = info.measured_bitrate_kbps;
+      probe.target_kbps = info.bitrate;
       probes.push_back(probe);
     }
     return probes;
@@ -451,6 +459,7 @@ main(int argc, char *argv[]) {
   // Adding this guard here first as it also performs recovery after crash,
   // otherwise people could theoretically end up without display output.
   // It also should be run be destroyed before forced shutdown.
+  crash::context::set_phase(crash::context::phase_e::display_restore);
   auto display_device_deinit_guard = display_device::session_t::init();
   if (!display_device_deinit_guard) {
     BOOST_LOG(error) << "Display device session failed to initialize"sv;
@@ -458,6 +467,7 @@ main(int argc, char *argv[]) {
 
 #ifdef WIN32
   // Modify relevant NVIDIA control panel settings if the system has corresponding gpu
+  crash::context::set_phase(crash::context::phase_e::nvprefs);
   nvprefs_instance.configure();
 
   // Wait as long as possible to terminate Sunshine.exe during logoff/shutdown
@@ -551,6 +561,7 @@ main(int argc, char *argv[]) {
   SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 #endif
 
+  crash::context::set_phase(crash::context::phase_e::apps);
 #ifdef _WIN32
   // The Windows host offers Big Screen once to an apps.json that is older than the entry (default_apps.h); Foundation Desktop is a Windows component.
   default_apps::migrate_file(config::stream.file_apps, config::sunshine.locale);
@@ -558,6 +569,7 @@ main(int argc, char *argv[]) {
 
   proc::refresh(config::stream.file_apps);
 
+  crash::context::set_phase(crash::context::phase_e::enhancement);
   if (!image_enhancement::manager().initialize()) {
     BOOST_LOG(warning) << "HDR enhancement configuration or selected component is unavailable; optional processing is disabled";
   }
@@ -570,6 +582,7 @@ main(int argc, char *argv[]) {
 
   std::unique_ptr<platf::deinit_t> platf_deinit_guard;
   {
+    crash::context::set_phase(crash::context::phase_e::platform_init);
     startup::phase_t phase("platf::init", log_phase);
     platf_deinit_guard = platf::init();
   }
@@ -579,6 +592,7 @@ main(int argc, char *argv[]) {
 
   std::unique_ptr<platf::deinit_t> proc_deinit_guard;
   {
+    crash::context::set_phase(crash::context::phase_e::proc_init);
     startup::phase_t phase("proc::init", log_phase);
     proc_deinit_guard = proc::init();
   }
@@ -590,6 +604,7 @@ main(int argc, char *argv[]) {
 
   // The PyroWave runtime probe creates a Vulkan device; run it now beside the other start-up work instead of inside the
   // first RTSP DESCRIBE (which also serves every other RTSP request on the same thread).
+  crash::context::set_phase(crash::context::phase_e::pyrowave);
   pyrowave::prewarm_server_runtime();
 
   // The input devices (the HID enumeration of the virtual mouse, the gamepad back ends) are opened beside the encoder probe, not before it: neither needs the other,
@@ -605,6 +620,7 @@ main(int argc, char *argv[]) {
     return guard;
   });
 
+  crash::context::set_phase(crash::context::phase_e::network);
   if (http::init()) {
     BOOST_LOG(fatal) << "HTTP interface failed to initialize"sv;
 
@@ -644,6 +660,7 @@ main(int argc, char *argv[]) {
     return lifetime::desired_exit_code;
   }
 
+  crash::context::set_phase(crash::context::phase_e::webhook);
   webhook::auth::load_result_t webhook_auth_result {
     webhook::auth::load_status_t::INVALID,
     {}
@@ -683,6 +700,7 @@ main(int argc, char *argv[]) {
 #ifdef _WIN32
   if (config::audio.mat_live && config::audio.stream) spatial_audio::mat_capture_process.start();
 #endif
+  crash::context::set_phase(crash::context::phase_e::listeners);
   std::thread configThread { confighttp::start };
 
   // The servers of the clients open before the probe: a client that asks while the probe runs waits for it (startup::probe_gate) and is told that the host is
@@ -691,11 +709,14 @@ main(int argc, char *argv[]) {
   std::thread rtspThread { rtsp_stream::start };
 
   {
+    crash::context::set_phase(crash::context::phase_e::encoder_probe);
     startup::phase_t phase("encoder probe", log_phase);
     probe_encoders_with_watchdog();
   }
   startup::probe_gate().open();
+  crash::context::set_phase(crash::context::phase_e::input_wait);
   input_deinit_guard = input_init.get();
+  crash::context::set_phase(crash::context::phase_e::tray);
 
 #if defined(_WIN32) && defined(SUNSHINE_GUI_TRAY) && SUNSHINE_GUI_TRAY >= 1
   // The service wrapper owns user-session agent startup in service mode, and
@@ -733,8 +754,15 @@ main(int argc, char *argv[]) {
 #endif
 
   telemetry::host_ready();
+  // An exit that was already asked for (a required listener failed during the probe sets the event directly) must not look ready.
+  if (!shutdown_event->peek()) {
+    lifetime::core_state_ready();
+  }
   crash_startup_busy.reset();
+  crash::context::set_phase(crash::context::phase_e::none);
   mainThreadLoop(shutdown_event);
+  // Every way out of the loop is an exit: the service must not adopt this process from here on, whichever path raised the event.
+  lifetime::core_state_stopping();
 
 #ifdef _WIN32
   spatial_audio::mat_capture_process.stop();

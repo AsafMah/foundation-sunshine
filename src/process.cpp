@@ -192,6 +192,7 @@ namespace proc {
   }
   int
   proc_t::execute(int app_id, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
+    std::lock_guard lifecycle(_lifecycle_mutex);
     // Ensure starting from a clean slate
     terminate();
     auto iter = std::find_if(_apps.begin(), _apps.end(), [&app_id](const auto app) {
@@ -409,6 +410,7 @@ namespace proc {
 
   void
   proc_t::terminate() {
+    std::lock_guard lifecycle(_lifecycle_mutex);
     std::error_code ec;
     placebo = false;
     launch_splash::end();
@@ -834,6 +836,10 @@ namespace proc {
 
         // 如果文件不存在则下载
         if (!std::filesystem::exists(local_path)) {
+          // a cover that just failed is not asked for again (and not logged again) on every refresh of the list
+          if (http::cover_download_recently_failed(original_url)) {
+            return DEFAULT_APP_IMAGE_PATH;
+          }
           BOOST_LOG(info) << "Downloading image from URL: " << original_url;
           if (!http::download_public_cover_image(original_url, file_handler::path_to_utf8(local_path))) {
             BOOST_LOG(warning) << "Failed to download image (or rejected by magic check) from URL: " << original_url;
