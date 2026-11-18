@@ -25,7 +25,7 @@ def require_newer(candidate, latest):
         raise ValueError(f"Candidate {candidate} must be strictly greater than Latest {latest}")
 
 
-def select(upstream, fork, latest, run_number, is_ancestor):
+def select(upstream, fork, latest, run_number, is_ancestor, dev=False):
     if not isinstance(run_number, int) or run_number <= 0:
         raise ValueError("Run number must be positive")
     bases = []
@@ -44,7 +44,9 @@ def select(upstream, fork, latest, run_number, is_ancestor):
     if not bases:
         raise ValueError("No reachable release base")
     candidate = f"v{'.'.join(map(str, max(bases)))}.{run_number}"
-    require_newer(candidate, latest)
+    # A dev (non-publishing) build is labelled with its lineage but publishes nothing, so it is not gated against Latest.
+    if not dev:
+        require_newer(candidate, latest)
     return candidate
 
 
@@ -60,6 +62,8 @@ def main():
     parser.add_argument("--latest", required=True)
     parser.add_argument("--run-number", type=int)
     parser.add_argument("--candidate")
+    parser.add_argument("--dev", action="store_true",
+                        help="version of a non-publishing build: the lineage, without the gate against Latest")
     args = parser.parse_args()
     latest = json.loads(Path(args.latest).read_text(encoding="utf-8-sig"))["tag_name"]
     if args.candidate:
@@ -78,7 +82,7 @@ def main():
         return result.returncode == 0
 
     print(select(read_releases(args.upstream), read_releases(args.fork),
-                 latest, args.run_number, ancestor))
+                 latest, args.run_number, ancestor, dev=args.dev))
 
 
 if __name__ == "__main__":

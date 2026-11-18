@@ -54,6 +54,37 @@ class ForkReleaseVersionTests(unittest.TestCase):
             release_version.select([release("v2026.1031.121458", "a" * 40)], [],
                                    "v2026.1103.100831.14", 17, lambda _: True)
 
+    def test_dev_build_takes_the_lineage_without_the_publication_gate(self):
+        # A non-publishing build of an older branch is honestly older than Latest: it still gets its own lineage
+        # (never 0.0.0.<commit>, which every updater reads as older than any release) and the build does not fail.
+        upstream = [release("v2026.1031.121458", "a" * 40)]
+        self.assertEqual(release_version.select(upstream, [], "v2026.1103.100831.14", 17, lambda _: True, dev=True),
+                         "v2026.1031.121458.17")
+        with self.assertRaisesRegex(ValueError, "No reachable release base"):
+            release_version.select(upstream, [], "v2026.1103.100831.14", 17, lambda _: False, dev=True)
+
+    def test_dev_cli_prints_the_dev_build_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = {}
+            for name, data in (("upstream", [release("v2026.1031.121458", "a" * 40)]), ("fork", []),
+                               ("latest", {"tag_name": "v2026.1103.100831.14.杂鱼"})):
+                paths[name] = Path(tmp) / f"{name}.json"
+                paths[name].write_text(json.dumps(data), encoding="utf-8")
+            original = release_version.subprocess.run
+            release_version.subprocess.run = lambda *a, **k: type("R", (), {"returncode": 0, "stderr": b""})()
+            try:
+                import contextlib, io, sys
+                out = io.StringIO()
+                argv = sys.argv
+                sys.argv = ["fork-release-version.py", "--upstream", str(paths["upstream"]), "--fork", str(paths["fork"]),
+                            "--latest", str(paths["latest"]), "--run-number", "23", "--dev"]
+                with contextlib.redirect_stdout(out):
+                    release_version.main()
+            finally:
+                sys.argv = argv
+                release_version.subprocess.run = original
+        self.assertEqual(out.getvalue().strip(), "v2026.1031.121458.23")
+
     def test_prepublication_gate_rejects_regression_equality_and_race(self):
         for latest in ("v2026.1103.100831.14.杂鱼", "v2026.1031.121458.17",
                        "v2026.1107.122135.18"):

@@ -298,6 +298,8 @@ jobs:
       release_generate_release_notes: ${{ steps.setup_release_fork.outputs.release_generate_release_notes || steps.setup_release_auto.outputs.release_generate_release_notes || steps.setup_release_manual.outputs.release_generate_release_notes }}
       release_tag: ${{ steps.setup_release_fork.outputs.release_tag || steps.setup_release_auto.outputs.release_tag || steps.setup_release_manual.outputs.release_tag }}
       release_version: ${{ steps.setup_release_fork.outputs.release_version || steps.setup_release_auto.outputs.release_version || steps.setup_release_manual.outputs.release_version }}
+      # Forks without fork_release: the lineage .dev version the binaries carry (empty: 0.0.0.<commit>).
+      build_version: ${{ steps.setup_release_fork_dev.outputs.build_version }}
     permissions:
       contents: write  # read does not work to check squash and merge details
     # Pinned: the ubuntu-latest label migrates to Ubuntu 26 (actions/runner-images#14748); move this on purpose, not by label.
@@ -406,6 +408,33 @@ jobs:
             echo "release_tag=${tag}"
             echo "release_version=${tag}"
           } >> "$GITHUB_OUTPUT"
+
+      # Forks, every other build: the same lineage version a release of this commit would get (newest reachable base, this run),
+      # marked .dev instead of .杂鱼, so the Panel and the Web UI order a test build among the releases instead of reading
+      # 0.0.0.<commit> as older than all of them. Nothing is published or gated; if the lookup fails the build keeps 0.0.0.<commit>.
+      - name: Setup Release (Fork dev version)
+        id: setup_release_fork_dev
+        if: >-
+          github.repository != 'AlkaidLab/foundation-sunshine' &&
+          !(github.event_name == 'workflow_dispatch' && inputs.fork_release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          if gh api --paginate --slurp "repos/AlkaidLab/foundation-sunshine/releases?per_page=100" > "$RUNNER_TEMP/upstream-releases.json" &&
+             gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$RUNNER_TEMP/fork-releases.json" &&
+             { gh api "repos/$GITHUB_REPOSITORY/releases/latest" > "$RUNNER_TEMP/latest-release.json" ||
+               echo '{"tag_name":"v0.0.0.0"}' > "$RUNNER_TEMP/latest-release.json"; } &&
+             tag=$(python3 scripts/fork-release-version.py --dev \
+               --upstream "$RUNNER_TEMP/upstream-releases.json" \
+               --fork "$RUNNER_TEMP/fork-releases.json" \
+               --latest "$RUNNER_TEMP/latest-release.json" \
+               --run-number "$GITHUB_RUN_NUMBER"); then
+            echo "Fork dev build version ${tag}.dev"
+            echo "build_version=${tag}.dev" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning title=Fork dev version::no release lineage found; this build is versioned 0.0.0.<commit>"
+          fi
 
       - name: Filter bot contributors
         id: filter_release_contributors
@@ -614,7 +643,8 @@ jobs:
           RTX_VIDEO_NGX_APPLICATION_ID: ${{ (github.repository == 'AlkaidLab/foundation-sunshine' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == 'AlkaidLab/foundation-sunshine')) && secrets.RTX_VIDEO_NGX_APPLICATION_ID || '' }}
           SUNSHINE_RTX_HDR: ${{ !(github.repository == 'AlkaidLab/foundation-sunshine' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == 'AlkaidLab/foundation-sunshine')) && 'OFF' || (github.event_name != 'pull_request' && github.ref == 'refs/heads/master') && 'ON' || inputs.rtx_hdr || 'AUTO' }}
           BRANCH: ${{ github.head_ref || github.ref_name }}
-          BUILD_VERSION: ${{ needs.setup_release.outputs.release_tag }}.杂鱼
+          BUILD_VERSION: ${{ needs.setup_release.outputs.build_version || format('{0}.杂鱼', needs.setup_release.outputs.release_tag) }}
+          FORK_DEV_BUILD: ${{ needs.setup_release.outputs.build_version != '' }}
           COMMIT: ${{ needs.setup_release.outputs.release_commit }}
           FORK_RELEASE: ${{ needs.setup_release.outputs.fork_release }}
           SUNSHINE_BUILD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -1072,7 +1102,8 @@ jobs:
           RTX_VIDEO_NGX_APPLICATION_ID: ${{ (github.repository == 'AlkaidLab/foundation-sunshine' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == 'AlkaidLab/foundation-sunshine')) && secrets.RTX_VIDEO_NGX_APPLICATION_ID || '' }}
           SUNSHINE_RTX_HDR: ${{ !(github.repository == 'AlkaidLab/foundation-sunshine' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == 'AlkaidLab/foundation-sunshine')) && 'OFF' || (github.event_name != 'pull_request' && github.ref == 'refs/heads/master') && 'ON' || inputs.rtx_hdr || 'AUTO' }}
           BRANCH: ${{ github.head_ref || github.ref_name }}
-          BUILD_VERSION: ${{ needs.setup_release.outputs.release_tag }}.杂鱼
+          BUILD_VERSION: ${{ needs.setup_release.outputs.build_version || format('{0}.杂鱼', needs.setup_release.outputs.release_tag) }}
+          FORK_DEV_BUILD: ${{ needs.setup_release.outputs.build_version != '' }}
           COMMIT: ${{ needs.setup_release.outputs.release_commit }}
           FORK_RELEASE: ${{ needs.setup_release.outputs.fork_release }}
           # Build identity (cmake/prep/build_info.cmake): master builds carry the full commit too. A published build is a

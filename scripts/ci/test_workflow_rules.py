@@ -89,6 +89,22 @@ class PublishTest(unittest.TestCase):
         upload = step(self.build, "Upload Artifacts")
         self.assertNotIn("publish_release", upload.get("if", ""))
 
+    def test_a_fork_test_build_carries_its_lineage_version_not_0_0_0(self):
+        # Every fork build that is not a fork release is versioned <lineage>.dev (scripts/fork-release-version.py --dev), so the
+        # Panel and the Web UI updaters never read it as older than every release; the configures and build_version.cmake take it.
+        dev = step(self.setup, "Setup Release (Fork dev version)")
+        self.assertIn("github.repository != 'AlkaidLab/foundation-sunshine'", dev["if"])
+        self.assertIn("inputs.fork_release", dev["if"])
+        self.assertIn("fork-release-version.py --dev", dev["run"])
+        self.assertIn("build_version=${tag}.dev", dev["run"])
+        self.assertEqual(self.setup["outputs"]["build_version"], "${{ steps.setup_release_fork_dev.outputs.build_version }}")
+        for job in (self.build, self.workflow["jobs"]["shard"]):
+            env = step(job, "Configure Windows")["env"]
+            self.assertTrue(env["BUILD_VERSION"].startswith("${{ needs.setup_release.outputs.build_version || "))
+            self.assertEqual(env["FORK_DEV_BUILD"], "${{ needs.setup_release.outputs.build_version != '' }}")
+        cmake = (WORKFLOW.parents[2] / "cmake" / "prep" / "build_version.cmake").read_text(encoding="utf-8")
+        self.assertIn('("$ENV{FORK_DEV_BUILD}" STREQUAL "true")', cmake)
+
 
 class ShardTest(unittest.TestCase):
     def setUp(self):
