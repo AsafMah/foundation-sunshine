@@ -33,19 +33,20 @@
   #include <windows.h>
 #endif
 
+#include <boost/log/attributes/value_extraction.hpp>
 #include <boost/log/core.hpp>
 #include <boost/log/sinks/basic_sink_backend.hpp>
 #include <boost/log/sinks/sync_frontend.hpp>
-#include <boost/log/attributes/value_extraction.hpp>
 
-#include "error_report.h"
 #include "device_facts.h"
+#include "error_report.h"
 #include "install_journal.h"
-#include "service_lifecycle.h"
+#include "log_template.h"
 #include "service.h"
+#include "service_lifecycle.h"
 #include "src/build_info.h"
-#include "src/crash/crash.h"
 #include "src/config.h"
+#include "src/crash/crash.h"
 #include "src/logging.h"
 #include "src/logging_site.h"
 #include "src/platform/common.h"
@@ -169,23 +170,6 @@ namespace telemetry {
       if (v.find("intel") != std::string::npos) return "intel";
       if (v.find("apple") != std::string::npos) return "apple";
       return v.empty() ? "" : "other";
-    }
-
-    // which part of the host a log line comes from: only a known word at the start of the line names a component
-    std::string
-    component_of(const char *message, std::size_t length) {
-      static const std::vector<std::string_view> known {
-        "config", "nvhttp", "rtsp", "stream", "video", "audio", "input", "capture", "display", "encoder", "nvenc", "webhook", "vdd", "sparxie", "upnp", "network", "clipboard", "gamepad", "tray", "process", "doctor", "pair", "nat", "mic",
-      };
-      std::string head;
-      for (std::size_t i = 0; i < length && i < 24; ++i) {
-        const auto c = static_cast<unsigned char>(message[i]);
-        if (!std::isalnum(c)) break;
-        head.push_back(static_cast<char>(std::tolower(c)));
-      }
-      for (const auto &k : known)
-        if (head == k) return head;
-      return "host";
     }
 
     // ---- device facts and the installer's journal (stage c) ------------------------------------------------------------------------------------------------
@@ -380,18 +364,23 @@ namespace telemetry {
     public:
       void
       consume(const bl::record_view &record) {
-        // runs on the thread that logged: a counter and a copy of the line, nothing else (the line is scrubbed later, on the sender thread)
         try {
           const auto severity = record.attribute_values()["Severity"].extract<int>();
-          if (!severity) return;
           const auto service = current();
-          if (!service) return;
+          if (!severity || !service) return;
           const auto message = record.attribute_values()["Message"].extract<std::string>();
-          const std::string text = message ? message.get() : std::string {};
-          // every severity goes to the short ring an anomaly excerpt is cut from; only warnings and above are tallied
-          service->note_log_line(severity.get(), text.c_str(), text.size());
+          const std::string_view text = message ? std::string_view { message.get() } : std::string_view {};
+          service->note_log_line(severity.get(), text);
           if (severity.get() < 3 || severity.get() > 5) return;
-          service->note_log(severity.get(), text.c_str(), text.size(), component_of(text.c_str(), text.size()), severity.get() >= logging::SITE_MIN_SEVERITY ? logging::site_text(record) : std::string {});
+          if (severity.get() < logging::SITE_MIN_SEVERITY) return service->note_log(severity.get(), {}, log_component_of(text));
+          const auto site = record.attribute_values()[logging::SITE_ATTRIBUTE].extract<logging::source_site_t>();
+          const auto explicit_template = record.attribute_values()[logging::MESSAGE_TEMPLATE_ATTRIBUTE].extract<std::string>();
+          std::string_view message_template;
+          if (explicit_template)
+            message_template = explicit_template.get();
+          else if (site)
+            message_template = log_template_at(site.get().file, site.get().line);
+          service->note_log(severity.get(), message_template, log_component_of(message_template), logging::site_text(record));
         }
         catch (...) {
         }
@@ -431,8 +420,10 @@ namespace telemetry {
         const bool finished = cv_.wait_for(lock, grace, [&] { return done_; });
         lock.unlock();
         if (!thread_.joinable()) return true;
-        if (finished) thread_.join();
-        else thread_.detach();
+        if (finished)
+          thread_.join();
+        else
+          thread_.detach();
         return finished;
       }
 
@@ -596,6 +587,10 @@ namespace telemetry {
       options.dir = platf::appdata() / "telemetry";
       options.endpoint = endpoint;
       options.aggregate_interval_ms = 6 * 60 * 60 * 1000;  // high-volume usage and experience records leave merged, at most every six hours and at exit
+      // Routine records leave once a day, from the install's own moment of the day, and only for a sample of the installs (default one in ten; the service's answer replaces it); crash reports, error reports and
+      // feedback do not wait for either (report_slot.h, service.h)
+      options.routine_slot = true;
+      options.sample_rate = 0.1;
       for (const char *variable : { "COMPUTERNAME", "HOSTNAME", "USERNAME", "USER", "LOGNAME" })
         if (const char *value = std::getenv(variable)) options.redact_words.emplace_back(value);
       service_deps_t deps;
@@ -710,8 +705,10 @@ namespace telemetry {
     catch (...) {
     }
     // a thread still inside a POST keeps running to its own end and still uses the runner: the runner is then left alone
-    if (finished) runner.reset();
-    else (void) runner.release();
+    if (finished)
+      runner.reset();
+    else
+      (void) runner.release();
     std::lock_guard lock { slot_mutex };
     service_slot().reset();
   }
@@ -827,6 +824,15 @@ namespace telemetry {
         { "sent_events", counts.sent_events },
         { "rejected_batches", counts.rejected_batches },
         { "failed_posts", counts.failed_posts },
+        { "sampled_out", counts.sampled_out },
+      };
+      const auto plan = service->plan();
+      out["plan"] = json {
+        { "sample_rate", plan.sample_rate },
+        { "sampled_in", plan.sampled_in },
+        { "sample_weight", plan.weight },
+        { "slot_minute_utc", plan.slot_offset_ms / 60'000 },
+        { "routine_day_done", plan.routine_day_done },
       };
     }
     return out;
@@ -838,7 +844,8 @@ namespace telemetry {
     // the events and the fields every batch carries with them: what leaves this computer, exactly (no event of the web or the panel is added here that the host would refuse)
     json out { { "events", service ? service->preview() : json::array() }, { "endpoint", endpoint() + "/v1/events" } };
     if (service) {
-      const auto context = service->context();
+      auto context = service->context();
+      context.sample_weight = service->plan().weight;  // what a sampled batch carries
       out["envelope"] = envelope_fields(context, "host", context.version);
     }
     return out;

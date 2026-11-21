@@ -1352,14 +1352,14 @@
     "vb_cable_open_devmgmt": "Ouvrir le Gestionnaire de périphériques",
     "vb_cable_install": "Installer VB-CABLE",
     "vb_cable_enable": "Activer VB-CABLE",
-    "vb_cable_install_confirm": "L’hôte télécharge le pilote VB-CABLE depuis VB-Audio, vérifie la signature de son programme d’installation et l’installe en mode silencieux avec les droits d’administrateur. Cela ajoute un périphérique audio virtuel à Windows. Continuer ?",
+    "vb_cable_install_confirm": "Le pilote audio virtuel VB-CABLE de VB-Audio va être installé. Continuer ?",
     "vb_cable_enable_confirm": "L’hôte active le périphérique VB-CABLE désactivé dans le Gestionnaire de périphériques (pnputil /enable-device). Continuer ?",
     "vb_cable_job_downloading": "Téléchargement de VB-CABLE…",
     "vb_cable_job_verifying": "Vérification de la signature…",
     "vb_cable_job_installing": "Installation de VB-CABLE…",
     "vb_cable_job_enabling": "Activation de VB-CABLE…",
     "vb_cable_err_download": "Le téléchargement a échoué. Vérifiez le réseau et réessayez, ou téléchargez-le manuellement.",
-    "vb_cable_err_signature": "Le programme d’installation n’a pas de signature valide de VB-Audio. L’installation a été arrêtée.",
+    "vb_cable_err_signature": "La vérification des fichiers d’installation de VB-CABLE a échoué. L’installation a été arrêtée.",
     "vb_cable_err_admin": "Sunshine ne s’exécute pas avec les droits d’administrateur et ne peut donc ni installer ni activer de pilotes.",
     "vb_cable_err_failed": "Échec : VB-CABLE reste indisponible. Ouvrez le Gestionnaire de périphériques ou installez-le manuellement."
   },
@@ -1451,6 +1451,10 @@
       "chip": "Client",
       "hint": "These options run in the client's input and audio path. The host does not store them; they are listed here so every option has its place.",
       "title": "Applied by the client"
+    },
+    "client_support": {
+      "needs": "Needs client support: {clients}. Other clients keep their own rate.",
+      "since": "{version} and later"
     },
     "collapse": "Collapse",
     "color": {
@@ -1591,14 +1595,25 @@
     },
     "test_panel": {
       "haptics": "HD haptics",
-      "identify": "Identify",
-      "idle": "Ready for a preview action.",
-      "note": "The native test endpoint is not wired in this build. These controls show what the selected profile would send; they never write the profile.",
-      "preview_only": "Preview only: {action}. No hardware command was sent.",
-      "stop": "Arrêter",
+      "note": "Sends a test to the controllers of the running stream: a short rumble, the light bar flashing three times, a resistance on each trigger for 1.5 s. The client has to carry out the light and the trigger as the host asks; the host cannot tell whether the client's pad did it.",
       "title": "Per-controller test",
+      "result": {
+        "sent": "Sent a short rumble to {pads} controller(s). The host cannot tell whether the client's pad moved.",
+        "no_pad": "No controller is in use: start a stream with a controller connected on the client first.",
+        "unsupported": "This system has no native DualSense path, so there is nothing to test.",
+        "busy": "The previous test is still running.",
+        "failed": "The test request failed."
+      },
+      "identify": "Identify controller",
       "trigger_left": "Left trigger",
-      "trigger_right": "Right trigger"
+      "trigger_right": "Right trigger",
+      "stop": "Stop",
+      "sent": {
+        "identify": "Asked {pads} controller(s) to flash the light bar three times. The host cannot tell whether the client's pad flashed.",
+        "trigger_left": "Asked {pads} controller(s) for a 1.5 s resistance on the left trigger. The host cannot tell whether the client's trigger resisted.",
+        "trigger_right": "Asked {pads} controller(s) for a 1.5 s resistance on the right trigger. The host cannot tell whether the client's trigger resisted.",
+        "stop": "The light, trigger and rumble tests are stopped."
+      }
     },
     "title": "DualSense host tuning",
     "trigger_preview": {

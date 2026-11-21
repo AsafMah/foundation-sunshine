@@ -1353,14 +1353,14 @@
     "vb_cable_open_devmgmt": "打开设备管理器",
     "vb_cable_install": "安装 VB-CABLE",
     "vb_cable_enable": "启用 VB-CABLE",
-    "vb_cable_install_confirm": "主机将从 VB-Audio 官网下载 VB-CABLE 驱动，校验安装程序的数字签名后，以管理员权限静默安装。安装会向 Windows 添加一个虚拟音频设备。继续吗？",
+    "vb_cable_install_confirm": "将安装由 VB-Audio 提供的 VB-CABLE 虚拟音频驱动。继续吗？",
     "vb_cable_enable_confirm": "主机将启用在设备管理器中被禁用的 VB-CABLE 设备（pnputil /enable-device）。继续吗？",
     "vb_cable_job_downloading": "正在下载 VB-CABLE…",
     "vb_cable_job_verifying": "正在校验数字签名…",
     "vb_cable_job_installing": "正在安装 VB-CABLE…",
     "vb_cable_job_enabling": "正在启用 VB-CABLE…",
     "vb_cable_err_download": "下载失败。请检查网络后重试，或手动下载。",
-    "vb_cable_err_signature": "安装程序没有 VB-Audio 的有效数字签名，已停止安装。",
+    "vb_cable_err_signature": "VB-CABLE 安装文件校验失败，已停止安装。",
     "vb_cable_err_admin": "Sunshine 没有以管理员权限运行，无法安装或启用驱动。",
     "vb_cable_err_failed": "没有成功：VB-CABLE 仍不可用。可打开设备管理器查看，或手动安装。"
   },
@@ -1501,9 +1501,9 @@
     "only_modified": "只看已修改",
     "pending": {
       "count": "{count} 项",
-      "reason": "当前版本暂未开放",
-      "title": "暂未开放",
-      "not_yet": "尚未提供"
+      "reason": "当前不可用",
+      "title": "当前不可用的设置",
+      "not_yet": "主机这边不可用"
     },
     "presets": {
       "applied": "已应用“{name}”预设，保存后生效。",
@@ -1525,26 +1525,37 @@
     "save": "保存",
     "save_failed": "保存被拒绝。",
     "save_ok": "已保存 {count} 项。",
-    "save_partial": "已保存 {applied} 项；另有 {unavailable} 项暂未开放，没有保存。",
+    "save_partial": "已保存 {applied} 项；另有 {unavailable} 项当前不可用，没有保存。",
     "saving": "保存中…",
     "search": "筛选",
-    "show_pending": "显示暂未开放的项",
+    "show_pending": "显示不可用的设置",
     "summary": {
       "absent": "当前版本不含此功能",
       "active": "{count} 个手柄正在使用",
       "idle": "没有手柄在使用",
-      "wired": "{wired} 项可调 · {pending} 项本版本尚未接入"
+      "wired": "{wired} 项可调 · {pending} 项当前不可用"
     },
     "test_panel": {
       "haptics": "触觉",
-      "identify": "识别手柄",
-      "idle": "就绪",
-      "note": "暂未开放，按钮只演示会发生什么。",
-      "preview_only": "仅演示：{action}，没有发送到手柄。",
-      "stop": "停止",
+      "note": "向正在串流的手柄发测试：短震动、灯条闪三下、左右扳机各 1.5 秒的阻力。灯条和扳机要客户端按主机的指令执行；主机无法得知客户端的手柄是否真的做了。",
       "title": "手柄测试",
+      "result": {
+        "sent": "已发出短震动（{pads} 个手柄）。客户端的手柄是否真的震动，主机无法得知。",
+        "no_pad": "没有手柄在使用：先开始串流，并让客户端连接手柄。",
+        "unsupported": "这个系统没有原生 DualSense 通道，不能测试。",
+        "busy": "上一次测试还在进行。",
+        "failed": "测试请求失败。"
+      },
+      "identify": "识别手柄",
       "trigger_left": "左扳机",
-      "trigger_right": "右扳机"
+      "trigger_right": "右扳机",
+      "stop": "停止",
+      "sent": {
+        "identify": "已请求 {pads} 个手柄把灯条闪三下。客户端的手柄是否真的闪，主机无法得知。",
+        "trigger_left": "已请求 {pads} 个手柄给左扳机一段 1.5 秒的阻力。客户端的扳机是否真的有阻力，主机无法得知。",
+        "trigger_right": "已请求 {pads} 个手柄给右扳机一段 1.5 秒的阻力。客户端的扳机是否真的有阻力，主机无法得知。",
+        "stop": "已停止灯光、扳机和震动测试。"
+      }
     },
     "title": "DualSense 手柄调校",
     "trigger_preview": {
@@ -1605,6 +1616,10 @@
       "title": "由客户端执行",
       "chip": "客户端",
       "hint": "这些选项在客户端的输入与音频路径中执行，主机不保存它们。"
+    },
+    "client_support": {
+      "needs": "需要客户端支持：{clients}；其他客户端保持自己的频率。",
+      "since": "{version} 起"
     },
     "gamepad_advanced": "手柄高级",
     "restore_confirm": "把所有 DualSense 选项恢复为默认值吗？更改保存后生效。"

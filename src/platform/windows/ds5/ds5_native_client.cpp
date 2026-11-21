@@ -55,7 +55,9 @@
 #include "src/ds5/button_map.h"
 #include "src/ds5/control_extension.h"
 #include "src/ds5/feature_reports.h"
+#include "src/ds5/mic_route.h"
 #include "src/ds5/output_fields.h"
+#include "src/ds5/pad_test.h"
 #include "src/ds5/report_delta.h"
 #include "src/ds5/rumble_policy.h"
 #include "src/ds5/rumble_test.h"
@@ -329,9 +331,10 @@ namespace platf::ds5 {
         std::copy_n(report.begin(), std::min(report.size(), seen_report.size()), seen_report.begin());
         switch (delta) {
           case ::ds5::report_delta::buttons:
+          case ::ds5::report_delta::release:
             edge_snapshots.push_back({ report[8], report[9], report[10] });
             if (edge_snapshots.size() > kMaxEdgeSnapshots) edge_snapshots.pop_front();
-            return ::platf::report_change::edge;
+            return delta == ::ds5::report_delta::release ? ::platf::report_change::release : ::platf::report_change::edge;
           case ::ds5::report_delta::stream:
             return ::platf::report_change::stream;
           case ::ds5::report_delta::none:
@@ -476,10 +479,17 @@ namespace platf::ds5 {
       ::ds5::tuning::trigger::tracker_t trigger_tracker;
       int global_index { -1 };
       int client_index { 0 };
+      std::uint16_t announced_motion_rate { 0 };  ///< the rate the client was last asked for (key 101); 0 before the first request
       std::wstring leased_serial;
       bool mute_button_down { false };
       std::optional<bool> published_mute;
       std::atomic<int> usb_capture_mute { -1 };
+      /* The client microphone on the capture endpoint (key 96).  mic_ring is written by the microphone receive thread and
+       * read by this pad's reply worker; the two flags are set by the control requests of the USB bus. */
+      ::ds5::mic_route::ring_t mic_ring;
+      std::atomic_bool mic_capturing { false };  ///< an application records: interface 2 has its alternate setting 1 selected
+      std::atomic_bool mic_muted { false };  ///< the feature unit of the microphone is muted
+      std::atomic<int> mic_served_peak { 0 };  ///< the loudest sample handed to the bus since the recording began (0..32767)
       std::atomic_bool mute_watch_stop { false };
       std::thread mute_watch;
       ::ds5::control_extension::output_t game_extension {};
@@ -487,7 +497,8 @@ namespace platf::ds5 {
       std::uint64_t sequence { 1 };
       paced_reply_queue replies { [this](std::vector<std::uint8_t> wire) { return bridge.send_reply(std::move(wire)); },
         paced_reply_queue::interrupt_config {},
-        [] { return static_cast<unsigned>(::ds5::tuning::runtime::state().active_controllers.load(std::memory_order_acquire)); } };
+        [] { return static_cast<unsigned>(::ds5::tuning::runtime::state().active_controllers.load(std::memory_order_acquire)); },
+        [] { return ::ds5::tuning::runtime::state().input_report_rate_hz.load(std::memory_order_acquire); } };
       struct pcm_counters_t {
         std::uint64_t packets {};
         std::uint64_t frames {};
@@ -808,6 +819,7 @@ namespace platf::ds5 {
         jack_bits = static_cast<std::uint8_t>((jack_bits & ~0x04u) | (muted ? 0x04u : 0u));
         report[54] = jack_bits;
         microphone.mute = muted ? 1u : 0u;
+        mic_muted.store(muted, std::memory_order_release);
         namespace ext = ::ds5::control_extension;
         game_extension.valid_mask |= ext::out_mic_mute | ext::out_mute_led;
         game_extension.mic_mute = muted ? 1u : 0u;
@@ -894,10 +906,34 @@ namespace platf::ds5 {
 
       ~native_impl() { stop(); }
 
+      /**
+       * Tell the client at what rate to report motion (key 101).  The first call after allocation always
+       * sends; later calls send when the saved rate changed, so a stream already running follows a save.
+       * Call with the lock held.
+       */
+      void
+      announce_motion_rate_locked(bool force) {
+        if (!feedback || global_index < 0 || stopping) return;
+        const auto rate = ::ds5::tuning::runtime::motion_report_rate();
+        if (!force && rate == announced_motion_rate) return;
+        announced_motion_rate = rate;
+        feedback->raise(gamepad_feedback_msg_t::make_motion_event_state(static_cast<std::uint16_t>(client_index), LI_MOTION_TYPE_ACCEL, rate));
+        feedback->raise(gamepad_feedback_msg_t::make_motion_event_state(static_cast<std::uint16_t>(client_index), LI_MOTION_TYPE_GYRO, rate));
+        trace.feedback("motion_event_state", static_cast<std::uint16_t>(client_index), 2 * sizeof(rate));
+        BOOST_LOG(info) << "Native DS5 motion report rate: pad "sv << global_index << " client number "sv << client_index << " asked for "sv << rate << " Hz"sv;
+      }
+
+      void
+      announce_motion_rate(bool force) {
+        std::lock_guard lock(mutex);
+        announce_motion_rate_locked(force);
+      }
+
       void
       push_tuning_state() {
         std::lock_guard lock(mutex);
         if (!feedback || global_index < 0 || stopping || core == nullptr) return;
+        announce_motion_rate_locked(false);
         const auto extension_before = sent_extension;
         send_extension_changes_locked();
         const bool extension_sent = !(extension_before == sent_extension);
@@ -939,6 +975,68 @@ namespace platf::ds5 {
         trace.feedback("rumble", static_cast<std::uint16_t>(client_index), sizeof(left) + sizeof(right));
         BOOST_LOG(info) << "Native DS5 rumble test: pad "sv << global_index << " client number "sv << client_index
                         << (restore ? " end"sv : " start"sv) << " left "sv << left << " right "sv << right << " (16-bit, after the saved shaping)"sv;
+        return true;
+      }
+
+      /**
+       * One step of a pad test (pad_test.h).  What the pad showed before is given back: the light bar as the
+       * tuning and the game's last colour make it, the triggers as the game holds them.
+       */
+      bool
+      test_step(::ds5::pad_test::step_e step) {
+        using ::ds5::pad_test::step_e;
+        std::lock_guard lock(mutex);
+        if (!feedback || global_index < 0 || stopping || core == nullptr) return false;
+        const auto id = static_cast<std::uint16_t>(client_index);
+        const auto send_light = [&](std::uint8_t red, std::uint8_t green, std::uint8_t blue) {
+          feedback->raise(gamepad_feedback_msg_t::make_rgb_led(id, red, green, blue));
+          trace.feedback("rgb_led", id, 3);
+        };
+        const auto send_triggers = [&](std::uint8_t flags, const ::ds5::tuning::trigger::block_t &left, const ::ds5::tuning::trigger::block_t &right) {
+          std::array<std::uint8_t, 10> left_parameters {};
+          std::array<std::uint8_t, 10> right_parameters {};
+          std::copy_n(left.data() + 1, 10, left_parameters.begin());
+          std::copy_n(right.data() + 1, 10, right_parameters.begin());
+          feedback->raise(gamepad_feedback_msg_t::make_adaptive_triggers(id, flags, left[0], right[0], left_parameters, right_parameters));
+          trace.feedback("adaptive_triggers", id, 22);
+        };
+        const auto restore_triggers = [&] {
+          trigger_tracker.forget_sent();
+          raise_trigger_plan(trigger_tracker.plan(nullptr, 0u, ::ds5::tuning::trigger::read_config()));
+        };
+        const auto restore_light = [&] {
+          std::uint8_t red {};
+          std::uint8_t green {};
+          std::uint8_t blue {};
+          ::ds5::tuning::runtime::apply_lightbar(red, green, blue, have_game_lightbar ? game_lightbar[0] : std::uint8_t { 0 },
+            have_game_lightbar ? game_lightbar[1] : std::uint8_t { 0 }, have_game_lightbar ? game_lightbar[2] : std::uint8_t { 0 });
+          lightbar_out = { red, green, blue };
+          lightbar_sent = true;
+          send_light(red, green, blue);
+        };
+        const auto off = ::ds5::tuning::trigger::off_block();
+        const auto effect = ::ds5::pad_test::trigger_test_block();
+        switch (step) {
+          case step_e::lightbar_white: send_light(255, 255, 255); break;
+          case step_e::lightbar_off: send_light(0, 0, 0); break;
+          case step_e::lightbar_restore: restore_light(); break;
+          case step_e::trigger_left_on: send_triggers(0x08u, effect, off); break;
+          case step_e::trigger_right_on: send_triggers(0x04u, off, effect); break;
+          case step_e::trigger_left_off:
+            send_triggers(0x08u, off, off);
+            restore_triggers();
+            break;
+          case step_e::trigger_right_off:
+            send_triggers(0x04u, off, off);
+            restore_triggers();
+            break;
+          case step_e::stop_all:
+            send_triggers(0x0cu, off, off);
+            restore_triggers();
+            restore_light();
+            break;
+        }
+        BOOST_LOG(info) << "Native DS5 pad test: pad "sv << global_index << " client number "sv << client_index << " step "sv << static_cast<int>(step);
         return true;
       }
 
@@ -1294,12 +1392,97 @@ namespace platf::ds5 {
         return bridge.send_reply(ret_submit(sequence_number, kPipeError, {}));
       }
 
+      /** The capture interface was selected (an application records) or released: the ring starts from nothing either way. */
+      void
+      note_capture_interface(bool on) {
+        mic_capturing.store(on, std::memory_order_release);
+        const auto before = mic_ring.stats();
+        const auto peak = mic_served_peak.exchange(0, std::memory_order_acq_rel);
+        mic_ring.flush();
+        if (on) {
+          BOOST_LOG(info) << "Native DS5 microphone: an application records from pad "sv << global_index << ", route "sv
+                          << (::ds5::tuning::runtime::state().mic_route.load(std::memory_order_acquire) == 0u ? "controller (the client microphone)"sv : "silence"sv);
+          return;
+        }
+        BOOST_LOG(info) << "Native DS5 microphone: recording from pad "sv << global_index << " ended; loudest sample on the bus "sv << peak
+                        << (mic_muted.load(std::memory_order_acquire) ? ", the endpoint is muted"sv : ""sv) << "; client audio written "sv
+                        << before.frames_written << " frames, served "sv << before.frames_served << ", discarded while idle "sv
+                        << before.frames_idle_discarded << ", trimmed "sv << before.frames_trimmed << ", dropped "sv << before.frames_dropped
+                        << ", underruns "sv << before.underruns << " ("sv << before.underrun_frames << " silent frames), average fill "sv
+                        << static_cast<int>(before.fill_average) << " frames ("sv << static_cast<int>(before.fill_average / 48.0) << " ms)"sv;
+      }
+
+      /** Called with the client microphone block (mono, 48 kHz): the route decides whether this endpoint gets it. */
+      void
+      feed_microphone(const std::int16_t *samples, std::size_t frames) {
+        if (::ds5::tuning::runtime::state().mic_route.load(std::memory_order_acquire) != 0u) return;
+        mic_ring.write(samples, frames, mic_capturing.load(std::memory_order_acquire), std::chrono::steady_clock::now());
+      }
+
+      /** The reply of an isochronous IN URB of the capture endpoint, built when its slot has ended: the freshest microphone samples. */
+      std::vector<std::uint8_t>
+      capture_reply(std::uint32_t sequence_number, std::uint32_t endpoint, std::uint32_t direction, std::uint32_t length,
+        const std::vector<std::array<std::uint32_t, 2>> &packets, const std::array<std::uint8_t, 4> &start_frame, std::array<std::uint8_t, 8> setup) {
+        const bool route_controller = ::ds5::tuning::runtime::state().mic_route.load(std::memory_order_acquire) == 0u;
+        const bool recording = mic_capturing.load(std::memory_order_acquire);
+        const bool muted = mic_muted.load(std::memory_order_acquire);
+        const auto now = std::chrono::steady_clock::now();
+        std::vector<std::uint8_t> payload;
+        std::vector<std::uint8_t> descriptors(packets.size() * 16u, 0);
+        std::array<std::int16_t, 48> mono {};
+        std::array<std::uint8_t, 192> stereo {};
+        std::uint32_t actual = 0;
+        for (std::size_t index = 0; index < packets.size(); ++index) {
+          const auto available = std::min(packets[index][1], 192u);
+          const auto frames = std::min<std::size_t>(available / 4u, mono.size());
+          if (route_controller && recording) {
+            mic_ring.serve_packet(mono.data(), frames, now);
+            int peak = 0;
+            for (std::size_t sample = 0; sample < frames; ++sample) peak = std::max(peak, std::abs(static_cast<int>(mono[sample])));
+            if (peak > mic_served_peak.load(std::memory_order_relaxed)) mic_served_peak.store(peak, std::memory_order_relaxed);
+          }
+          else {
+            /* a route that is not the client microphone leaves nothing queued for when it comes back */
+            if (!route_controller) mic_ring.flush();
+            mono.fill(0);
+          }
+          ::ds5::mic_route::to_stereo(mono.data(), frames, muted, stereo.data());
+          payload.insert(payload.end(), stereo.begin(), stereo.begin() + static_cast<std::ptrdiff_t>(frames * 4u));
+          payload.insert(payload.end(), available - static_cast<std::uint32_t>(frames * 4u), 0);
+          put_be(descriptors.data() + index * 16u, packets[index][0]);
+          put_be(descriptors.data() + index * 16u + 4, packets[index][1]);
+          put_be(descriptors.data() + index * 16u + 8, available);
+          actual += available;
+        }
+        trace.urb(sequence_number, endpoint, direction, length, 0, actual, setup, payload);
+        auto reply = ret_submit(sequence_number, 0, payload, actual, static_cast<std::uint32_t>(packets.size()), descriptors);
+        std::copy(start_frame.begin(), start_frame.end(), reply.begin() + 28);  // start_frame echoes the request
+        return reply;
+      }
+
       bool
       iso_reply(std::uint32_t sequence_number, const std::vector<std::uint8_t> &wire, bool capture) {
         const auto direction = get_be(wire.data() + 12);
         const auto length = get_be(wire.data() + 24);
         const auto count = get_be(wire.data() + 32);
         const auto payload_offset = kUsbipHeader + (direction == 0 ? length : 0u);
+        if (capture) {
+          std::vector<std::array<std::uint32_t, 2>> packets;
+          for (std::uint32_t index = 0; index < count; ++index) {
+            const auto *descriptor = wire.data() + payload_offset + index * 16u;
+            packets.push_back({ get_be(descriptor), get_be(descriptor + 4) });
+          }
+          std::array<std::uint8_t, 4> start_frame {};
+          std::copy_n(wire.data() + 28, start_frame.size(), start_frame.begin());
+          std::array<std::uint8_t, 8> setup {};
+          std::copy_n(wire.data() + 40, setup.size(), setup.begin());
+          const auto endpoint = get_be(wire.data() + 16);
+          replies.schedule_iso_lazy(paced_reply_queue::lane::iso_in, sequence_number, count, std::chrono::milliseconds(1),
+            [this, sequence_number, endpoint, direction, length, packets = std::move(packets), start_frame, setup]() {
+              return capture_reply(sequence_number, endpoint, direction, length, packets, start_frame, setup);
+            });
+          return true;
+        }
         std::vector<std::uint8_t> payload;
         std::vector<std::uint8_t> descriptors(static_cast<std::size_t>(count) * 16u, 0);
         std::uint32_t actual = 0;
@@ -1307,19 +1490,16 @@ namespace platf::ds5 {
           const auto *descriptor = wire.data() + payload_offset + index * 16u;
           const auto offset = get_be(descriptor);
           const auto packet_length = get_be(descriptor + 4);
-          const auto available = std::min(packet_length, 192u);
           put_be(descriptors.data() + index * 16u, offset);
           put_be(descriptors.data() + index * 16u + 4, packet_length);
-          put_be(descriptors.data() + index * 16u + 8, capture ? available : packet_length);
-          if (capture) payload.insert(payload.end(), available, 0);
-          actual += capture ? available : packet_length;
+          put_be(descriptors.data() + index * 16u + 8, packet_length);
+          actual += packet_length;
         }
         trace.urb(sequence_number, get_be(wire.data() + 16), direction, length, 0, actual,
           std::span<const std::uint8_t>(wire.data() + 40, 8), payload);
         auto reply = ret_submit(sequence_number, 0, payload, actual, count, descriptors);
         std::copy_n(wire.data() + 28, 4, reply.data() + 28);  // start_frame echoes the request
-        replies.schedule_iso(capture ? paced_reply_queue::lane::iso_in : paced_reply_queue::lane::iso_out,
-          sequence_number, count, std::move(reply));
+        replies.schedule_iso(paced_reply_queue::lane::iso_out, sequence_number, count, std::move(reply));
         return true;
       }
 
@@ -1446,7 +1626,10 @@ namespace platf::ds5 {
             const auto input_value = data_length >= 2 ? static_cast<int32_t>(static_cast<int16_t>(get_le16(data))) :
                                                         (data_length == 1 ? data[0] : 0);
             if (alk_usbip_uac_feature_set(&unit, control, input_value) != ALK_USBIP_OK) return stall(sequence_number);
-            if (&unit == &microphone && control == 1) usb_capture_mute.store(input_value != 0 ? 1 : 0, std::memory_order_release);
+            if (&unit == &microphone && control == 1) {
+              usb_capture_mute.store(input_value != 0 ? 1 : 0, std::memory_order_release);
+              mic_muted.store(input_value != 0, std::memory_order_release);
+            }
             reply = {};
           }
         }
@@ -1457,6 +1640,8 @@ namespace platf::ds5 {
           reply = { 1 };
         }
         else if (request == 11 && !in) {
+          /* SET_INTERFACE.  Interface 2 is the microphone: alternate setting 1 means an application records. */
+          if ((index & 0xffu) == 2u) note_capture_interface(value != 0);
           reply = {};
         }
         else if (request == 10 && in) {
@@ -1506,6 +1691,20 @@ namespace platf::ds5 {
       return pads;
     }
 
+    unsigned
+    test_step_all(::ds5::pad_test::step_e step) {
+      std::lock_guard lock(live_clients_mutex);
+      unsigned pads = 0;
+      for (auto *client : live_clients) pads += client->test_step(step);
+      return pads;
+    }
+
+    void
+    feed_microphone_all(const std::int16_t *samples, std::size_t frames) {
+      std::lock_guard lock(live_clients_mutex);
+      for (auto *client : live_clients) client->feed_microphone(samples, frames);
+    }
+
     void
     push_saved_lightbar() {
       std::lock_guard lock(live_clients_mutex);
@@ -1522,6 +1721,8 @@ namespace platf::ds5 {
     }
     ::ds5::tuning::runtime::published_handler().store(&push_saved_lightbar, std::memory_order_release);
     ::ds5::rumble_test::handler().store(&test_rumble_all, std::memory_order_release);
+    ::ds5::mic_route::handler().store(&feed_microphone_all, std::memory_order_release);
+    ::ds5::pad_test::handler().store(&test_step_all, std::memory_order_release);
   }
   native_client_t::~native_client_t() {
     std::lock_guard lock(live_clients_mutex);
@@ -1531,6 +1732,22 @@ namespace platf::ds5 {
   native_client_t::push_tuning_state() {
     std::shared_lock registry(_impl->registry);
     for (const auto &controller : _impl->controllers) controller->push_tuning_state();
+  }
+  void
+  native_client_t::feed_microphone(const std::int16_t *samples, std::size_t frames) {
+    std::shared_lock registry(_impl->registry);
+    for (const auto &controller : _impl->controllers) controller->feed_microphone(samples, frames);
+  }
+  unsigned
+  native_client_t::test_step(::ds5::pad_test::step_e step) {
+    std::shared_lock registry(_impl->registry);
+    unsigned pads = 0;
+    for (const auto &controller : _impl->controllers) {
+      if (!controller->test_step(step)) continue;
+      ++pads;
+      if (step == ::ds5::pad_test::step_e::stop_all) controller->test_rumble(0, 0, true);
+    }
+    return pads;
   }
   unsigned
   native_client_t::test_rumble(std::uint8_t left, std::uint8_t right, bool restore) {
@@ -1555,10 +1772,15 @@ namespace platf::ds5 {
     }
     auto controller = std::make_unique<native_impl>();
     if (!controller->start(id, std::move(queue), audio_haptics)) return -1;
-    std::unique_lock registry(_impl->registry);
-    _impl->controllers.push_back(std::move(controller));
-    published_audio_haptics.store(audio_haptics || published_audio_haptics.load(boost::memory_order_relaxed),
-      boost::memory_order_release);
+    auto *const pad = controller.get();
+    {
+      std::unique_lock registry(_impl->registry);
+      _impl->controllers.push_back(std::move(controller));
+      published_audio_haptics.store(audio_haptics || published_audio_haptics.load(boost::memory_order_relaxed),
+        boost::memory_order_release);
+    }
+    /* The first request for motion reports at the saved rate (key 101); allocation and release run on the input thread. */
+    pad->announce_motion_rate(true);
     return 0;
   }
 

@@ -1352,14 +1352,14 @@
     "vb_cable_open_devmgmt": "Open Device Manager",
     "vb_cable_install": "Install VB-CABLE",
     "vb_cable_enable": "Enable VB-CABLE",
-    "vb_cable_install_confirm": "The host downloads the VB-CABLE driver from VB-Audio, checks the signature of its setup program and installs it silently with administrator rights. This adds a virtual audio device to Windows. Continue?",
+    "vb_cable_install_confirm": "The VB-CABLE virtual audio driver from VB-Audio will be installed. Continue?",
     "vb_cable_enable_confirm": "The host enables the VB-CABLE device that is disabled in Device Manager (pnputil /enable-device). Continue?",
     "vb_cable_job_downloading": "Downloading VB-CABLE…",
     "vb_cable_job_verifying": "Checking the signature…",
     "vb_cable_job_installing": "Installing VB-CABLE…",
     "vb_cable_job_enabling": "Enabling VB-CABLE…",
     "vb_cable_err_download": "The download failed. Check the network and try again, or download it manually.",
-    "vb_cable_err_signature": "The setup program is not validly signed by VB-Audio. Installation was stopped.",
+    "vb_cable_err_signature": "Verification of the VB-CABLE installation files failed. Installation was stopped.",
     "vb_cable_err_admin": "Sunshine is not running with administrator rights, so it cannot install or enable drivers.",
     "vb_cable_err_failed": "That did not work: VB-CABLE is still unavailable. Open Device Manager to look, or install it manually."
   },
@@ -1451,6 +1451,10 @@
       "hint": "These options run in the client's input and audio path. The host does not store them.",
       "title": "Applied by the client"
     },
+    "client_support": {
+      "needs": "Needs client support: {clients}. Other clients keep their own rate.",
+      "since": "{version} and later"
+    },
     "collapse": "Hide",
     "color": {
       "blue": "Blue",
@@ -1525,9 +1529,9 @@
     "only_modified": "Changed only",
     "pending": {
       "count": "{count} options",
-      "not_yet": "Not available yet",
-      "reason": "Not available in this version",
-      "title": "Not available yet"
+      "not_yet": "Unavailable on the host",
+      "reason": "Unavailable",
+      "title": "Unavailable settings"
     },
     "pergame": {
       "conflict": "The list changed elsewhere; reloaded.",
@@ -1574,7 +1578,7 @@
     "save": "Save",
     "save_failed": "The update was rejected.",
     "save_ok": "Saved {count} option(s).",
-    "save_partial": "Saved {applied}; {unavailable} not available yet and left unchanged.",
+    "save_partial": "Saved {applied}; {unavailable} unavailable and left unchanged.",
     "saving": "Saving…",
     "search": "Filter",
     "show_pending": "Show unavailable",
@@ -1582,21 +1586,32 @@
       "absent": "Not included in this build",
       "active": "{count} controller(s) in use",
       "idle": "No controller in use",
-      "wired": "{wired} adjustable · {pending} not connected in this build yet"
+      "wired": "{wired} adjustable · {pending} unavailable"
     },
     "test": {
       "open_tool": "Open the controller test tool"
     },
     "test_panel": {
       "haptics": "Haptics",
-      "identify": "Identify",
-      "idle": "Ready",
-      "note": "Not available yet; the buttons only show what would happen.",
-      "preview_only": "Preview only: {action}. Nothing was sent.",
-      "stop": "Stop",
+      "note": "Sends a test to the controllers of the running stream: a short rumble, the light bar flashing three times, a resistance on each trigger for 1.5 s. The client has to carry out the light and the trigger as the host asks; the host cannot tell whether the client's pad did it.",
       "title": "Controller test",
+      "result": {
+        "sent": "Sent a short rumble to {pads} controller(s). The host cannot tell whether the client's pad moved.",
+        "no_pad": "No controller is in use: start a stream with a controller connected on the client first.",
+        "unsupported": "This system has no native DualSense path, so there is nothing to test.",
+        "busy": "The previous test is still running.",
+        "failed": "The test request failed."
+      },
+      "identify": "Identify controller",
       "trigger_left": "Left trigger",
-      "trigger_right": "Right trigger"
+      "trigger_right": "Right trigger",
+      "stop": "Stop",
+      "sent": {
+        "identify": "Asked {pads} controller(s) to flash the light bar three times. The host cannot tell whether the client's pad flashed.",
+        "trigger_left": "Asked {pads} controller(s) for a 1.5 s resistance on the left trigger. The host cannot tell whether the client's trigger resisted.",
+        "trigger_right": "Asked {pads} controller(s) for a 1.5 s resistance on the right trigger. The host cannot tell whether the client's trigger resisted.",
+        "stop": "The light, trigger and rumble tests are stopped."
+      }
     },
     "title": "DualSense tuning",
     "trigger_preview": {

@@ -1352,14 +1352,14 @@
     "vb_cable_open_devmgmt": "Otevřít Správce zařízení",
     "vb_cable_install": "Nainstalovat VB-CABLE",
     "vb_cable_enable": "Povolit VB-CABLE",
-    "vb_cable_install_confirm": "Hostitel stáhne ovladač VB-CABLE od VB-Audio, zkontroluje podpis jeho instalačního programu a tiše jej nainstaluje s právy správce. Do Windows se tím přidá virtuální zvukové zařízení. Pokračovat?",
+    "vb_cable_install_confirm": "Bude nainstalován virtuální zvukový ovladač VB-CABLE od VB-Audio. Pokračovat?",
     "vb_cable_enable_confirm": "Hostitel povolí zařízení VB-CABLE, které je ve Správci zařízení zakázané (pnputil /enable-device). Pokračovat?",
     "vb_cable_job_downloading": "Stahování VB-CABLE…",
     "vb_cable_job_verifying": "Kontrola podpisu…",
     "vb_cable_job_installing": "Instalace VB-CABLE…",
     "vb_cable_job_enabling": "Povolování VB-CABLE…",
     "vb_cable_err_download": "Stahování selhalo. Zkontrolujte síť a zkuste to znovu, nebo stáhněte ručně.",
-    "vb_cable_err_signature": "Instalační program nemá platný podpis VB-Audio. Instalace byla zastavena.",
+    "vb_cable_err_signature": "Ověření instalačních souborů VB-CABLE selhalo. Instalace byla zastavena.",
     "vb_cable_err_admin": "Sunshine neběží s právy správce, a proto nemůže instalovat ani povolovat ovladače.",
     "vb_cable_err_failed": "Nepodařilo se: VB-CABLE je stále nedostupný. Otevřete Správce zařízení, nebo jej nainstalujte ručně."
   },
@@ -1451,6 +1451,10 @@
       "chip": "Klient",
       "hint": "These options run in the client's input and audio path. The host does not store them; they are listed here so every option has its place.",
       "title": "Aplikováno klientem"
+    },
+    "client_support": {
+      "needs": "Needs client support: {clients}. Other clients keep their own rate.",
+      "since": "{version} and later"
     },
     "collapse": "Collapse",
     "color": {
@@ -1591,14 +1595,25 @@
     },
     "test_panel": {
       "haptics": "HD haptics",
-      "identify": "Identifikovat",
-      "idle": "Ready for a preview action.",
-      "note": "The native test endpoint is not wired in this build. These controls show what the selected profile would send; they never write the profile.",
-      "preview_only": "Preview only: {action}. No hardware command was sent.",
-      "stop": "Zastavit",
+      "note": "Sends a test to the controllers of the running stream: a short rumble, the light bar flashing three times, a resistance on each trigger for 1.5 s. The client has to carry out the light and the trigger as the host asks; the host cannot tell whether the client's pad did it.",
       "title": "Per-controller test",
-      "trigger_left": "Levý spínač",
-      "trigger_right": "Pravý spínač"
+      "result": {
+        "sent": "Sent a short rumble to {pads} controller(s). The host cannot tell whether the client's pad moved.",
+        "no_pad": "No controller is in use: start a stream with a controller connected on the client first.",
+        "unsupported": "This system has no native DualSense path, so there is nothing to test.",
+        "busy": "The previous test is still running.",
+        "failed": "The test request failed."
+      },
+      "identify": "Identify controller",
+      "trigger_left": "Left trigger",
+      "trigger_right": "Right trigger",
+      "stop": "Stop",
+      "sent": {
+        "identify": "Asked {pads} controller(s) to flash the light bar three times. The host cannot tell whether the client's pad flashed.",
+        "trigger_left": "Asked {pads} controller(s) for a 1.5 s resistance on the left trigger. The host cannot tell whether the client's trigger resisted.",
+        "trigger_right": "Asked {pads} controller(s) for a 1.5 s resistance on the right trigger. The host cannot tell whether the client's trigger resisted.",
+        "stop": "The light, trigger and rumble tests are stopped."
+      }
     },
     "title": "DualSense host tuning",
     "trigger_preview": {

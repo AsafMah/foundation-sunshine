@@ -301,11 +301,11 @@ namespace platf::dxgi {
   }
 
   class d3d_base_encode_device final {
-    // HLG encoding parameters. Keep the layout in sync with the shader cbuffer.
+    // Keep the layout in sync with hdr_encoding_params.hlsl.
     struct alignas(16) HdrEncodingParams {
       float nominalPeakNits;
       float hlgSystemGamma;
-      float padding[2] {};
+      uint32_t sdrOutputPrimaries;
     };
     static_assert(sizeof(HdrEncodingParams) == 16);
 
@@ -606,11 +606,9 @@ namespace platf::dxgi {
         auto draw = [&](auto &input, auto &y_or_yuv_viewports, auto &uv_viewport) {
           device_ctx->PSSetShaderResources(0, 1, &input);
 
-          // Restore HLG parameters after any pre-encode filter used this context.
-          if (hdr_encoding_cbuf) {
-            ID3D11Buffer *hdr_params = hdr_encoding_cbuf.get();
-            device_ctx->PSSetConstantBuffers(3, 1, &hdr_params);
-          }
+          // A filter may have used b3. An unbound buffer selects ordinary SDR.
+          ID3D11Buffer *hdr_params = hdr_encoding_cbuf.get();
+          device_ctx->PSSetConstantBuffers(3, 1, &hdr_params);
 
           // Select the correct pixel shader based on image gamma type:
           // - linear_gamma AND FP16 format: Use FP16 shader that applies transfer function
@@ -760,14 +758,13 @@ namespace platf::dxgi {
     }
 
     int
-    configure_hdr_encoding(bool use_hlg_shader, bool is_probe) {
+    configure_hdr_encoding(const ::video::sunshine_colorspace_t &colorspace, bool is_probe) {
       hdr_encoding_cbuf.reset();
       hdr_nominal_peak_nits = 1000.0f;
-      ID3D11Buffer *null_cbuf = nullptr;
-      device_ctx->PSSetConstantBuffers(3, 1, &null_cbuf);
 
       float analysis_max_nits = 10000.0f;
-      if (use_hlg_shader) {
+      HdrEncodingParams params {};
+      if (::video::colorspace_is_hlg(colorspace)) {
         SS_HDR_METADATA metadata {};
         // Use the effective capture-display metadata as the single source of
         // truth. VDD reports the client-mapped capabilities here; a physical
@@ -779,17 +776,8 @@ namespace platf::dxgi {
                                   static_cast<float>(metadata.maxDisplayLuminance) : 1000.0f;
         hdr_nominal_peak_nits = peak_nits;
         const float system_gamma = ::video::hlg_system_gamma(peak_nits);
-        const HdrEncodingParams params { peak_nits, system_gamma, {} };
-
-        auto hdr_params = make_buffer(device.get(), params);
-        if (!hdr_params) {
-          BOOST_LOG(error) << "Failed to create HLG encoding parameter buffer";
-          return -1;
-        }
-
-        ID3D11Buffer *hdr_params_p = hdr_params.get();
-        device_ctx->PSSetConstantBuffers(3, 1, &hdr_params_p);
-        hdr_encoding_cbuf = std::move(hdr_params);
+        params.nominalPeakNits = peak_nits;
+        params.hlgSystemGamma = system_gamma;
         // Vivid statistics must describe the encoded HLG range, not scRGB
         // headroom that cannot be represented by the nominal HLG signal.
         analysis_max_nits = std::min(peak_nits, 10000.0f);
@@ -800,6 +788,20 @@ namespace platf::dxgi {
                 ? " (capture display metadata)"
                 : " (1000-nit fallback)");
       }
+      else if (!::video::colorspace_is_hdr(colorspace) && display->is_hdr()) {
+        // The Method B input is absolute scRGB. Windows has already applied
+        // its SDR white setting to any SDR windows in the captured desktop.
+        params.sdrOutputPrimaries = ::video::avcodec_colorspace_from_sunshine_colorspace(colorspace).primaries;
+      }
+      if (params.nominalPeakNits > 0 || params.sdrOutputPrimaries != 0) {
+        hdr_encoding_cbuf = make_buffer(device.get(), params);
+        if (!hdr_encoding_cbuf) {
+          BOOST_LOG(error) << "Failed to create HDR conversion parameter buffer";
+          return -1;
+        }
+      }
+      ID3D11Buffer *hdr_params = hdr_encoding_cbuf.get();
+      device_ctx->PSSetConstantBuffers(3, 1, &hdr_params);
 
       hdr_analysis_max_nits = analysis_max_nits;
       if (hdr_analysis_enabled) {
@@ -909,7 +911,7 @@ namespace platf::dxgi {
       const bool use_pq_shader = ::video::colorspace_is_pq(colorspace);
       const bool use_hlg_shader = ::video::colorspace_is_hlg(colorspace);
 
-      if (configure_hdr_encoding(use_hlg_shader, is_probe) != 0) {
+      if (configure_hdr_encoding(colorspace, is_probe) != 0) {
         return -1;
       }
 
@@ -1781,14 +1783,22 @@ namespace platf::dxgi {
     void
     apply_nr_request() {
       const auto requested = ::video::requested_nr_settings(runtime_status_id);
-      if (!requested || (requested->enabled == runtime_status.nr_requested_enabled &&
+      // A component-unavailable degradation can clear without a new request:
+      // the selection may be enabled or maintenance may finish. Keep
+      // re-evaluating that case on later frames; the retry is a cheap
+      // validated-pointer acquire and skips DLL work while it still fails.
+      const bool retry_unavailable_component = requested && requested->enabled &&
+        runtime_status.nr_state == "degraded" &&
+        runtime_status.nr_failure_reason == "component_unavailable";
+      if (!requested || (!retry_unavailable_component &&
+          (requested->enabled == runtime_status.nr_requested_enabled &&
           requested->scale_percent == nr_filter_config.nr_scale_percent &&
           requested->intensity == nr_filter_config.nr_intensity &&
           requested->ui_correction == nr_filter_config.nr_ui_correction &&
           requested->motion_quality == nr_filter_config.nr_motion_quality &&
           requested->style == nr_filter_config.nr_style &&
           requested->skin_structure_strength == nr_filter_config.nr_skin_structure_strength &&
-          requested->auto_mask == nr_filter_config.nr_auto_mask)) return;
+          requested->auto_mask == nr_filter_config.nr_auto_mask))) return;
       nr_rollback_pending = requested->enabled && runtime_status.nr_state == "active";
       nr_attempt_request = *requested;
       nr_previous_request = { true, runtime_status.nr_scale_percent, runtime_status.nr_intensity,
@@ -1825,7 +1835,9 @@ namespace platf::dxgi {
         ::video::update_hdr_pipeline_status(runtime_status_id, runtime_status);
         return;
       }
-      ::video::update_hdr_pipeline_status(runtime_status_id, runtime_status);
+      if (!retry_unavailable_component) {
+        ::video::update_hdr_pipeline_status(runtime_status_id, runtime_status);
+      }
 
       if (!nr_session_backend) nr_session_backend = image_enhancement::manager().acquire_selected(image_enhancement::backend_capability_e::nr);
       enhancement_backend = nr_session_backend;
@@ -1833,7 +1845,11 @@ namespace platf::dxgi {
         runtime_status.nr_state = "degraded";
         runtime_status.nr_failure_reason = "component_unavailable";
         rollback_failed_nr_request();
-        ::video::update_hdr_pipeline_status(runtime_status_id, runtime_status);
+        // The retry path entered with this exact degraded status; do not
+        // republish identical content on every frame.
+        if (!retry_unavailable_component) {
+          ::video::update_hdr_pipeline_status(runtime_status_id, runtime_status);
+        }
         return;
       }
       pre_encode_filter = make_pre_encode_filter(pre_encode_filter_e::external_neural_enhancement,
@@ -3113,10 +3129,8 @@ namespace platf::dxgi {
       };
       const UINT cbuf_count = write_hdr_analysis_snapshot ? 3 : 2;
       device_ctx->CSSetConstantBuffers(0, cbuf_count, cbufs);
-      if (hdr_encoding_cbuf) {
-        ID3D11Buffer *hdr_params = hdr_encoding_cbuf.get();
-        device_ctx->CSSetConstantBuffers(3, 1, &hdr_params);
-      }
+      ID3D11Buffer *hdr_params = hdr_encoding_cbuf.get();
+      device_ctx->CSSetConstantBuffers(3, 1, &hdr_params);
 
       // The scaled snapshot shader converts all pixels in one analysis cell per thread.
       if (write_hdr_analysis_snapshot && cs_is_scaled) {
@@ -4039,6 +4053,12 @@ namespace platf::dxgi {
       return -1;
     }
 
+    // dxgi::init() returns -1 when a required shader did not compile and the host goes on without a working capture (main.cpp "Platform failed to initialize"):
+    // the encoder probe then reached these blobs as null pointers (11-19 crash reports, EXCEPTION_ACCESS_VIOLATION in init_cursor_pipeline). Fail the display instead.
+    if (!cursor_vs_hlsl) {
+      BOOST_LOG(error) << "Shader cursor_vs_hlsl was not compiled"sv;
+      return -1;
+    }
     status = device->CreateVertexShader(cursor_vs_hlsl->GetBufferPointer(), cursor_vs_hlsl->GetBufferSize(), nullptr, &cursor_vs);
     if (status) {
       BOOST_LOG(error) << "Failed to create scene vertex shader [0x"sv << util::hex(status).to_string_view() << ']';
@@ -4058,6 +4078,10 @@ namespace platf::dxgi {
 
     if (config.dynamicRange && is_hdr()) {
       // This shader will normalize scRGB white levels to a user-defined white level
+      if (!cursor_ps_normalize_white_hlsl) {
+        BOOST_LOG(error) << "Shader cursor_ps_normalize_white_hlsl was not compiled"sv;
+        return -1;
+      }
       status = device->CreatePixelShader(cursor_ps_normalize_white_hlsl->GetBufferPointer(), cursor_ps_normalize_white_hlsl->GetBufferSize(), nullptr, &cursor_ps);
       if (status) {
         BOOST_LOG(error) << "Failed to create cursor blending (normalized white) pixel shader [0x"sv << util::hex(status).to_string_view() << ']';
@@ -4076,6 +4100,10 @@ namespace platf::dxgi {
       cursor_white_normalization_enabled = true;
     }
     else {
+      if (!cursor_ps_hlsl) {
+        BOOST_LOG(error) << "Shader cursor_ps_hlsl was not compiled"sv;
+        return -1;
+      }
       status = device->CreatePixelShader(cursor_ps_hlsl->GetBufferPointer(), cursor_ps_hlsl->GetBufferSize(), nullptr, &cursor_ps);
       if (status) {
         BOOST_LOG(error) << "Failed to create cursor blending pixel shader [0x"sv << util::hex(status).to_string_view() << ']';
@@ -4189,6 +4217,10 @@ namespace platf::dxgi {
       return -1;
     }
 
+    if (!simple_cursor_vs_hlsl || !simple_cursor_ps_hlsl) {
+      BOOST_LOG(error) << "Shader "sv << (simple_cursor_vs_hlsl ? "simple_cursor_ps_hlsl"sv : "simple_cursor_vs_hlsl"sv) << " was not compiled"sv;
+      return -1;
+    }
     auto status = device->CreateVertexShader(simple_cursor_vs_hlsl->GetBufferPointer(), simple_cursor_vs_hlsl->GetBufferSize(), nullptr, &cursor_vs);
     if (status) {
       BOOST_LOG(error) << "Failed to create simple cursor vertex shader [0x"sv << util::hex(status).to_string_view() << ']';

@@ -1352,14 +1352,14 @@
     "vb_cable_open_devmgmt": "Abrir el Administrador de dispositivos",
     "vb_cable_install": "Instalar VB-CABLE",
     "vb_cable_enable": "Habilitar VB-CABLE",
-    "vb_cable_install_confirm": "El host descarga el controlador VB-CABLE de VB-Audio, comprueba la firma de su programa de instalación y lo instala en silencio con permisos de administrador. Esto añade un dispositivo de audio virtual a Windows. ¿Continuar?",
+    "vb_cable_install_confirm": "Se instalará el controlador de audio virtual VB-CABLE de VB-Audio. ¿Continuar?",
     "vb_cable_enable_confirm": "El host habilita el dispositivo VB-CABLE que está deshabilitado en el Administrador de dispositivos (pnputil /enable-device). ¿Continuar?",
     "vb_cable_job_downloading": "Descargando VB-CABLE…",
     "vb_cable_job_verifying": "Comprobando la firma…",
     "vb_cable_job_installing": "Instalando VB-CABLE…",
     "vb_cable_job_enabling": "Habilitando VB-CABLE…",
     "vb_cable_err_download": "La descarga falló. Comprueba la red e inténtalo de nuevo, o descárgalo manualmente.",
-    "vb_cable_err_signature": "El programa de instalación no tiene una firma válida de VB-Audio. Se detuvo la instalación.",
+    "vb_cable_err_signature": "Falló la verificación de los archivos de instalación de VB-CABLE. Se detuvo la instalación.",
     "vb_cable_err_admin": "Sunshine no se ejecuta con permisos de administrador, por lo que no puede instalar ni habilitar controladores.",
     "vb_cable_err_failed": "No funcionó: VB-CABLE sigue sin estar disponible. Abre el Administrador de dispositivos o instálalo manualmente."
   },
@@ -1451,6 +1451,10 @@
       "chip": "Cliente",
       "hint": "These options run in the client's input and audio path. The host does not store them; they are listed here so every option has its place.",
       "title": "Applied by the client"
+    },
+    "client_support": {
+      "needs": "Needs client support: {clients}. Other clients keep their own rate.",
+      "since": "{version} and later"
     },
     "collapse": "Collapse",
     "color": {
@@ -1591,14 +1595,25 @@
     },
     "test_panel": {
       "haptics": "HD haptics",
-      "identify": "Identify",
-      "idle": "Ready for a preview action.",
-      "note": "The native test endpoint is not wired in this build. These controls show what the selected profile would send; they never write the profile.",
-      "preview_only": "Preview only: {action}. No hardware command was sent.",
-      "stop": "Detener",
+      "note": "Sends a test to the controllers of the running stream: a short rumble, the light bar flashing three times, a resistance on each trigger for 1.5 s. The client has to carry out the light and the trigger as the host asks; the host cannot tell whether the client's pad did it.",
       "title": "Per-controller test",
+      "result": {
+        "sent": "Sent a short rumble to {pads} controller(s). The host cannot tell whether the client's pad moved.",
+        "no_pad": "No controller is in use: start a stream with a controller connected on the client first.",
+        "unsupported": "This system has no native DualSense path, so there is nothing to test.",
+        "busy": "The previous test is still running.",
+        "failed": "The test request failed."
+      },
+      "identify": "Identify controller",
       "trigger_left": "Left trigger",
-      "trigger_right": "Right trigger"
+      "trigger_right": "Right trigger",
+      "stop": "Stop",
+      "sent": {
+        "identify": "Asked {pads} controller(s) to flash the light bar three times. The host cannot tell whether the client's pad flashed.",
+        "trigger_left": "Asked {pads} controller(s) for a 1.5 s resistance on the left trigger. The host cannot tell whether the client's trigger resisted.",
+        "trigger_right": "Asked {pads} controller(s) for a 1.5 s resistance on the right trigger. The host cannot tell whether the client's trigger resisted.",
+        "stop": "The light, trigger and rumble tests are stopped."
+      }
     },
     "title": "DualSense host tuning",
     "trigger_preview": {

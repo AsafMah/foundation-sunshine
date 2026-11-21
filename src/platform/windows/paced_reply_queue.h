@@ -71,10 +71,13 @@ namespace platf {
     /**
      * @param active_pads How many pads share the reply budget (the stream floor of
      *                    every pad grows with it); null counts as one.
+     * @param rate_cap_hz The most replies per second the user allows a pad (0 or null: no cap); the
+     *                    interrupt lane keeps every reply at least 1 / cap after the previous one.
      */
-    paced_reply_queue(send_t send, interrupt_config config, std::function<unsigned()> active_pads = {}):
+    paced_reply_queue(send_t send, interrupt_config config, std::function<unsigned()> active_pads = {}, std::function<unsigned()> rate_cap_hz = {}):
         send_(std::move(send)),
-        active_pads_(std::move(active_pads)) {
+        active_pads_(std::move(active_pads)),
+        rate_cap_hz_(std::move(rate_cap_hz)) {
       for (auto &lane_state : interrupt_) lane_state = interrupt_lane_t(config);
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
   #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -145,8 +148,12 @@ namespace platf {
     void
     schedule_interrupt(lane which, std::uint32_t sequence, interrupt_wire_t make_wire) {
       std::lock_guard lock(mutex_);
-      interrupt_[static_cast<std::size_t>(which)].hold(sequence, std::move(make_wire));
-      SetEvent(wake_);
+      auto &lane_state = interrupt_[static_cast<std::size_t>(which)];
+      const bool was_empty = lane_state.held() == 0;
+      lane_state.hold(sequence, std::move(make_wire));
+      /* The due time of a held reply does not depend on which URB it answers, so another URB
+       * behind one that is already held needs no wake of the worker. */
+      if (was_empty) SetEvent(wake_);
     }
 
     /**
@@ -165,7 +172,7 @@ namespace platf {
       const bool had_edge = lane_state.pending_edges() != 0;
       const bool was_dirty = lane_state.dirty();
       lane_state.new_data(change);
-      const bool earlier = change == report_change::edge ? !had_edge : !had_edge && !was_dirty;
+      const bool earlier = change != report_change::stream ? !had_edge : !had_edge && !was_dirty;
       if (earlier && lane_state.held() != 0) SetEvent(wake_);
     }
 
@@ -242,6 +249,9 @@ namespace platf {
             send_(node.mapped().make_wire());
           }
           const auto active = pads();
+          const auto cap = rate_cap_hz_ ? rate_cap_hz_() : 0u;
+          const auto floor = cap == 0u ? clock::duration::zero() : std::chrono::duration_cast<clock::duration>(std::chrono::seconds(1)) / cap;
+          for (auto &lane_state : interrupt_) lane_state.set_floor(floor);
           for (auto &lane_state : interrupt_) {
             /* Taking a reply starts the next interval, so at most one leaves per call. */
             if (auto taken = lane_state.take_if_due(clock::now(), active)) send_(taken->item(taken->edge));
@@ -251,10 +261,17 @@ namespace platf {
           for (const auto &lane_state : interrupt_) {
             if (const auto due = lane_state.next_due(active); due && (!wake || *due < *wake)) wake = *due;
           }
-          if (!wake)
-            CancelWaitableTimer(timer_);
-          else
-            arm_timer(*wake - clock::now());
+          /* A wake caused by an event, not by the timer, usually leaves the due time where it was:
+           * the timer is then still armed for it and is not set again. */
+          const auto now = clock::now();
+          if (!wake) {
+            if (armed_) CancelWaitableTimer(timer_);
+            armed_.reset();
+          }
+          else if (!armed_ || *armed_ != *wake || *armed_ <= now) {
+            arm_timer(*wake - now);
+            armed_ = *wake;
+          }
         }
         WaitForMultipleObjects(static_cast<DWORD>(handles.size()), handles.data(), FALSE, INFINITE);
       }
@@ -262,10 +279,12 @@ namespace platf {
 
     send_t send_;
     std::function<unsigned()> active_pads_;
+    std::function<unsigned()> rate_cap_hz_;
     mutable std::mutex mutex_;
     std::multimap<clock::time_point, item_t> items_;
     std::array<clock::time_point, static_cast<std::size_t>(lane::count_)> next_free_ {};
     std::array<interrupt_lane_t, static_cast<std::size_t>(lane::count_)> interrupt_;
+    std::optional<clock::time_point> armed_;  ///< the time the timer is set for, while it is armed
     bool stop_ { false };
     bool high_resolution_ { false };
     HANDLE wake_ { nullptr };

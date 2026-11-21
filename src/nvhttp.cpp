@@ -82,6 +82,7 @@
 #include "rtsp.h"
 #include "startup_gate.h"
 #include "stream.h"
+#include "touch_keyboard_session.h"
 #include "tray/system_tray.h"
 #include "utility.h"
 #include "uuid.h"
@@ -168,6 +169,19 @@ namespace nvhttp {
     session.client_name = client_family::session_client_name(session.client_name, paired ? std::string_view { paired->name } : std::string_view {});
   }
 
+#ifdef _WIN32
+  int
+  prepare_touch_keyboard(rtsp_stream::launch_session_t &session) {
+    int intent = session.touch_keyboard;
+    if (intent < 0 && config::get_client_touch_keyboard_enabled(session.client_cert_uuid)) {
+      intent = 1;
+    }
+    const bool touch_client = intent == 1 || (session.touch_keyboard < 0 && session.touch_family);
+    session.env["SUNSHINE_CLIENT_TOUCH"] = touch_client ? "true" : "false";
+    return intent;
+  }
+#endif
+
   std::shared_ptr<rtsp_stream::launch_session_t>
   make_launch_session(bool host_audio, const args_t &args) {
     auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
@@ -207,7 +221,8 @@ namespace nvhttp {
     }
     if (const auto defaults = image_enhancement::load_nr_defaults()) {
       const auto &f = defaults->filter;
-      launch_session->dlssnr_params.enabled = defaults->enabled;
+      // Defaults carry remembered parameters only; the on/off default for
+      // 自动 apps is the stable global component selection below.
       launch_session->dlssnr_params.intensity = f.nr_intensity;
       launch_session->dlssnr_params.style = f.nr_style;
       launch_session->dlssnr_params.skin_structure_strength = f.nr_skin_structure_strength;
@@ -216,9 +231,10 @@ namespace nvhttp {
       launch_session->dlssnr_params.motion_quality = f.nr_motion_quality;
       launch_session->dlssnr_scale_percent = f.nr_scale_percent;
     }
-    // Explicit per-app on/off settings take precedence; inherit uses the saved
-    // stream defaults. The overlay processing scale is currently global.
-    if (const auto app_dlssnr = proc::proc.get_app_dlssnr_config(launch_session->appid)) {
+    // Explicit per-app on/off settings take precedence; 自动 apps follow the
+    // global component selection. The overlay processing scale is global.
+    const auto app_dlssnr = proc::proc.get_app_dlssnr_config(launch_session->appid);
+    if (app_dlssnr) {
       launch_session->dlssnr_params = *app_dlssnr;
     }
     if (launch_session->dlssnr_params.enabled) {
@@ -226,11 +242,21 @@ namespace nvhttp {
       // It selects RTX HDR only for PQ and releases the unused backend;
       // HLG/SDR must retain NR even when launch initially requested RTX HDR.
       launch_session->dlssnr_backend = image_enhancement::manager().acquire_selected(image_enhancement::backend_capability_e::nr);
+      if (!launch_session->dlssnr_backend) {
+        BOOST_LOG(warning) << "App ["sv << launch_session->appid << "] enables DLSS NR, but its component is not selected"sv;
+      }
+    }
+    else if (!app_dlssnr) {
+      // 自动: the global switch is the persistent default. Without a selected
+      // backend the stream simply starts with NR off.
+      launch_session->dlssnr_backend = image_enhancement::manager().acquire_selected(image_enhancement::backend_capability_e::nr);
+      launch_session->dlssnr_params.enabled = static_cast<bool>(launch_session->dlssnr_backend);
     }
     launch_session->use_vdd = util::from_view(get_arg(args, "useVdd", "0"));
     launch_session->custom_screen_mode = util::from_view(get_arg(args, "customScreenMode", "-1"));
     // Client-declared touch-keyboard intent (Sunshine protocol extension).
-    // -1 undeclared: fall back to the per-client server profile.
+    // -1 undeclared: fall back to the per-client server profile; 0 and 1
+    // request that the GUI suppress or enable auto-invoke for the session.
     launch_session->touch_keyboard = util::from_view(get_arg(args, "touchKeyboard", "-1"));
     // Client-declared controller emulation type (Sunshine protocol extension
     // carried on the /launch and /resume query string). Values outside the
@@ -699,6 +725,9 @@ namespace nvhttp {
       observe_client_family(client_cert_uuid, make_family_observation(args, request->header));
     }
     launch_session->touch_family = request_is_touch_family(args, request->header);
+#ifdef _WIN32
+    const auto touch_keyboard_intent = prepare_touch_keyboard(*launch_session);
+#endif
     hdr::resolve_session_target(*launch_session);
     if (launch_session->highly_suspected_unknown_client) {
       BOOST_LOG(warning) << "Launch request highly resembles a known unauthorized client fork"
@@ -739,6 +768,7 @@ namespace nvhttp {
     }
 
 #ifdef _WIN32
+    launch_session->touch_keyboard_lease = touch_kb::acquire(touch_keyboard_intent);
     if (display_device::resolve_display_intent(config::video, *launch_session).target ==
         display_device::display_intent_t::target_e::vdd) {
       launch_session->nvidia_vsync_lease = nvprefs_instance.acquire_vsync();
@@ -892,6 +922,11 @@ namespace nvhttp {
     if (no_active_sessions && args.find("localAudioPlayMode"s) != std::end(args)) {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     }
+    // Resume requests need not include an appid. Resolve per-app enhancement
+    // settings against the running app rather than treating it as Auto.
+    if (args.find("appid"s) == std::end(args)) {
+      args.emplace("appid", std::to_string(current_appid));
+    }
     const auto launch_session = make_launch_session(host_audio, args);
     if (!launch_session) {
       tree.put("root.resume", 0);
@@ -917,6 +952,9 @@ namespace nvhttp {
       observe_client_family(client_cert_uuid, make_family_observation(args, request->header));
     }
     launch_session->touch_family = request_is_touch_family(args, request->header);
+#ifdef _WIN32
+    const auto touch_keyboard_intent = prepare_touch_keyboard(*launch_session);
+#endif
     hdr::resolve_session_target(*launch_session);
     if (launch_session->highly_suspected_unknown_client) {
       BOOST_LOG(warning) << "Resume request highly resembles a known unauthorized client fork"
@@ -949,6 +987,7 @@ namespace nvhttp {
     }
 
 #ifdef _WIN32
+    launch_session->touch_keyboard_lease = touch_kb::acquire(touch_keyboard_intent);
     if (display_device::resolve_display_intent(config::video, *launch_session).target ==
         display_device::display_intent_t::target_e::vdd) {
       launch_session->nvidia_vsync_lease = nvprefs_instance.acquire_vsync();

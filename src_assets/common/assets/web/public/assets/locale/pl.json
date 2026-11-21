@@ -1352,14 +1352,14 @@
     "vb_cable_open_devmgmt": "Otwórz Menedżera urządzeń",
     "vb_cable_install": "Zainstaluj VB-CABLE",
     "vb_cable_enable": "Włącz VB-CABLE",
-    "vb_cable_install_confirm": "Host pobiera sterownik VB-CABLE z VB-Audio, sprawdza podpis jego instalatora i instaluje go po cichu z uprawnieniami administratora. W systemie Windows pojawi się wirtualne urządzenie audio. Kontynuować?",
+    "vb_cable_install_confirm": "Zostanie zainstalowany wirtualny sterownik audio VB-CABLE od VB-Audio. Kontynuować?",
     "vb_cable_enable_confirm": "Host włącza urządzenie VB-CABLE wyłączone w Menedżerze urządzeń (pnputil /enable-device). Kontynuować?",
     "vb_cable_job_downloading": "Pobieranie VB-CABLE…",
     "vb_cable_job_verifying": "Sprawdzanie podpisu…",
     "vb_cable_job_installing": "Instalowanie VB-CABLE…",
     "vb_cable_job_enabling": "Włączanie VB-CABLE…",
     "vb_cable_err_download": "Pobieranie nie powiodło się. Sprawdź sieć i spróbuj ponownie lub pobierz ręcznie.",
-    "vb_cable_err_signature": "Instalator nie ma prawidłowego podpisu VB-Audio. Instalację przerwano.",
+    "vb_cable_err_signature": "Weryfikacja plików instalacyjnych VB-CABLE nie powiodła się. Instalacja została zatrzymana.",
     "vb_cable_err_admin": "Sunshine nie działa z uprawnieniami administratora, więc nie może instalować ani włączać sterowników.",
     "vb_cable_err_failed": "Nie udało się: VB-CABLE nadal jest niedostępny. Otwórz Menedżera urządzeń lub zainstaluj go ręcznie."
   },
@@ -1451,6 +1451,10 @@
       "chip": "Klient",
       "hint": "These options run in the client's input and audio path. The host does not store them; they are listed here so every option has its place.",
       "title": "Zastosowane przez klienta"
+    },
+    "client_support": {
+      "needs": "Needs client support: {clients}. Other clients keep their own rate.",
+      "since": "{version} and later"
     },
     "collapse": "Collapse",
     "color": {
@@ -1591,14 +1595,25 @@
     },
     "test_panel": {
       "haptics": "HD haptics",
-      "identify": "Zidentyfikuj",
-      "idle": "Ready for a preview action.",
-      "note": "The native test endpoint is not wired in this build. These controls show what the selected profile would send; they never write the profile.",
-      "preview_only": "Preview only: {action}. No hardware command was sent.",
-      "stop": "Zatrzymaj",
+      "note": "Sends a test to the controllers of the running stream: a short rumble, the light bar flashing three times, a resistance on each trigger for 1.5 s. The client has to carry out the light and the trigger as the host asks; the host cannot tell whether the client's pad did it.",
       "title": "Per-controller test",
-      "trigger_left": "Lewy spust",
-      "trigger_right": "Prawy spust"
+      "result": {
+        "sent": "Sent a short rumble to {pads} controller(s). The host cannot tell whether the client's pad moved.",
+        "no_pad": "No controller is in use: start a stream with a controller connected on the client first.",
+        "unsupported": "This system has no native DualSense path, so there is nothing to test.",
+        "busy": "The previous test is still running.",
+        "failed": "The test request failed."
+      },
+      "identify": "Identify controller",
+      "trigger_left": "Left trigger",
+      "trigger_right": "Right trigger",
+      "stop": "Stop",
+      "sent": {
+        "identify": "Asked {pads} controller(s) to flash the light bar three times. The host cannot tell whether the client's pad flashed.",
+        "trigger_left": "Asked {pads} controller(s) for a 1.5 s resistance on the left trigger. The host cannot tell whether the client's trigger resisted.",
+        "trigger_right": "Asked {pads} controller(s) for a 1.5 s resistance on the right trigger. The host cannot tell whether the client's trigger resisted.",
+        "stop": "The light, trigger and rumble tests are stopped."
+      }
     },
     "title": "DualSense host tuning",
     "trigger_preview": {
