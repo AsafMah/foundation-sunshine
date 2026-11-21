@@ -40,7 +40,7 @@ test vector.
 
 ## Consent, identity, upload
 
-* Error reports follow the host key `telemetry_errors` (default on); without it an old `telemetry_consent = off` still means off. Turning it
+* Error reports follow the host key `telemetry_errors` (default on upstream, off in this fork: `src/telemetry/fork_defaults.h`); without it an old `telemetry_consent = off` still means off. Turning it
   off removes every waiting report; nothing is written while it is off. The consent is re-read every 30 s.
 * `install_id`: the host's `<config>/telemetry/install_id` (one line, UUID). The host creates it when absent; the Panel and `sparxie-launch` only read it.
 * Upload: first pass 20 s after the start (`SUNSHINE_CRASH_UPLOAD_DELAY_S`), then every 30 min, on its own thread. Endpoint:

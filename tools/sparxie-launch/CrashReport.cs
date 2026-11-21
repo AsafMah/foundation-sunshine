@@ -120,13 +120,17 @@ internal static class CrashReport
         return found;
     }
 
-    /// <summary>Error reports may leave the computer unless turned off: <c>telemetry_errors</c> decides; without it an old <c>telemetry_consent = off</c> still means off; else on.</summary>
+    /// <summary>Fork (AsafMah/foundation-sunshine, src/telemetry/fork_defaults.h): error reports are off until the person turns them on. Upstream: on.</summary>
+    internal const bool ErrorsDefault = false;
+
+    /// <summary>Error reports may leave the computer when turned on: <c>telemetry_errors</c> decides; without it an old <c>telemetry_consent = off</c> still means off; else <see cref="ErrorsDefault"/>.</summary>
     internal static bool ErrorsEnabled(string conf)
     {
         static bool Off(string v) => v.Equals("off", StringComparison.OrdinalIgnoreCase) || v.Equals("false", StringComparison.OrdinalIgnoreCase) || v == "0";
         var own = ConfValue(conf, "telemetry_errors");
         if (own.Length > 0) return !Off(own);
-        return ConfValue(conf, "telemetry_consent") != "off";
+        if (ConfValue(conf, "telemetry_consent") == "off") return false;
+        return ErrorsDefault;
     }
 
     /// <summary>The one-line UUID the host keeps in <c>config\telemetry\install_id</c>; null when absent or malformed (the host makes it when consent allows).</summary>
@@ -248,11 +252,14 @@ internal static class CrashReport
         TaskScheduler.UnobservedTaskException += (_, e) => Record("unhandled-dotnet", e.Exception.Flatten(), withDump: false);
     }
 
-    private static bool Enabled()
+    private static bool Enabled() => _hostConfig is null ? ErrorsEnabled("") : EnabledFrom(() => File.ReadAllText(Path.Combine(_hostConfig, "sunshine.conf")));
+
+    /// <summary>The choice read from the host's config; an unreadable config counts as the default.</summary>
+    internal static bool EnabledFrom(Func<string> readConf)
     {
-        try { return ErrorsEnabled(_hostConfig is null ? "" : File.ReadAllText(Path.Combine(_hostConfig, "sunshine.conf"))); }
-        catch (IOException) { return true; }
-        catch (UnauthorizedAccessException) { return true; }
+        try { return ErrorsEnabled(readConf()); }
+        catch (IOException) { return ErrorsDefault; }
+        catch (UnauthorizedAccessException) { return ErrorsDefault; }
     }
 
     /// <summary>Writes one report; never throws (it runs while the process is going down).</summary>

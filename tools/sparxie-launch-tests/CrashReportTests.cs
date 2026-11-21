@@ -35,7 +35,11 @@ internal static partial class Tests
         Same(64, meta.GetProperty("signature").GetString()!.Length, "crash meta: signature length");
         Check(!meta.TryGetProperty("install_id", out _), "crash meta: no install id until upload");
 
-        Check(CrashReport.ErrorsEnabled("") && CrashReport.ErrorsEnabled("telemetry_errors = on\n") && !CrashReport.ErrorsEnabled("telemetry_errors = off\n"), "crash consent: key");
+        Check(CrashReport.ErrorsEnabled("telemetry_errors = on\n") && !CrashReport.ErrorsEnabled("telemetry_errors = off\n"), "crash consent: key");
+        // fork (src/telemetry/fork_defaults.h): no crash report leaves until error reports are turned on; usage statistics on say nothing about it
+        Check(!CrashReport.ErrorsEnabled("") && !CrashReport.ErrorsEnabled("telemetry_consent = on\n"), "crash consent: fork default off");
+        Check(!CrashReport.EnabledFrom(() => throw new IOException("locked")) && !CrashReport.EnabledFrom(() => throw new UnauthorizedAccessException()), "crash consent: an unreadable config is the default (off)");
+        Check(CrashReport.EnabledFrom(() => "telemetry_errors = on\n"), "crash consent: read from the config");
         Check(!CrashReport.ErrorsEnabled("telemetry_consent = off\n") && CrashReport.ErrorsEnabled("telemetry_consent = off\ntelemetry_errors = on\n"), "crash consent: an old no stays no");
         Check(CrashReport.Settled(200) && CrashReport.Settled(400) && !CrashReport.Settled(429) && !CrashReport.Settled(503) && !CrashReport.Settled(0), "crash upload: what is settled");
 

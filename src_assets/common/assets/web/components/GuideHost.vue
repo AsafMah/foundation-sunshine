@@ -50,8 +50,10 @@ const saveGuideProgress = createHostSaver({ getJson: (path) => apiJson(path), po
 // the first screen's one-time notice about error reports links to the switch (关于 › 隐私): the guide closes and the About page opens
 const flowCallbacks = { ...callbacks, openPrivacy: () => { emit('close'); shell?.nav.go('about') }, saveGuideProgress }
 onMounted(async () => {
-  try { hostProgress.value = hostProgressOf(await apiJson('/api/config')) } catch { hostProgress.value = hostProgressOf(null) }
+  // fork: telemetry is off until the person turns it on (src/telemetry/fork_defaults.h); the first screen's notice says data is sent, so it is skipped while both choices are off
   await telemetry.refresh()
+  if (telemetry.consent.value === 'off' && telemetry.errors.value === 'off') telemetry.markErrorsNoticeSeen()
+  try { hostProgress.value = hostProgressOf(await apiJson('/api/config')) } catch { hostProgress.value = hostProgressOf(null) }
 })
 // The code is drawn from the matrix of the qrcode package already used for QR pairing; nothing is fetched
 const qrMatrix = (text) => QRCode.create(text, { errorCorrectionLevel: 'M' }).modules

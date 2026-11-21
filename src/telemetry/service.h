@@ -43,6 +43,8 @@ namespace telemetry {
   struct consent_t {
     bool usage = true;
     bool errors = true;
+    bool usage_by_default = false;  ///< the value is the default, not the person's: an unset or unrecognised key (fork_defaults.h)
+    bool errors_by_default = false;
     bool any() const { return usage || errors; }
     bool allows(kind_e kind) const { return kind == kind_e::error ? errors : usage; }
   };

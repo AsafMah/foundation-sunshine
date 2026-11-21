@@ -330,8 +330,8 @@ TEST(CrashMeta, ReturnsZeroWhenItDoesNotFit) {
 }
 
 TEST(CrashConsent, FollowsTheTelemetryErrorsKey) {
-  EXPECT_TRUE(crash::errors_enabled_from_conf(""));  // default on
-  EXPECT_TRUE(crash::errors_enabled_from_conf("port = 47989\n"));
+  EXPECT_FALSE(crash::errors_enabled_from_conf(""));  // fork default: off until the person turns error reports on (src/telemetry/fork_defaults.h)
+  EXPECT_FALSE(crash::errors_enabled_from_conf("port = 47989\n"));
   EXPECT_FALSE(crash::errors_enabled_from_conf("telemetry_errors = off\n"));
   EXPECT_FALSE(crash::errors_enabled_from_conf("telemetry_errors=false"));
   EXPECT_TRUE(crash::errors_enabled_from_conf("telemetry_errors = on\n"));
@@ -342,8 +342,9 @@ TEST(CrashConsent, FollowsTheTelemetryErrorsKey) {
 TEST(CrashConsent, AnOldNoStaysNoUntilErrorsAreTurnedOn) {
   EXPECT_FALSE(crash::errors_enabled_from_conf("telemetry_consent = off\n"));
   EXPECT_TRUE(crash::errors_enabled_from_conf("telemetry_consent = off\ntelemetry_errors = on\n"));
-  EXPECT_TRUE(crash::errors_enabled_from_conf("telemetry_consent = on\n"));
-  EXPECT_TRUE(crash::errors_enabled_from_conf("telemetry_consent = ask\n"));
+  // fork default: usage statistics turned on say nothing about error reports, which stay at their own default (off)
+  EXPECT_FALSE(crash::errors_enabled_from_conf("telemetry_consent = on\n"));
+  EXPECT_FALSE(crash::errors_enabled_from_conf("telemetry_consent = ask\n"));
 }
 
 TEST(CrashEndpoint, ConfigKeyAndDefault) {

@@ -73,6 +73,17 @@ namespace telemetry {
     struct consent_cache_t {
       std::atomic<bool> usage { false };
       std::atomic<bool> errors { false };
+      std::atomic<bool> usage_by_default { false };
+      std::atomic<bool> errors_by_default { false };
+      void store(const consent_t &c) {
+        usage.store(c.usage, std::memory_order_relaxed);
+        errors.store(c.errors, std::memory_order_relaxed);
+        usage_by_default.store(c.usage_by_default, std::memory_order_relaxed);
+        errors_by_default.store(c.errors_by_default, std::memory_order_relaxed);
+      }
+      consent_t load() const {
+        return consent_t { usage.load(std::memory_order_relaxed), errors.load(std::memory_order_relaxed), usage_by_default.load(std::memory_order_relaxed), errors_by_default.load(std::memory_order_relaxed) };
+      }
     } consent_cache;
 
     std::shared_ptr<service_t> &
@@ -111,8 +122,7 @@ namespace telemetry {
     refresh_consent_cache() {
       if (const auto snapshot = config::get_config_snapshot()) {
         const auto c = consent_from_snapshot(*snapshot);
-        consent_cache.usage.store(c.usage, std::memory_order_relaxed);
-        consent_cache.errors.store(c.errors, std::memory_order_relaxed);
+        consent_cache.store(c);
       }
     }
 
@@ -580,8 +590,7 @@ namespace telemetry {
       if (const auto snapshot = config::get_config_snapshot()) {
         endpoint = read_endpoint_from(*snapshot);
         const auto c = consent_from_snapshot(*snapshot);
-        consent_cache.usage.store(c.usage);
-        consent_cache.errors.store(c.errors);
+        consent_cache.store(c);
       }
       service_options_t options;
       options.dir = platf::appdata() / "telemetry";
@@ -590,7 +599,7 @@ namespace telemetry {
       for (const char *variable : { "COMPUTERNAME", "HOSTNAME", "USERNAME", "USER", "LOGNAME" })
         if (const char *value = std::getenv(variable)) options.redact_words.emplace_back(value);
       service_deps_t deps;
-      deps.consent = [] { return consent_t { consent_cache.usage.load(std::memory_order_relaxed), consent_cache.errors.load(std::memory_order_relaxed) }; };
+      deps.consent = [] { return consent_cache.load(); };
       deps.post = [](const std::string &url, const std::string &body) { return http_post(url, "application/json", body); };
       deps.session_log = [](const std::string &endpoint, const std::string &install_id, const std::string &version) { return crash::upload_session_log(endpoint, install_id, version); };
       deps.session_log_state = [] { return std::string { crash::session_log_state() }; };

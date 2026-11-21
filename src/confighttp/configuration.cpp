@@ -22,6 +22,7 @@
 #include "src/network.h"
 #include "src/platform/common.h"
 #include "src/stream.h"
+#include "src/telemetry/fork_defaults.h"
 #include "src/telemetry/telemetry.h"
 #include "src/utility.h"
 #include "src/video.h"
@@ -114,6 +115,8 @@ namespace confighttp::configuration {
       outputTree.put("version", build_info::version());
 
       auto vars = config::parse_config(file_handler::read_file(config::sunshine.config_file.c_str()));
+      // fork: an unset telemetry choice is reported with its default (off), so About > Privacy shows what the host does
+      telemetry::fork_defaults::fill_unset(vars);
       for (auto &[name, value] : vars) {
         // widget_token 是本地端点凭证,不回显明文;只暴露是否已配置
         if (name == "widget_token" || name == "mat_live_pipe" || name == "mat_live_producer") {

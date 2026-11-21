@@ -10,12 +10,14 @@
 #include <regex>
 #include <set>
 #include <thread>
+#include <unordered_map>
 
 #include "src/log_text.h"
 #include "src/telemetry/device_facts.h"
 #include "src/telemetry/events.h"
 #include "src/telemetry/install_journal.h"
 #include "src/telemetry/queue.h"
+#include "src/telemetry/fork_defaults.h"
 #include "src/telemetry/service.h"
 #include "src/telemetry/stream_stats.h"
 
@@ -309,15 +311,60 @@ TEST(TelemetryEnvelope, ProductVersionStartsItsOwnEnvelope) {
 // consent
 
 TEST(TelemetryConsent, ConfigKeysFollowTheSharedRules) {
-  EXPECT_TRUE(consent_from_config("", "", false, false).usage);
-  EXPECT_TRUE(consent_from_config("", "", false, false).errors);
   EXPECT_FALSE(consent_from_config("off", "", true, false).usage);
   EXPECT_FALSE(consent_from_config("off", "", true, false).errors);  // the old single answer "no" stays no for error reports
-  EXPECT_TRUE(consent_from_config("ask", "", true, false).usage);  // 'ask' reads as the default
   EXPECT_FALSE(consent_from_config("on", "off", true, true).errors);
   EXPECT_TRUE(consent_from_config("on", "off", true, true).usage);
   EXPECT_TRUE(consent_from_config("off", "on", true, true).errors);
   EXPECT_FALSE(consent_from_config("false", "", true, false).usage);
+}
+
+// Fork (AsafMah/foundation-sunshine): both choices are off until the person turns them on; an explicit value still wins.
+TEST(TelemetryConsent, ForkDefaultsBothChoicesOff) {
+  const auto none = consent_from_config("", "", false, false);
+  EXPECT_FALSE(none.usage);
+  EXPECT_FALSE(none.errors);
+  EXPECT_TRUE(none.usage_by_default);
+  EXPECT_TRUE(none.errors_by_default);
+  EXPECT_FALSE(consent_from_config("ask", "", true, false).usage);  // 'ask' reads as the default
+  EXPECT_TRUE(consent_from_config("ask", "", true, false).usage_by_default);
+  const auto usage_on = consent_from_config("on", "", true, false);
+  EXPECT_TRUE(usage_on.usage);
+  EXPECT_FALSE(usage_on.usage_by_default);
+  EXPECT_FALSE(usage_on.errors);  // error reports keep their own default
+  EXPECT_TRUE(usage_on.errors_by_default);
+  const auto both_on = consent_from_config("on", "on", true, true);
+  EXPECT_TRUE(both_on.usage);
+  EXPECT_TRUE(both_on.errors);
+  EXPECT_FALSE(both_on.errors_by_default);
+  EXPECT_FALSE(consent_from_config("off", "off", true, true).errors_by_default);
+}
+
+TEST(TelemetryConsent, ConfigApiReportsTheForkDefaultForAnUnsetChoice) {
+  std::unordered_map<std::string, std::string> unset { { "port", "47989" } };
+  telemetry::fork_defaults::fill_unset(unset);
+  EXPECT_EQ(unset["telemetry_consent"], "off");
+  EXPECT_EQ(unset["telemetry_errors"], "off");
+  std::unordered_map<std::string, std::string> chosen { { "telemetry_consent", "on" }, { "telemetry_errors", "on" } };
+  telemetry::fork_defaults::fill_unset(chosen);
+  EXPECT_EQ(chosen["telemetry_consent"], "on");
+  EXPECT_EQ(chosen["telemetry_errors"], "on");
+  // a retired or unrecognised value reads as the default on the host, so the page is told the default too: foundation-ui takes
+  // 'ask' for "not answered" and would hand a stale cached 'on' back to the host (an opt-in nobody gave)
+  std::unordered_map<std::string, std::string> retired { { "telemetry_consent", "ask" }, { "telemetry_errors", "maybe" } };
+  telemetry::fork_defaults::fill_unset(retired);
+  EXPECT_EQ(retired["telemetry_consent"], "off");
+  EXPECT_EQ(retired["telemetry_errors"], "off");
+  std::unordered_map<std::string, std::string> spelled { { "telemetry_consent", "true" }, { "telemetry_errors", "disabled" } };
+  telemetry::fork_defaults::fill_unset(spelled);
+  EXPECT_EQ(spelled["telemetry_consent"], "true");  // an explicit choice is passed on as written
+  EXPECT_EQ(spelled["telemetry_errors"], "disabled");
+  // the page and the host agree for every value the host recognises
+  for (const std::string v : { "on", "off", "true", "false", "1", "0", "enabled", "disabled", "yes", "no", "ask", "", "maybe" }) {
+    std::unordered_map<std::string, std::string> m { { "telemetry_consent", v }, { "telemetry_errors", v } };
+    telemetry::fork_defaults::fill_unset(m);
+    EXPECT_EQ(m["telemetry_consent"] != "off" && m["telemetry_consent"] != "false" && m["telemetry_consent"] != "0" && m["telemetry_consent"] != "disabled" && m["telemetry_consent"] != "no", consent_from_config(v, v, true, true).usage) << v;
+  }
 }
 
 TEST(TelemetryConsent, UsageOffSendsNoUsageOrExperience) {
@@ -3080,6 +3127,31 @@ TEST(OptOutService, TurningAChoiceOffSendsOneRecordAndNothingAfterIt) {
   EXPECT_FALSE(h.posted.empty());
   for (const auto &b : h.posted) EXPECT_EQ(b["events"][0]["props"], (json { { "choice", "errors" } }));
   EXPECT_TRUE(h.svc->install_id().empty());
+}
+
+// An install that ran with the upstream default (on) and gets the fork default (off): nobody turned anything off, so no turn-off record leaves; the number goes.
+TEST(OptOutService, TheForkDefaultIsNotATurnOff) {
+  harness_t h;
+  h.consent = consent_t { true, true };
+  h.svc->reconcile_consent();
+  ASSERT_EQ(h.svc->install_id().size(), 36u);
+  h.consent = consent_from_config("", "", false, false);
+  h.svc->consent_changed();
+  h.svc->pump();
+  EXPECT_TRUE(h.posted.empty());
+  EXPECT_TRUE(h.svc->install_id().empty());
+  EXPECT_EQ(json::parse(std::ifstream(h.dir.path / "consent_state.json"))["usage"], false);
+  // the person turns usage statistics on and then off again: that is a turn-off, one record
+  h.consent = consent_from_config("on", "", true, false);
+  h.svc->consent_changed();
+  EXPECT_TRUE(h.svc->emit(kind_e::usage, "app_start", json { { "cold", true } }));
+  h.svc->pump();  // something left under an install id: turning it off now is worth a record
+  ASSERT_EQ(h.svc->install_id().size(), 36u);
+  h.posted.clear();
+  h.consent = consent_from_config("off", "", true, false);
+  h.svc->consent_changed();
+  h.svc->pump();
+  EXPECT_EQ(names_of(h.posted), (std::set<std::string> { "opt_out" }));
 }
 
 TEST(OptOutService, TheRecordIsSavedBeforeTheStateAndAnExpiredOneLeavesTheDisk) {

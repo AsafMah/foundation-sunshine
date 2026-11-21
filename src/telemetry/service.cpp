@@ -4,6 +4,7 @@
  */
 #include "service.h"
 #include "error_code.h"
+#include "fork_defaults.h"
 #include "opt_out.h"
 
 #include "src/crash/crash_context.h"
@@ -90,10 +91,19 @@ namespace telemetry {
   consent_t
   consent_from_config(const std::string &usage_value, const std::string &errors_value, bool usage_key_present, bool errors_key_present) {
     consent_t c;
-    c.usage = !(usage_key_present && falsy(usage_value));
+    // fork: an unset or unrecognised value is the fork default (fork_defaults.h); an explicit on or off is the person's and wins
+    if (usage_key_present && (truthy(usage_value) || falsy(usage_value))) c.usage = truthy(usage_value);
+    else {
+      c.usage = fork_defaults::USAGE_ON;
+      c.usage_by_default = true;
+    }
     if (errors_key_present && (truthy(errors_value) || falsy(errors_value))) c.errors = truthy(errors_value);
     // a person who answered "off" to the old single question said no to everything that left the computer: that stays no for error reports until they turn it on
-    else c.errors = !(usage_key_present && usage_value == "off");
+    else if (usage_key_present && usage_value == "off") c.errors = false;
+    else {
+      c.errors = fork_defaults::ERRORS_ON;
+      c.errors_by_default = true;
+    }
     return c;
   }
 
@@ -1653,7 +1663,9 @@ namespace telemetry {
         const auto stored = in ? json::parse(in, nullptr, false) : json();
         if (!stored.is_discarded()) before = opt_out::state_from_json(stored);
       }
-      const auto off = opt_out::turned_off(before, c.usage, c.errors);
+      auto off = opt_out::turned_off(before, c.usage, c.errors);
+      // fork: a choice that is off only because of the fork default (fork_defaults.h) was never turned off by a person: no record leaves for it
+      std::erase_if(off, [&](const std::string &choice) { return choice == "usage" ? c.usage_by_default : c.errors_by_default; });
       const bool changed = !before.known || before.usage != c.usage || before.errors != c.errors;
       if (!off.empty()) {
         // The record is saved before the new state is: a state that says "already off" without a saved record would lose the record for good (the next start would find nothing turned off).

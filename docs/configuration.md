@@ -304,7 +304,7 @@ provide the desktop of a separate RDP session.
 
 <table>
     <tr><td>Description</td><td>Usage statistics: counts of what is used and numbers about how streams perform, sent to the developers' own server (api.alkaidlab.com). What is sent and what is never sent: <a href="privacy_telemetry.md">privacy_telemetry.md</a>. Changed in the control panel or the Web UI under About › Privacy; the change takes effect at once.</td></tr>
-    <tr><td>Default</td><td><code>on</code></td></tr>
+    <tr><td>Default</td><td><code>off</code> in this fork (upstream: <code>on</code>). An unset or unrecognised value is the default; <code>on</code> or <code>off</code> set by you wins.</td></tr>
     <tr><td>Example</td><td><code>telemetry_consent = off</code></td></tr>
 </table>
 
@@ -312,7 +312,7 @@ provide the desktop of a separate RDP session.
 
 <table>
     <tr><td>Description</td><td>Error reports: error records with personal details removed, and crash reports. A stored <code>telemetry_consent = off</code> from the earlier single choice also reads as off here until this key is set to <code>on</code>.</td></tr>
-    <tr><td>Default</td><td><code>on</code></td></tr>
+    <tr><td>Default</td><td><code>off</code> in this fork (upstream: <code>on</code>). Turning usage statistics on does not turn error reports on.</td></tr>
     <tr><td>Example</td><td><code>telemetry_errors = off</code></td></tr>
 </table>
 

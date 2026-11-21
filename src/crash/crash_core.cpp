@@ -5,6 +5,7 @@
 #include "crash_core.h"
 
 #include "crash_context.h"
+#include "../telemetry/fork_defaults.h"
 
 #include <algorithm>
 #include <cctype>
@@ -429,7 +430,8 @@ namespace crash {
     const auto own = conf_value(text, "telemetry_errors");
     if (!own.empty()) return !falsy(own);
     // someone who said no to the old single question said no to everything that leaves the computer
-    return conf_value(text, "telemetry_consent") != "off";
+    if (conf_value(text, "telemetry_consent") == "off") return false;
+    return telemetry::fork_defaults::ERRORS_ON;
   }
 
   std::string
