@@ -183,6 +183,17 @@ if (WIN32)
 endif ()
 add_test(NAME audio_default_wait_unit_tests COMMAND audio_default_wait_unit_tests)
 
+# Default sink switching at stream start, runtime host_audio toggle, and stream end: no audio API.
+add_executable(audio_sink_switch_unit_tests
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_audio_sink_switch.cpp)
+target_include_directories(audio_sink_switch_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(audio_sink_switch_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
+set_target_properties(audio_sink_switch_unit_tests PROPERTIES CXX_STANDARD 23)
+if (WIN32)
+    set_target_properties(audio_sink_switch_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
+endif ()
+add_test(NAME audio_sink_switch_unit_tests COMMAND audio_sink_switch_unit_tests)
+
 if (WIN32)
     # Prints what GET /api/audio/devices answers on this machine; reads endpoints only. Not a unit test.
     add_executable(audio_devices_dump
@@ -302,6 +313,27 @@ target_link_libraries(poster_unit_tests PRIVATE gtest_main OpenSSL::Crypto sunsh
 set_target_properties(poster_unit_tests PROPERTIES CXX_STANDARD 23)
 add_test(NAME poster_unit_tests COMMAND poster_unit_tests)
 
+add_executable(generated_cover_unit_tests
+        ${CMAKE_SOURCE_DIR}/src/generated_cover.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_generated_cover.cpp)
+target_include_directories(generated_cover_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(generated_cover_unit_tests PRIVATE gtest_main OpenSSL::Crypto sunshine_project_options sunshine_coverage)
+if (WIN32)
+    target_link_libraries(generated_cover_unit_tests PRIVATE windowscodecs ole32 shell32 d2d1 dwrite)
+endif ()
+set_target_properties(generated_cover_unit_tests PROPERTIES CXX_STANDARD 23)
+add_test(NAME generated_cover_unit_tests COMMAND generated_cover_unit_tests)
+
+add_executable(generated_cover_render_tool
+        ${CMAKE_SOURCE_DIR}/src/generated_cover.cpp
+        ${CMAKE_SOURCE_DIR}/tests/tools/generate_cover_renders.cpp)
+target_include_directories(generated_cover_render_tool PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(generated_cover_render_tool PRIVATE OpenSSL::Crypto sunshine_project_options)
+if (WIN32)
+    target_link_libraries(generated_cover_render_tool PRIVATE windowscodecs ole32 shell32 d2d1 dwrite)
+endif ()
+set_target_properties(generated_cover_render_tool PROPERTIES CXX_STANDARD 23)
+
 add_executable(measured_bitrate_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_measured_bitrate.cpp)
 target_include_directories(measured_bitrate_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(measured_bitrate_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
@@ -316,7 +348,7 @@ target_link_libraries(host_bitrate_cap_unit_tests PRIVATE gtest_main sunshine_pr
 set_target_properties(host_bitrate_cap_unit_tests PROPERTIES CXX_STANDARD 23)
 add_test(NAME host_bitrate_cap_unit_tests COMMAND host_bitrate_cap_unit_tests)
 
-add_executable(dynamic_param_protocol_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_dynamic_param_protocol.cpp)
+add_executable(dynamic_param_protocol_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_dynamic_param_protocol.cpp ${CMAKE_SOURCE_DIR}/tests/unit/test_display_recovery.cpp)
 target_include_directories(dynamic_param_protocol_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(dynamic_param_protocol_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
 set_target_properties(dynamic_param_protocol_unit_tests PROPERTIES CXX_STANDARD 23)
@@ -462,6 +494,12 @@ if (WIN32)
 endif ()
 add_test(NAME ds5_tuning_unit_tests COMMAND ds5_tuning_unit_tests)
 
+add_executable(ds5_attach_policy_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_ds5_attach_policy.cpp)
+target_include_directories(ds5_attach_policy_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(ds5_attach_policy_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
+set_target_properties(ds5_attach_policy_unit_tests PROPERTIES CXX_STANDARD 23)
+add_test(NAME ds5_attach_policy_unit_tests COMMAND ds5_attach_policy_unit_tests)
+
 include("${CMAKE_CURRENT_LIST_DIR}/ds5_matrix.cmake")
 
 add_executable(ds5_haptics_unit_tests
@@ -539,6 +577,12 @@ if (WIN32)
     add_test(NAME paced_reply_queue_unit_tests COMMAND paced_reply_queue_unit_tests)
 endif ()
 
+add_executable(unicode_input_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/platform/windows/test_unicode_input.cpp)
+target_include_directories(unicode_input_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
+target_link_libraries(unicode_input_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
+set_target_properties(unicode_input_unit_tests PROPERTIES CXX_STANDARD 23)
+add_test(NAME unicode_input_unit_tests COMMAND unicode_input_unit_tests)
+
 add_executable(ds5_haptics_wire_unit_tests ${CMAKE_SOURCE_DIR}/tests/unit/test_ds5_haptics_wire.cpp)
 target_include_directories(ds5_haptics_wire_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(ds5_haptics_wire_unit_tests PRIVATE gtest_main sunshine_project_options sunshine_coverage)
@@ -608,7 +652,7 @@ add_executable(http_safety_unit_tests
         ${CMAKE_SOURCE_DIR}/src/ai/proxy.cpp)
 target_include_directories(http_safety_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(http_safety_unit_tests PRIVATE ${SUNSHINE_EXTERNAL_LIBRARIES} gtest_main
-        sunshine_project_options sunshine_coverage sunshine_crypto sunshine_ai_provider sunshine_ai_stream)
+        sunshine_project_options sunshine_coverage sunshine_crypto brotli_dec sunshine_ai_provider sunshine_ai_stream)
 target_compile_definitions(http_safety_unit_tests PRIVATE ${SUNSHINE_DEFINITIONS})
 set_target_properties(http_safety_unit_tests PROPERTIES CXX_STANDARD 23)
 if (WIN32)
@@ -824,6 +868,8 @@ add_test(NAME session_store_unit_tests COMMAND session_store_unit_tests)
 add_executable(session_auth_routes_unit_tests
         ${CMAKE_SOURCE_DIR}/tests/unit/test_session_auth_routes.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_token_user_session.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_asset_https_routes.cpp
+        ${CMAKE_SOURCE_DIR}/src/confighttp/assets.cpp
         ${CMAKE_SOURCE_DIR}/src/confighttp/auth.cpp
         ${CMAKE_SOURCE_DIR}/src/confighttp/local_auth_token.cpp
         ${CMAKE_SOURCE_DIR}/src/confighttp/common.cpp
@@ -835,15 +881,20 @@ add_executable(session_auth_routes_unit_tests
         ${CMAKE_SOURCE_DIR}/src/http/tls_trust.cpp)
 target_include_directories(session_auth_routes_unit_tests PRIVATE "${CMAKE_SOURCE_DIR}")
 target_link_libraries(session_auth_routes_unit_tests PRIVATE ${SUNSHINE_EXTERNAL_LIBRARIES} gtest_main
-        sunshine_project_options sunshine_coverage sunshine_crypto ${PLATFORM_LIBRARIES})
-target_compile_definitions(session_auth_routes_unit_tests PRIVATE ${SUNSHINE_DEFINITIONS})
+        sunshine_project_options sunshine_coverage sunshine_crypto brotli_dec ${PLATFORM_LIBRARIES})
+# Both suites use the same test binary; asset files must stay under the test build tree.
+set(_asset_route_test_definitions ${SUNSHINE_DEFINITIONS})
+list(FILTER _asset_route_test_definitions EXCLUDE REGEX "^SUNSHINE_ASSETS_DIR=")
+target_compile_definitions(session_auth_routes_unit_tests PRIVATE ${_asset_route_test_definitions}
+        SUNSHINE_ASSETS_DIR="${CMAKE_CURRENT_BINARY_DIR}/asset-route-fixture")
 target_compile_options(session_auth_routes_unit_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSHINE_COMPILE_OPTIONS}>)
 set_target_properties(session_auth_routes_unit_tests PROPERTIES CXX_STANDARD 23)
 if (WIN32)
     set_target_properties(session_auth_routes_unit_tests PROPERTIES LINK_SEARCH_START_STATIC 1)
 endif ()
-add_test(NAME session_auth_routes_unit_tests COMMAND session_auth_routes_unit_tests)
-set_tests_properties(session_auth_routes_unit_tests PROPERTIES TIMEOUT 60)
+add_test(NAME session_auth_routes_unit_tests COMMAND session_auth_routes_unit_tests --gtest_filter=-AssetHttpsRoutes.*)
+add_test(NAME asset_https_routes_unit_tests COMMAND session_auth_routes_unit_tests --gtest_filter=AssetHttpsRoutes.*)
+set_tests_properties(session_auth_routes_unit_tests asset_https_routes_unit_tests PROPERTIES TIMEOUT 60)
 
 add_executable(sunshinesvc_state_unit_tests
         ${CMAKE_SOURCE_DIR}/tests/unit/test_sunshinesvc_state.cpp)
@@ -1627,6 +1678,7 @@ list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_audio_devices.
 list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_display_settings_restore.cpp)
 list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_audio_sink_plan.cpp)
 list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_audio_default_wait.cpp)
+list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_audio_sink_switch.cpp)
 list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_telemetry.cpp ${CMAKE_SOURCE_DIR}/tests/unit/test_error_code.cpp)
 list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_host_bitrate_cap.cpp)
 list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/unit/test_cover_failure_backoff.cpp)
@@ -1673,6 +1725,7 @@ list(REMOVE_ITEM TEST_SOURCES ${CMAKE_SOURCE_DIR}/tests/usbip/external_readonly_
         ${CMAKE_SOURCE_DIR}/tests/unit/test_usbip_stale_port_sweep.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_rtsp.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_session_auth_routes.cpp
+        ${CMAKE_SOURCE_DIR}/tests/unit/test_asset_https_routes.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_session_store.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_sunshinesvc_state.cpp
         ${CMAKE_SOURCE_DIR}/tests/unit/test_tray_state.cpp
@@ -1725,7 +1778,8 @@ if (WIN32)
     target_link_libraries(${PROJECT_NAME} PRIVATE alkaidlab_ds5_core alkaidlab_usbip_core)
 endif ()
 # The network overview in the host sources uses the STUN codec on every platform.
-target_link_libraries(${PROJECT_NAME} PRIVATE alkaidlab_stun_codec sunshine_log_templates)
+# Asset routes decode the shipped Brotli copy for clients without Accept-Encoding: br.
+target_link_libraries(${PROJECT_NAME} PRIVATE alkaidlab_stun_codec brotli_dec sunshine_log_templates)
 # The adapter definitions are set per source file in cmake/targets/common.cmake.
 if (TARGET sunshine_rtx_video_adapter)
     add_dependencies(${PROJECT_NAME} sunshine_rtx_video_adapter)
@@ -1748,8 +1802,9 @@ target_link_libraries(${PROJECT_NAME}
         ${PLATFORM_LIBRARIES}
         sunshine_project_options sunshine_coverage sunshine_crypto sunshine_ai_provider sunshine_ai_stream)
 if (WIN32)
-    # src/sparxie/platform.cpp downloads through WinHTTP, as the sunshine target links it.
-    target_link_libraries(${PROJECT_NAME} PRIVATE winhttp)
+    # src/sparxie/platform.cpp downloads through WinHTTP, as the sunshine target links it;
+    # src/generated_cover.cpp draws with Direct2D and DirectWrite and reads icons through the shell.
+    target_link_libraries(${PROJECT_NAME} PRIVATE winhttp windowscodecs ole32 shell32 d2d1 dwrite)
 endif ()
 target_compile_definitions(${PROJECT_NAME} PUBLIC
         SUNSHINE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"

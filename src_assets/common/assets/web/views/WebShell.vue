@@ -59,7 +59,7 @@
         <MButton variant="danger" icon="logout" @click="confirmLogout">{{ $t('troubleshooting.logout') }}</MButton>
       </template>
     </ConfirmDialog>
-    <MConnectDialog v-model="connect.open.value" v-model:tab="connect.tab.value" v-model:os="connect.os.value" :assets-of="connect.assetsOf" :version-of="connect.versionOf" :locale="String(uiLocale)" :qr="connect.matrix" :pair-qr="connect.pairQr" :count="hostClients.length" :latest="hostClients.length ? hostClients[hostClients.length - 1].name : ''" :close-label="$t('_common.close')"
+    <MConnectDialog v-if="showConnectDialog" v-model="connect.open.value" v-model:tab="connect.tab.value" v-model:os="connect.os.value" :assets-of="connect.assetsOf" :version-of="connect.versionOf" :locale="String(uiLocale)" :qr="connect.matrix" :pair-qr="connect.pairQr" :count="hostClients.length" :latest="hostClients.length ? hostClients[hostClients.length - 1].name : ''" :close-label="$t('_common.close')"
       @pair-pin="(e) => connect.pairPin(e.pin)" @pair-qr-begin="connect.qrBegin()" @pair-qr-stop="connect.qrStop()" @open-url="(u) => openExternalUrl(u).catch(() => {})" @open-downloads="() => { connect.open.value = false; jumpNav.go('downloads') }" />
     <MPairPrompt :requests="pairing.requests.value" :locale="String(uiLocale)" @submit="onPairSubmit" @reject="(id) => pairing.reject(id)" @install="connect.show('install')" />
     <PendingHosts />
@@ -73,7 +73,7 @@ import { computed, defineAsyncComponent, defineComponent, getCurrentInstance, h,
 import { useI18n } from 'vue-i18n'
 import QRCode from 'qrcode'
 import { trackEvents, setTelemetryContext } from '../config/telemetry.js'
-import { answerRedactRequests, announcementTexts, feedbackTexts, isCompactNav, MSheet, MFeedbackButton, openFeedbackHere, homeTexts, MContextProvider, useTelemetryConsent, MErrorHost, installErrorHandlers, setErrorContext, startAutoReport, MPageLoading, useNotify, useSystemNotices, MStatusBell, MPage, MGroup, MItem, MSection, MIcon, MBrand, MCaption, MCaptionVersion, MCaptionBack, MBackChip, useCaptionRoom, createJumpHistory, useBackVariant, showsButton, showsChip, captionTexts, MCoachMarks, MConnectDialog, MPairPrompt, MPinHost, pinSpecForPage, pinTexts, pinToHome, isPinnedOnHome, createPairingPending, MSnackbar, connectTexts, useConnectDialog, MUnifiedSearch, useUnifiedSearch, requestPageFilter, searchTexts, actionDocs, settingDocs, clientDocs, appDocs, tileDocs, addTileToHome, MHostOffline, useHostConnection, MButton, MContextMenu, MNavList, MScene, resetTexts, aboutTexts, latencyClockTexts, statusTexts, networkOverviewTexts, doctorTexts, testToolTexts, createNav, useAnnouncements, MAnnouncementButton, MAnnouncementPage, MAnnouncementPopup, ackedAt, useAppearance, useSettingsList, useErrors, useDeveloperMode, DevReportHost, registerDevReport } from 'foundation-ui/vue'
+import { answerRedactRequests, announcementTexts, feedbackTexts, isCompactNav, MSheet, MFeedbackButton, openFeedbackHere, homeTexts, MContextProvider, useTelemetryConsent, MErrorHost, installErrorHandlers, setErrorContext, startAutoReport, MPageLoading, useNotify, useSystemNotices, useFeedbackReplies, MStatusBell, MPage, MGroup, MItem, MSection, MIcon, MBrand, MCaption, MCaptionVersion, MCaptionBack, MBackChip, useCaptionRoom, createJumpHistory, useBackVariant, showsButton, showsChip, captionTexts, MCoachMarks, MPairPrompt, MPinHost, pinSpecForPage, pinTexts, pinToHome, isPinnedOnHome, createPairingPending, MSnackbar, connectTexts, useConnectDialog, MUnifiedSearch, useUnifiedSearch, requestPageFilter, searchTexts, actionDocs, settingDocs, clientDocs, appDocs, tileDocs, addTileToHome, MHostOffline, useHostConnection, MButton, MContextMenu, MNavList, MScene, resetTexts, aboutTexts, latencyClockTexts, statusTexts, networkOverviewTexts, doctorTexts, testToolTexts, createNav, useAnnouncements, MAnnouncementButton, MAnnouncementPopup, ackedAt, useAppearance, useSettingsList, useErrors, useDeveloperMode, DevReportHost, registerDevReport } from 'foundation-ui/vue'
 import { afterCheck, afterOpened, noticeView, readNotice, writeNotice } from 'foundation-ui/update'
 import { SEARCH_INDEX } from '../config/settingsData/index.js'
 import { categoryOfRow, labelOf, parseSettingsHash, rowIdOf, settingsHash } from 'foundation-ui/settings/index.js'
@@ -85,6 +85,7 @@ import WebDialogHost from '../components/layout/WebDialogHost.vue'
 import { registerPending } from '../composables/pendingSources.js'
 import ConfirmDialog from '../components/common/ConfirmDialog.vue'
 import { useLogout } from '../composables/useLogout.js'
+import { fetchLogTail } from '../composables/useLogs.js'
 import { useAudioDevices } from '../composables/useAudioDevices.js'
 import { useShellLive } from '../composables/useShellLive.js'
 import { useUpdateStatus } from '../composables/useUpdateStatus.js'
@@ -94,7 +95,7 @@ import { openExternalUrl } from '../utils/helpers.js'
 import { rowKeywords } from 'foundation-ui/settings/index.js'
 import { hostData } from '../composables/hostData.js'
 import { apiFetch, apiJson } from '../utils/apiFetch.js'
-import { lazyPane } from '../utils/lazyPane.js'
+import { hasOpened, lazyPane } from '../utils/lazyPane.js'
 import { createFramedBack } from '../utils/framedBack.js'
 
 const { t, te, locale: uiLocale } = useI18n()
@@ -117,6 +118,8 @@ watch(hostUnusable, (off) => { frozenId.value = off ? String(nav.current.value |
 // A page that is not loaded yet shows the one loading state in the content area (after a short delay), never a blank.
 const LoadingView = defineComponent({ name: 'PageLoadingView', setup: () => () => h('div', { class: 'm-page' }, [h('div', { class: 'm-page__column', style: 'padding-top: 80px' }, [h(MPageLoading)])]) })
 const lazy = (loader) => lazyPane(loader, { loading: LoadingView })
+const MConnectDialog = lazyPane(() => import('foundation-ui/vue/MConnectDialog.vue'), { loading: () => null })
+const MAnnouncementPage = lazy(() => import('foundation-ui/vue/MAnnouncementPage.vue'))
 const VIEWS = {
   home: lazy(() => import('./Home.vue')),
   pin: lazy(() => import('./Pin.vue')),
@@ -125,6 +128,7 @@ const VIEWS = {
   downloads: lazy(() => import('./Downloads.vue')),
   troubleshooting: lazy(() => import('./Troubleshooting.vue')),
   password: lazy(() => import('./SecurityLogin.vue')),
+  'help-page': lazy(() => import('./Help.vue')),
   about: lazy(() => import('./About.vue')),
   appearance: lazy(() => import('./Appearance.vue')),
   'latency-clock': lazy(() => import('./LatencyClock.vue')),
@@ -216,6 +220,8 @@ const PAGES = {
   'latency-clock': { rail: 'system', path: null, hash: 'latency-clock', icon: 'speed', tone: 'tertiary', text: (locale) => latencyClockTexts(locale).title },
   'stream-timer': { rail: 'system', path: null, hash: 'stream-timer', icon: 'timer', tone: 'tertiary', text: (locale) => streamTimerTexts(locale).title },
   appearance: { rail: 'appearance', list: false, path: null, hash: 'appearance', icon: 'palette', tone: 'primary', text: (locale) => labelOf(locale, 'shell.appearance') },
+  // 帮助与关于: the four tiles and the way to 关于 (the About page opens over it, from the list)
+  'help-page': { rail: 'help', list: false, path: null, hash: 'help', icon: 'help', tone: 'primary', label: 'shell.help_about' },
   about: { rail: 'help', rootRail: 'about', list: false, push: true, path: null, hash: 'about', icon: 'info', tone: 'primary', text: (locale) => aboutTexts(locale).title },
 }
 // the rail of the control panel, without what only the control panel can do (the local USB/IP, the picture enhancement, the toolbox, 米塔 AI, the panel's own settings): see docs/parity.md of foundation-ui
@@ -344,7 +350,16 @@ registerDevReport({
 })
 let removeErrorHandlers = null
 const recentLogText = ref('')
-const refreshLogs = async () => { try { const r = await apiFetch('/api/logs'); if (r.ok) recentLogText.value = (await r.text()).split('\n').slice(-60).join('\n') } catch { /* a report without log lines */ } }
+const refreshLogs = async () => {
+  try {
+    const tail = await fetchLogTail()
+    let start = tail.length
+    for (let i = 0; i < 60 && start >= 0; i++) {
+      start = start === 0 ? -1 : tail.lastIndexOf('\n', start - 1)
+    }
+    recentLogText.value = tail.slice(start + 1)
+  } catch { /* a report without log lines */ }
+}
 const shellApp = getCurrentInstance()?.appContext.app
 // in the Panel's frame: the page around it asks for the marked boxes before it takes a screenshot (rectangles only)
 onMounted(async () => { if (embedded) { answerRedactRequests(); return }; removeErrorHandlers = installErrorHandlers({ app: shellApp }); startAutoReport({ context: errorContext }); void refreshLogs(); await telemetry.refresh() })
@@ -427,6 +442,8 @@ useSystemNotices({
   go: { components: () => jumpNav.go('components'), microphone: () => jumpNav.go('microphone'), vdd: () => jumpNav.go('vdd'), update: () => jumpNav.go('about') },
   update: () => ({ state: update.available.value ? 'available' : '', next: '' }),
 })
+// the developers' answers to the feedback this page sent go to the same status button (the sheet of an answer is drawn by DevReportHost); a frame embedded in the Panel leaves it to the Panel
+if (!embedded) useFeedbackReplies({ locale: uiLocale })
 const railItems = computed(() => RAIL.map((r) => ({ ...r, label: t(r.label), ...(r.id === 'overview' && announcementsUnread.value ? { badge: announcementsUnread.value } : {}), ...(r.id === 'help' && notice.value.dot ? { badge: 'dot' } : {}) })))
 // the bottom bar: four destinations with their full labels, the four settings categories behind one
 const BAR_GROUP = { overview: 'overview', stream: 'stream', config: 'settings-hub', input: 'settings-hub', audio: 'settings-hub', display: 'settings-hub', system: 'settings-hub', help: 'help' }
@@ -440,7 +457,7 @@ const railLabel = (rail) => t(RAIL.find((r) => r.id === rail)?.label || 'navbar.
 const settingsList = useSettingsList({ locale: uiLocale, config: live.config, dualsenseKeys: live.dualsenseKeys, sources: { clients: computed(() => live.clients.value?.list), apps: live.apps, components: computed(() => componentStatus.rows.value), ds: live.ds, mic: live.mic, audio: audioDevices.render } })
 watchEffect(() => { hubLines.value = settingsList.lines.value })
 // the row ids of foundation-ui's rowLines for the pages of the list panes
-const ROW_OF_PAGE = { pin: 'clients', apps: 'apps', downloads: 'downloads', gamepad: 'gamepad', keyboard: 'keyboard', mouse: 'mouse', usb: 'usb', microphone: 'microphone', 'display-output': 'display-output', 'display-modes': 'display-modes', 'display-encoders': 'display-encoders', 'display-hdr': 'display-hdr', 'display-advanced': 'display-advanced', 'audio-output': 'audio-output', vdd: 'vdd', components: 'components', network: 'network', 'latency-clock': 'latency-clock', 'test-tools': 'test-tools', 'stream-timer': 'stream-timer', troubleshooting: 'diagnostics', about: 'help' }
+const ROW_OF_PAGE = { pin: 'clients', apps: 'apps', downloads: 'downloads', gamepad: 'gamepad', keyboard: 'keyboard', mouse: 'mouse', usb: 'usb', microphone: 'microphone', 'display-output': 'display-output', 'display-modes': 'display-modes', 'display-encoders': 'display-encoders', 'display-hdr': 'display-hdr', 'display-advanced': 'display-advanced', 'audio-output': 'audio-output', vdd: 'vdd', components: 'components', network: 'network', 'latency-clock': 'latency-clock', 'test-tools': 'test-tools', 'stream-timer': 'stream-timer', troubleshooting: 'diagnostics', about: 'help', 'help-page': 'help' }
 // the pages of a host: the Windows-only ones (HDR, the virtual display) are not offered on another system
 const hostPlatform = computed(() => live.config.value?.platform || 'windows')
 const onThisHost = ([, p]) => !p.windows || hostPlatform.value === 'windows'
@@ -520,6 +537,7 @@ const connect = useConnectDialog({
   },
   defaultName: String(uiLocale.value).startsWith('zh') ? '新客户端' : 'New client',
 })
+const showConnectDialog = hasOpened(connect.open)
 // a device waits for its PIN: the prompt comes forward on any page (the host's long poll, docs/api/pairing-pending.md); a host without the API leaves it off
 const failing = (r) => Object.assign(new Error(`HTTP ${r.status}`), { status: r.status })
 const pairingApi = {
