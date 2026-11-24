@@ -3904,7 +3904,7 @@ namespace stream {
       }
 
       const auto iteration_start = std::chrono::steady_clock::now();
-      stall_telemetry.note_queue_age(iteration_start - packet->queued_at);
+      stall_telemetry.note_queued(iteration_start, packet->queued_at);
       // Observation only: runs on every exit from this iteration, including continue.
       struct iteration_end_t {
         decltype(stall_telemetry) &telemetry;

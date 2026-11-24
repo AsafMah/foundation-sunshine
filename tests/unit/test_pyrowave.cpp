@@ -2050,6 +2050,20 @@ TEST(BroadcastTelemetryTest, QuietWindowIsNotReported) {
   EXPECT_FALSE(telemetry.poll(t0 + 1s, 900ms));
 }
 
+// PyroWave packets come from upstream's publish path, which does not stamp queued_at: they must not read as hours in the queue.
+TEST(BroadcastTelemetryTest, UnstampedPacketHasNoQueueAge) {
+  using namespace std::chrono_literals;
+  const auto t0 = stream::stall_telemetry::clock_t::now();
+  stream::stall_telemetry::broadcast_telemetry_t telemetry { t0 };
+  telemetry.note_queued(t0 + 100ms, stream::stall_telemetry::clock_t::time_point {});
+  telemetry.note_queued(t0 + 100ms, t0 + 97ms);
+  EXPECT_FALSE(telemetry.poll(t0 + 1s, 900ms));
+  telemetry.note_queued(t0 + 1100ms, t0 + 1050ms);
+  const auto report = telemetry.poll(t0 + 2s, 1900ms);
+  ASSERT_TRUE(report);
+  EXPECT_EQ(report->max_queue_age, 50ms);
+}
+
 TEST(BroadcastTelemetryTest, ReportWaitsForTheOneSecondWindowAndKeepsMaxima) {
   using namespace std::chrono_literals;
   const auto t0 = stream::stall_telemetry::clock_t::now();

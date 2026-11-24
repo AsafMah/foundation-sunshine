@@ -76,6 +76,13 @@ namespace stream::stall_telemetry {
       current.max_queue_age = std::max(current.max_queue_age, d);
     }
 
+    /** The age of a popped packet. A packet whose producer did not stamp it (queued_at left at the epoch) has no age to report. */
+    void
+    note_queued(clock_t::time_point now, clock_t::time_point queued_at) {
+      if (queued_at == clock_t::time_point {}) return;
+      note_queue_age(now - queued_at);
+    }
+
     void
     note_lock_wait(nanoseconds d) {
       current.max_lock_wait = std::max(current.max_lock_wait, d);
