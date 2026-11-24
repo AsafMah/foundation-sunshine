@@ -109,7 +109,6 @@ const importsOf = (source) => {
 // (web/tests/configKeys.test.js checks the switch is there).
 export const FORK_UNINDEXED = Object.freeze({
   allow_client_resolution_change: 'configs/tabs/display/DisplayModes.vue',
-  clipboard_sync: 'configs/tabs/Inputs.vue',
   file_transfer: 'configs/tabs/Inputs.vue',
   file_upload: 'configs/tabs/Inputs.vue',
 })
